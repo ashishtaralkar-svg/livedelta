@@ -1,0 +1,26 @@
+# Optional systemd unit for AWS EC2 (Ubuntu 24.04).
+# Auto-starts the Docker Compose stack on boot and restarts it on failure.
+# Install:
+#   sudo cp deploy/deltabot.service /etc/systemd/system/deltabot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now deltabot
+#
+# (Alternatively rely solely on `restart: always` in docker-compose.yml plus an
+#  enabled Docker daemon — `sudo systemctl enable docker`.)
+
+[Unit]
+Description=Delta Exchange Supertrend Trading Bot
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/deltabot
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

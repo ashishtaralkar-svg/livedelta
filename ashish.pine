@@ -1,0 +1,302 @@
+//@version=5
+indicator("Prev Day OHLC + Supertrend + EMA H/L", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================
+// 1) PREVIOUS DAY OPEN & CLOSE (plotted on current/intraday chart)
+// ============================================================
+grpPD = "Previous Day Open/Close"
+showPrevDay = input.bool(true,  "Show Previous Day Open/Close", group=grpPD)
+pdOpenColor = input.color(color.new(color.blue,   0), "Prev Day Open Color",  group=grpPD)
+pdCloseColor= input.color(color.new(color.orange, 0), "Prev Day Close Color", group=grpPD)
+pdLineWidth = input.int(2, "Line Width", minval=1, maxval=5, group=grpPD)
+dayTZ       = input.string("Asia/Kolkata", "Day Boundary Timezone", group=grpPD)
+dayStartHr  = input.int(5,  "New Day Start Hour",   minval=0, maxval=23, group=grpPD)
+dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpPD)
+
+// Custom day boundary: a new "day" begins at dayStartHr:dayStartMin in dayTZ (default 05:30 IST).
+// Shift each bar's timestamp back by the start offset, then a calendar-day change in that shifted
+// time marks the start of a new custom day.
+offsetMs = (dayStartHr * 60 + dayStartMin) * 60 * 1000
+dayId    = dayofmonth(time - offsetMs, dayTZ)
+isNewDay = ta.change(dayId) != 0
+
+var float pdOpen     = na   // previous custom-day open
+var float pdClose    = na   // previous custom-day close
+var float curOpen    = na   // current custom-day open (running)
+var float lastClose  = na   // last close seen within the current custom day
+
+// --- Daily PnL aggregation (per custom-day) for the stats table ---
+var array<string> dayLabels    = array.new_string()  // completed-day date labels
+var array<int>    dayTrades    = array.new_int()      // completed-day trade counts
+var array<float>  dayPnlPts    = array.new_float()    // completed-day PnL (points)
+var int    curDayTrades = 0     // running trade count for the current day
+var float  curDayPnl    = 0.0   // running PnL (points) for the current day
+var string curDayStr    = na    // date label of the current day
+maxKeepDays = 15                // how many completed days to retain in memory
+
+if isNewDay
+    // Finalize the day that just ended, storing its totals
+    if not na(curDayStr)
+        array.push(dayLabels, curDayStr)
+        array.push(dayTrades, curDayTrades)
+        array.push(dayPnlPts, curDayPnl)
+        if array.size(dayLabels) > maxKeepDays
+            array.shift(dayLabels)
+            array.shift(dayTrades)
+            array.shift(dayPnlPts)
+    // Start the new day
+    curDayStr    := str.format_time(time - offsetMs, "dd-MM-yy", dayTZ)
+    curDayTrades := 0
+    curDayPnl    := 0.0
+    pdOpen  := curOpen      // freeze the just-finished day's open as "previous day"
+    pdClose := lastClose    // freeze its last close as "previous day close"
+    curOpen := open         // begin the new day
+lastClose := close
+
+plot(showPrevDay ? pdOpen  : na, "Prev Day Open",  color=pdOpenColor,  style=plot.style_linebr, linewidth=pdLineWidth)
+plot(showPrevDay ? pdClose : na, "Prev Day Close", color=pdCloseColor, style=plot.style_linebr, linewidth=pdLineWidth)
+
+// Optional right-side labels on the most recent bar
+var label lblOpen  = na
+var label lblClose = na
+if showPrevDay and barstate.islast
+    label.delete(lblOpen)
+    label.delete(lblClose)
+    lblOpen  := label.new(bar_index, pdOpen,  "PD Open "  + str.tostring(pdOpen,  format.mintick), style=label.style_label_left, color=color.new(pdOpenColor, 80),  textcolor=pdOpenColor,  size=size.small)
+    lblClose := label.new(bar_index, pdClose, "PD Close " + str.tostring(pdClose, format.mintick), style=label.style_label_left, color=color.new(pdCloseColor,80),  textcolor=pdCloseColor, size=size.small)
+
+// ============================================================
+// 2) SUPERTREND (Factor = 3, ATR Period = 10)
+// ============================================================
+grpST = "Supertrend"
+showST  = input.bool(true, "Show Supertrend", group=grpST)
+stFactor= input.float(3.0, "Supertrend Factor",     step=0.1, group=grpST)
+stATR   = input.int(10,    "Supertrend ATR Period", minval=1, group=grpST)
+upColor   = input.color(color.green, "Uptrend Color",   group=grpST)
+downColor = input.color(color.red,   "Downtrend Color", group=grpST)
+
+[stLine, stDir] = ta.supertrend(stFactor, stATR)
+
+plot(showST and stDir < 0 ? stLine : na, "Supertrend Up",   color=upColor,   style=plot.style_linebr, linewidth=2)
+plot(showST and stDir > 0 ? stLine : na, "Supertrend Down", color=downColor, style=plot.style_linebr, linewidth=2)
+
+// ============================================================
+// 3) 50 EMA of HIGH and 50 EMA of LOW
+// ============================================================
+grpEMA = "EMA High/Low"
+showEMA  = input.bool(true, "Show 50 EMA High/Low", group=grpEMA)
+emaLen   = input.int(50, "EMA Length", minval=1, group=grpEMA)
+emaHColor= input.color(color.teal,    "EMA High Color", group=grpEMA)
+emaLColor= input.color(color.fuchsia, "EMA Low Color",  group=grpEMA)
+
+emaHigh = ta.ema(high, emaLen)
+emaLow  = ta.ema(low,  emaLen)
+
+plot(showEMA ? emaHigh : na, "50 EMA High", color=emaHColor, linewidth=2)
+plot(showEMA ? emaLow  : na, "50 EMA Low",  color=emaLColor, linewidth=2)
+
+// ============================================================
+// 4) BUY / SELL CONDITIONS + ALERTS
+// ============================================================
+// Supertrend direction from ta.supertrend(): stDir == -1 => UPTREND (positive),
+//                                             stDir == +1 => DOWNTREND (negative)
+grpSig = "Signals / Alerts"
+useClose = input.bool(true, "Use bar close for price (uncheck = use high/low)", group=grpSig)
+sqOffHr  = input.int(17, "Square-Off Hour (force exit, IST)", minval=0, maxval=23, group=grpSig)
+sqOffMin = input.int(30, "Square-Off Minute",                minval=0, maxval=59, group=grpSig)
+
+// Reference price used for the comparison
+buyPrice  = useClose ? close : low    // for a strict "above everything" buy, low must clear all levels if unchecked
+sellPrice = useClose ? close : high   // for a strict "below everything" sell, high must stay below all levels
+
+stIsPositive = stDir < 0   // uptrend
+stIsNegative = stDir > 0   // downtrend
+
+// BUY: price above Prev Day Open, Prev Day Close, EMA High, EMA Low, AND Supertrend positive
+buyCond  = buyPrice > pdOpen  and buyPrice > pdClose  and buyPrice > emaHigh and buyPrice > emaLow  and stIsPositive
+
+// SELL: price below Prev Day Open, Prev Day Close, EMA High, EMA Low, AND Supertrend negative
+sellCond = sellPrice < pdOpen and sellPrice < pdClose and sellPrice < emaHigh and sellPrice < emaLow and stIsNegative
+
+// --- Position state (declared here so signals can be gated to one trade at a time) ---
+var bool  inLong       = false
+var bool  inShort      = false
+var float longPrevLow  = na   // fixed prev-candle-low stop captured at buy entry
+var float shortPrevHigh= na   // fixed prev-candle-high stop captured at sell entry
+var float longEntry    = na   // entry (buy) price
+var float shortEntry   = na   // entry (sell) price
+
+// --- Forced square-off: first bar at/after the square-off time (default 17:30 IST) ---
+sqMins    = sqOffHr * 60 + sqOffMin
+nowMins   = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOff = (nowMins >= sqMins) and (nowMins[1] < sqMins)
+
+// --- Will the open position exit on THIS bar? Evaluated up-front so a fresh
+//     signal is allowed on the SAME candle the SL is hit. ---
+// SL = entry bar's previous-candle LOW for longs, previous-candle HIGH for shorts.
+longExitSL  = inLong  and low  <= longPrevLow    // prev-candle-low stop broken
+shortExitSL = inShort and high >= shortPrevHigh  // prev-candle-high stop broken
+longSqOff   = inLong  and squareOff              // forced exit at cutoff time
+shortSqOff  = inShort and squareOff
+
+longExit  = longExitSL  or longSqOff
+shortExit = shortExitSL or shortSqOff
+
+// "Flat" for signalling = no carried position, OR that position exits on this very bar.
+// => one trade at a time, but a new signal CAN trigger on the same candle the SL is hit.
+flat = (not inLong or longExit) and (not inShort or shortExit)
+
+// First bar after the forced square-off — re-entry is allowed here even if the condition
+// was already true (no fresh crossing needed), so a trade can resume immediately.
+afterSqOff = squareOff[1]
+
+// Fire when flat and NOT on the square-off bar itself. Normally requires a fresh crossing
+// (not cond[1]); but on the bar right after square-off, a still-true condition also fires.
+buySignal  = buyCond  and flat and not squareOff and (not buyCond[1]  or afterSqOff)
+sellSignal = sellCond and flat and not squareOff and (not sellCond[1] or afterSqOff)
+
+// Plot signal markers
+plotshape(buySignal,  "BUY Signal",  style=shape.labelup,   location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, text="BUY",  size=size.small)
+plotshape(sellSignal, "SELL Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red,   0), textcolor=color.white, text="SELL", size=size.small)
+
+// Background tint while a condition holds (optional visual aid)
+bgcolor(buyCond  ? color.new(color.green, 90) : na, title="Buy Zone")
+bgcolor(sellCond ? color.new(color.red,   90) : na, title="Sell Zone")
+
+// Alert conditions (set these up via the Alerts panel -> condition = this indicator)
+alertcondition(buySignal,  title="BUY Alert",  message="BUY: price above PD Open/Close + EMA H/L and Supertrend positive on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sellSignal, title="SELL Alert", message="SELL: price below PD Open/Close + EMA H/L and Supertrend negative on {{ticker}} {{interval}} @ {{close}}")
+
+// ============================================================
+// 5) STOP-LOSS TRACKING
+// ============================================================
+// After a BUY alert:  SL = entry bar's previous-candle LOW.
+// After a SELL alert: SL = entry bar's previous-candle HIGH.
+// (Supertrend is no longer used as a stop; it remains an entry filter only.)
+grpSL = "Stop Loss"
+showSL = input.bool(true, "Show SL line & exit markers", group=grpSL)
+slColor = input.color(color.red, "SL Line Color", group=grpSL)
+
+// (Position-state vars and the exit booleans longExit/shortExit are computed in section 4,
+//  so a fresh signal can fire on the same candle an SL is hit. Here we just act on them.)
+
+// Exit price: SL hit -> prev-candle stop level; forced square-off -> the bar's close
+longExitPrice  = longExitSL  ? longPrevLow   : close
+shortExitPrice = shortExitSL ? shortPrevHigh : close
+
+// --- PnL label on the SL candle ---
+if showSL and longExit and not na(longEntry)
+    pnlPts = longExitPrice - longEntry
+    pnlPct = pnlPts / longEntry * 100
+    label.new(bar_index, low, "P&L " + str.tostring(pnlPts, format.mintick) + "\n" + str.tostring(pnlPct, "#.##") + "%", yloc=yloc.belowbar, style=label.style_label_up, color=pnlPts >= 0 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor=color.white, size=size.small)
+if showSL and shortExit and not na(shortEntry)
+    pnlPts = shortEntry - shortExitPrice
+    pnlPct = pnlPts / shortEntry * 100
+    label.new(bar_index, high, "P&L " + str.tostring(pnlPts, format.mintick) + "\n" + str.tostring(pnlPct, "#.##") + "%", yloc=yloc.abovebar, style=label.style_label_down, color=pnlPts >= 0 ? color.new(color.green, 0) : color.new(color.red, 0), textcolor=color.white, size=size.small)
+
+// Accumulate closed-trade PnL into the current day's totals (independent of showSL)
+if longExit and not na(longEntry)
+    curDayTrades := curDayTrades + 1
+    curDayPnl    := curDayPnl + (longExitPrice - longEntry)
+if shortExit and not na(shortEntry)
+    curDayTrades := curDayTrades + 1
+    curDayPnl    := curDayPnl + (shortEntry - shortExitPrice)
+
+if longExit
+    inLong := false
+    longPrevLow := na
+    longEntry := na
+if shortExit
+    inShort := false
+    shortPrevHigh := na
+    shortEntry := na
+
+// --- Apply ENTRIES (a new signal also flips an opposite open position) ---
+if buySignal
+    inLong  := true
+    inShort := false
+    longPrevLow := low[1]      // previous candle's low at the moment the buy alert fired
+    longEntry := close         // buy fill price
+if sellSignal
+    inShort := true
+    inLong  := false
+    shortPrevHigh := high[1]   // previous candle's high at the moment the sell alert fired
+    shortEntry := close        // sell fill price
+
+// The active stop level for display = the fixed prev-candle level
+longSLlevel  = inLong  ? longPrevLow   : na
+shortSLlevel = inShort ? shortPrevHigh : na
+
+plot(showSL ? longSLlevel  : na, "Long SL",  color=slColor, style=plot.style_linebr, linewidth=1)
+plot(showSL ? shortSLlevel : na, "Short SL", color=slColor, style=plot.style_linebr, linewidth=1)
+
+// SL-hit markers (prev-candle stop)
+plotshape(showSL and longExitSL,  "Long SL Hit",  style=shape.xcross, location=location.belowbar, color=slColor, text="SL", textcolor=slColor, size=size.tiny)
+plotshape(showSL and shortExitSL, "Short SL Hit", style=shape.xcross, location=location.abovebar, color=slColor, text="SL", textcolor=slColor, size=size.tiny)
+
+// Square-off (EOD) exit markers — only when the cutoff closed the trade, not the SL
+plotshape(showSL and longSqOff  and not longExitSL,  "Long EOD Exit",  style=shape.xcross, location=location.belowbar, color=color.gray, text="EOD", textcolor=color.gray, size=size.tiny)
+plotshape(showSL and shortSqOff and not shortExitSL, "Short EOD Exit", style=shape.xcross, location=location.abovebar, color=color.gray, text="EOD", textcolor=color.gray, size=size.tiny)
+
+alertcondition(longExitSL,  title="BUY SL Hit",  message="BUY SL hit (prev-candle low) on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortExitSL, title="SELL SL Hit", message="SELL SL hit (prev-candle high) on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longSqOff or shortSqOff, title="EOD Square-Off", message="Square-off exit at cutoff time on {{ticker}} {{interval}} @ {{close}}")
+
+// ============================================================
+// 6) DAY-WISE PnL TABLE (last 10 days, top-right)
+// ============================================================
+grpTbl    = "PnL Table"
+showTable = input.bool(true, "Show PnL Table (last 10 days)", group=grpTbl)
+tblTxtCol = input.color(color.white, "Table Text Color",       group=grpTbl)
+tblHdrCol = input.color(color.new(color.gray, 0),  "Header Color", group=grpTbl)
+
+DAYS_SHOWN = 10  // current day + up to 9 completed days
+
+var table pnlTbl = na
+if barstate.islast
+    if not na(pnlTbl)
+        table.delete(pnlTbl)
+    if showTable
+        // rows: header + DAYS_SHOWN day rows + total row
+        pnlTbl := table.new(position.top_right, 3, DAYS_SHOWN + 2, border_width=1, frame_width=1, frame_color=color.gray)
+
+        // Header
+        table.cell(pnlTbl, 0, 0, "Date",      text_color=tblTxtCol, bgcolor=tblHdrCol, text_size=size.small)
+        table.cell(pnlTbl, 1, 0, "Trades",    text_color=tblTxtCol, bgcolor=tblHdrCol, text_size=size.small)
+        table.cell(pnlTbl, 2, 0, "PnL (pts)", text_color=tblTxtCol, bgcolor=tblHdrCol, text_size=size.small)
+
+        rowI      = 1
+        totTrades = 0
+        totPnl    = 0.0
+
+        // Current (in-progress) day first, marked with *
+        if not na(curDayStr)
+            pcol = curDayPnl >= 0 ? color.new(color.green, 70) : color.new(color.red, 70)
+            table.cell(pnlTbl, 0, rowI, curDayStr + " *",                  text_color=tblTxtCol, text_size=size.small)
+            table.cell(pnlTbl, 1, rowI, str.tostring(curDayTrades),        text_color=tblTxtCol, text_size=size.small)
+            table.cell(pnlTbl, 2, rowI, str.tostring(curDayPnl, "#.##"),   text_color=tblTxtCol, bgcolor=pcol, text_size=size.small)
+            totTrades := totTrades + curDayTrades
+            totPnl    := totPnl + curDayPnl
+            rowI := rowI + 1
+
+        // Completed days, newest -> oldest, up to the remaining row budget
+        n = array.size(dayLabels)
+        i = n - 1
+        while i >= 0 and rowI <= DAYS_SHOWN
+            d = array.get(dayLabels, i)
+            t = array.get(dayTrades, i)
+            p = array.get(dayPnlPts, i)
+            pcol = p >= 0 ? color.new(color.green, 70) : color.new(color.red, 70)
+            table.cell(pnlTbl, 0, rowI, d,                       text_color=tblTxtCol, text_size=size.small)
+            table.cell(pnlTbl, 1, rowI, str.tostring(t),         text_color=tblTxtCol, text_size=size.small)
+            table.cell(pnlTbl, 2, rowI, str.tostring(p, "#.##"), text_color=tblTxtCol, bgcolor=pcol, text_size=size.small)
+            totTrades := totTrades + t
+            totPnl    := totPnl + p
+            rowI := rowI + 1
+            i := i - 1
+
+        // TOTAL row
+        totCol = totPnl >= 0 ? color.new(color.green, 0) : color.new(color.red, 0)
+        table.cell(pnlTbl, 0, rowI, "TOTAL",                       text_color=tblTxtCol, bgcolor=color.new(color.blue, 0), text_size=size.small)
+        table.cell(pnlTbl, 1, rowI, str.tostring(totTrades),       text_color=tblTxtCol, bgcolor=color.new(color.blue, 0), text_size=size.small)
+        table.cell(pnlTbl, 2, rowI, str.tostring(totPnl, "#.##"),  text_color=tblTxtCol, bgcolor=totCol, text_size=size.small)

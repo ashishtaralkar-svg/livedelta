@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+.env
+tests
+*.parquet
+*.csv

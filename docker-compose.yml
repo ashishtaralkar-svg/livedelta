@@ -1,0 +1,17 @@
+services:
+  deltabot:
+    build: .
+    image: deltabot:latest
+    container_name: deltabot
+    # Auto-restart on crash and on host reboot (with Docker service enabled).
+    restart: always
+    env_file:
+      - .env
+    # Structured JSON logs to stdout are captured by the json-file driver and
+    # can be shipped to CloudWatch via the awslogs driver or the CW agent.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
