@@ -25,7 +25,7 @@ from ..exchange.ws_manager import WebSocketManager
 from ..logging_setup import get_logger
 from ..models import Candle
 from ..pnl import TradeLedger
-from ..strategy.pine_strategy import PineStrategy, StrategyDecision
+from ..strategy.pine_strategy import PineStrategy, StrategyDecision, IntracandelSLCheck
 from . import reconciler
 from .candle_aggregator import CandleAggregator
 from .options_executor import OptionsExecutor, OptionsMarginError
@@ -57,7 +57,7 @@ class TradingEngine:
         self.ledger = TradeLedger(contract_value=0.001, contracts=settings.contracts)
         self.order_engine = OrderEngine(rest, settings)
         self.options_executor = OptionsExecutor(rest, settings) if settings.options_mode else None
-        self.aggregator = CandleAggregator(on_closed=self._on_closed_candle)
+        self.aggregator = CandleAggregator(on_closed=self._on_closed_candle, on_forming=self._on_forming_candle)
         self.ws: WebSocketManager | None = None
         self._last_closed_start: int | None = None
         self._bar_seconds = _RESOLUTION_SECONDS.get(settings.resolution, 60)
@@ -198,6 +198,12 @@ class TradingEngine:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def _on_forming_candle(self, candle: Candle) -> None:
+        """Sync callback for forming (intracandle) updates to check SL."""
+        task = asyncio.create_task(self._handle_forming_candle(candle))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def _handle_closed_candle(self, candle: Candle) -> None:
         # Gap detection across closed bars.
         if self._last_closed_start is not None:
@@ -229,6 +235,88 @@ class TradingEngine:
                 },
             )
             await self._act_on_decision(decision)
+
+    async def _handle_forming_candle(self, candle: Candle) -> None:
+        """Check if intracandle price crosses the stop-loss level."""
+        if not self.strategy.ready:
+            return
+        
+        # Check both high and low of the forming candle for SL triggers
+        for price in [candle.low, candle.high]:
+            sl_check = self.strategy.check_intracandle_sl(price)
+            
+            if sl_check.long_exit_sl or sl_check.short_exit_sl:
+                log.info(
+                    "Intracandle SL triggered",
+                    extra={
+                        "extra": {
+                            "t": candle.start_time,
+                            "price": price,
+                            "long_sl": sl_check.long_exit_sl,
+                            "short_sl": sl_check.short_exit_sl,
+                        }
+                    },
+                )
+                
+                # Trigger exit immediately at the SL price
+                dec = StrategyDecision(
+                    candle=candle,
+                    long_exit=sl_check.long_exit_sl,
+                    short_exit=sl_check.short_exit_sl,
+                    long_exit_sl=sl_check.long_exit_sl,
+                    short_exit_sl=sl_check.short_exit_sl,
+                    long_sq_off=False,
+                    short_sq_off=False,
+                    long_exit_price=sl_check.long_exit_price or price,
+                    short_exit_price=sl_check.short_exit_price or price,
+                    buy_signal=False,
+                    sell_signal=False,
+                    entry_price=price,
+                    target_state=self.strategy.position_state,
+                )
+                
+                # Update position state based on SL trigger
+                if sl_check.long_exit_sl:
+                    dec = StrategyDecision(
+                        candle=candle,
+                        long_exit=True,
+                        short_exit=False,
+                        long_exit_sl=True,
+                        short_exit_sl=False,
+                        long_sq_off=False,
+                        short_sq_off=False,
+                        long_exit_price=sl_check.long_exit_price or price,
+                        short_exit_price=price,
+                        buy_signal=False,
+                        sell_signal=False,
+                        entry_price=price,
+                        target_state=PositionState.FLAT if self.strategy.position_state == PositionState.LONG else self.strategy.position_state,
+                    )
+                    self.strategy._in_long = False
+                    self.strategy._long_prev_low = None
+                    self.strategy._long_entry = None
+                elif sl_check.short_exit_sl:
+                    dec = StrategyDecision(
+                        candle=candle,
+                        long_exit=False,
+                        short_exit=True,
+                        long_exit_sl=False,
+                        short_exit_sl=True,
+                        long_sq_off=False,
+                        short_sq_off=False,
+                        long_exit_price=price,
+                        short_exit_price=sl_check.short_exit_price or price,
+                        buy_signal=False,
+                        sell_signal=False,
+                        entry_price=price,
+                        target_state=PositionState.FLAT if self.strategy.position_state == PositionState.SHORT else self.strategy.position_state,
+                    )
+                    self.strategy._in_short = False
+                    self.strategy._short_prev_high = None
+                    self.strategy._short_entry = None
+                
+                await self._act_on_decision(dec)
+                break
 
     async def _act_on_decision(self, dec: StrategyDecision) -> None:
         was = self.sm.state

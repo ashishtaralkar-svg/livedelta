@@ -18,9 +18,9 @@ the previous bar) — except on the first bar after the forced square-off, where
 still-true condition is allowed to re-enter.
 
 Exit rules:
-  * Stop-loss: long exits if the bar's low pierces the entry bar's previous-candle
-    low; short exits if the bar's high pierces the entry bar's previous-candle high
-    (filled at the stop level).
+  * Stop-loss: long exits if the bar's low pierces the lowest low of the entry bar
+    and its previous candle; short exits if the bar's high pierces the highest high
+    of the entry bar and its previous candle (filled at the stop level).
   * Forced square-off at the configured cut-off time (default 17:30 IST), filled at
     the bar close.
 
@@ -39,6 +39,16 @@ from ..enums import PositionState
 from ..models import Candle
 from .indicators import EmaCalculator
 from .supertrend import SupertrendCalculator
+
+
+@dataclass(frozen=True)
+class IntracandelSLCheck:
+    """Intracandle stop-loss hit check on a forming candle."""
+
+    long_exit_sl: bool
+    short_exit_sl: bool
+    long_exit_price: float | None = None
+    short_exit_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +189,25 @@ class PineStrategy:
         """Consume one closed candle and return its decision (or ``None``)."""
         return self._step(candle, warmup=False)
 
+    def check_intracandle_sl(self, price: float) -> IntracandelSLCheck:
+        """Check if an intracandle price crosses the current stop-loss level.
+        
+        This is called on forming candle updates to trigger SL as soon as the price
+        touches the SL level, not just when the candle closes.
+        """
+        long_exit_sl = self._in_long and self._long_prev_low is not None and price <= self._long_prev_low
+        short_exit_sl = self._in_short and self._short_prev_high is not None and price >= self._short_prev_high
+        
+        long_exit_price = self._long_prev_low if long_exit_sl else None
+        short_exit_price = self._short_prev_high if short_exit_sl else None
+        
+        return IntracandelSLCheck(
+            long_exit_sl=bool(long_exit_sl),
+            short_exit_sl=bool(short_exit_sl),
+            long_exit_price=long_exit_price,
+            short_exit_price=short_exit_price,
+        )
+
     def sync_position(
         self,
         state: PositionState,
@@ -294,11 +323,11 @@ class PineStrategy:
                 self._short_entry = None
             if buy_signal:
                 self._in_long, self._in_short = True, False
-                self._long_prev_low = self._prev_low  # entry bar's previous-candle low
+                self._long_prev_low = min(self._prev_low, candle.low)  # lowest low of current and previous candle
                 self._long_entry = candle.close
             if sell_signal:
                 self._in_short, self._in_long = True, False
-                self._short_prev_high = self._prev_high  # entry bar's previous-candle high
+                self._short_prev_high = max(self._prev_high, candle.high)  # highest high of current and previous candle
                 self._short_entry = candle.close
 
         # --- Carry context to the next bar ---

@@ -20,8 +20,9 @@ log = get_logger(__name__)
 class CandleAggregator:
     """Detect closed 1-minute candles and invoke a callback once per closed bar."""
 
-    def __init__(self, on_closed: Callable[[Candle], object]) -> None:
+    def __init__(self, on_closed: Callable[[Candle], object], on_forming: Callable[[Candle], object] | None = None) -> None:
         self.on_closed = on_closed
+        self.on_forming = on_forming
         self._current: Candle | None = None
         self._last_emitted_start: int | None = None
 
@@ -41,11 +42,15 @@ class CandleAggregator:
     def _ingest_candle(self, candle: Candle) -> None:
         if self._current is None:
             self._current = candle
+            if self.on_forming is not None:
+                self.on_forming(candle)
             return
 
         if candle.start_time == self._current.start_time:
             # Update to the still-forming candle: keep the latest snapshot.
             self._current = candle
+            if self.on_forming is not None:
+                self.on_forming(candle)
             return
 
         if candle.start_time > self._current.start_time:
@@ -53,6 +58,8 @@ class CandleAggregator:
             closed = self._current
             self._current = candle
             self._emit(closed)
+            if self.on_forming is not None:
+                self.on_forming(candle)
             return
 
         # Out-of-order / stale message for an older candle: ignore.
