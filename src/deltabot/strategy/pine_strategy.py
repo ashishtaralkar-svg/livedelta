@@ -148,6 +148,16 @@ class PineStrategy:
         self._long_entry: float | None = None
         self._short_entry: float | None = None
 
+        # Pending confirmation entry: after a signal fires, wait for price to
+        # cross the signal candle's high (long) or low (short) before entering.
+        # If the stop-loss level is crossed first, the trade is invalid.
+        self._pending_long = False
+        self._pending_short = False
+        self._pending_long_trigger: float | None = None   # signal candle high
+        self._pending_short_trigger: float | None = None  # signal candle low
+        self._pending_long_sl: float | None = None        # invalidation level
+        self._pending_short_sl: float | None = None       # invalidation level
+
         self._ready = False
 
     # ------------------------------------------------------------------ #
@@ -215,6 +225,10 @@ class PineStrategy:
         entry_price: float | None = None,
         stop_level: float | None = None,
     ) -> None:
+        # Exchange state is the source of truth — any pending entry is moot.
+        self._pending_long = self._pending_short = False
+        self._pending_long_trigger = self._pending_long_sl = None
+        self._pending_short_trigger = self._pending_short_sl = None
         """Force the in-memory position to match the exchange (used on reconcile).
 
         When the exchange shows a position the strategy did not open, the stop
@@ -235,6 +249,49 @@ class PineStrategy:
             self._in_long = self._in_short = False
             self._long_prev_low = self._short_prev_high = None
             self._long_entry = self._short_entry = None
+
+    @property
+    def has_pending(self) -> bool:
+        return self._pending_long or self._pending_short
+
+    def apply_intracandle_pending(self, candle: Candle) -> tuple[bool, bool, float]:
+        """Check a forming candle against any pending entry trigger and SL.
+
+        Called by the live engine on each intracandle update so confirmation or
+        invalidation fires as soon as price crosses the level, not just at bar close.
+
+        Returns ``(confirmed, invalidated, entry_price)``.  Mutates strategy state
+        on confirmation or invalidation so the closed-candle path sees no pending.
+        """
+        if self._pending_long and self._pending_long_trigger is not None and self._pending_long_sl is not None:
+            sl, trig = self._pending_long_sl, self._pending_long_trigger
+            if candle.open <= sl or candle.low <= sl:
+                self._pending_long = False
+                self._pending_long_trigger = self._pending_long_sl = None
+                return False, True, 0.0
+            if candle.open >= trig or candle.high >= trig:
+                self._in_long, self._in_short = True, False
+                self._long_prev_low = sl
+                self._long_entry = trig
+                self._pending_long = False
+                self._pending_long_trigger = self._pending_long_sl = None
+                return True, False, trig
+
+        elif self._pending_short and self._pending_short_trigger is not None and self._pending_short_sl is not None:
+            sl, trig = self._pending_short_sl, self._pending_short_trigger
+            if candle.open >= sl or candle.high >= sl:
+                self._pending_short = False
+                self._pending_short_trigger = self._pending_short_sl = None
+                return False, True, 0.0
+            if candle.open <= trig or candle.low <= trig:
+                self._in_short, self._in_long = True, False
+                self._short_prev_high = sl
+                self._short_entry = trig
+                self._pending_short = False
+                self._pending_short_trigger = self._pending_short_sl = None
+                return True, False, trig
+
+        return False, False, 0.0
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -283,8 +340,7 @@ class PineStrategy:
             buy_cond = buy_price > levels_above and st_uptrend
             sell_cond = sell_price < levels_below and st_downtrend
 
-        # --- Exit evaluation (up-front, so a fresh signal can fire on the same
-        #     candle an SL is hit) ---
+        # --- Exit evaluation ---
         long_exit_sl = self._in_long and self._long_prev_low is not None and candle.low <= self._long_prev_low
         short_exit_sl = (
             self._in_short and self._short_prev_high is not None and candle.high >= self._short_prev_high
@@ -294,11 +350,55 @@ class PineStrategy:
         long_exit = bool(long_exit_sl or long_sq_off)
         short_exit = bool(short_exit_sl or short_sq_off)
 
-        flat = (not self._in_long or long_exit) and (not self._in_short or short_exit)
-        buy_signal = bool(
+        # --- Pending entry: confirm or invalidate on this candle ---
+        # A signal fires on the signal candle but the trade is only entered once
+        # price crosses the signal candle's high (long) or low (short).  If the
+        # stop-loss level is breached first the trade is cancelled.
+        confirmed_buy = False
+        confirmed_sell = False
+        confirmed_entry_price = 0.0
+
+        if not warmup:
+            if self._pending_long and self._pending_long_trigger is not None and self._pending_long_sl is not None:
+                sl, trig = self._pending_long_sl, self._pending_long_trigger
+                if candle.open <= sl or candle.low <= sl:
+                    # SL crossed before trigger — trade invalid
+                    self._pending_long = False
+                    self._pending_long_trigger = self._pending_long_sl = None
+                elif candle.open >= trig or candle.high >= trig:
+                    # Price crossed above signal candle high — confirmed entry
+                    confirmed_buy = True
+                    confirmed_entry_price = trig
+                    self._in_long, self._in_short = True, False
+                    self._long_prev_low = sl
+                    self._long_entry = trig
+                    self._pending_long = False
+                    self._pending_long_trigger = self._pending_long_sl = None
+
+            elif self._pending_short and self._pending_short_trigger is not None and self._pending_short_sl is not None:
+                sl, trig = self._pending_short_sl, self._pending_short_trigger
+                if candle.open >= sl or candle.high >= sl:
+                    # SL crossed before trigger — trade invalid
+                    self._pending_short = False
+                    self._pending_short_trigger = self._pending_short_sl = None
+                elif candle.open <= trig or candle.low <= trig:
+                    # Price crossed below signal candle low — confirmed entry
+                    confirmed_sell = True
+                    confirmed_entry_price = trig
+                    self._in_short, self._in_long = True, False
+                    self._short_prev_high = sl
+                    self._short_entry = trig
+                    self._pending_short = False
+                    self._pending_short_trigger = self._pending_short_sl = None
+
+        # --- New signal detection ---
+        # Include pending in the flat check so an active pending blocks new signals.
+        has_pending = self._pending_long or self._pending_short
+        flat = (not self._in_long or long_exit) and (not self._in_short or short_exit) and not has_pending
+        new_buy_signal = bool(
             buy_cond and flat and not square_off and (not self._prev_buy_cond or after_sq_off)
         )
-        sell_signal = bool(
+        new_sell_signal = bool(
             sell_cond and flat and not square_off and (not self._prev_sell_cond or after_sq_off)
         )
 
@@ -321,14 +421,24 @@ class PineStrategy:
                 self._in_short = False
                 self._short_prev_high = None
                 self._short_entry = None
-            if buy_signal:
-                self._in_long, self._in_short = True, False
-                self._long_prev_low = min(self._prev_low, candle.low)  # lowest low of current and previous candle
-                self._long_entry = candle.close
-            if sell_signal:
-                self._in_short, self._in_long = True, False
-                self._short_prev_high = max(self._prev_high, candle.high)  # highest high of current and previous candle
-                self._short_entry = candle.close
+            # Square-off cancels any pending entry for the day
+            if square_off:
+                self._pending_long = self._pending_short = False
+                self._pending_long_trigger = self._pending_long_sl = None
+                self._pending_short_trigger = self._pending_short_sl = None
+            # Set pending — actual entry deferred until price confirms
+            if new_buy_signal:
+                self._pending_long = True
+                self._pending_long_trigger = candle.high
+                self._pending_long_sl = (
+                    min(self._prev_low, candle.low) if self._prev_low is not None else candle.low
+                )
+            if new_sell_signal:
+                self._pending_short = True
+                self._pending_short_trigger = candle.low
+                self._pending_short_sl = (
+                    max(self._prev_high, candle.high) if self._prev_high is not None else candle.high
+                )
 
         # --- Carry context to the next bar ---
         self._prev_buy_cond = buy_cond
@@ -353,8 +463,8 @@ class PineStrategy:
             short_sq_off=bool(short_sq_off),
             long_exit_price=long_exit_price,
             short_exit_price=short_exit_price,
-            buy_signal=buy_signal,
-            sell_signal=sell_signal,
-            entry_price=candle.close,
+            buy_signal=confirmed_buy,
+            sell_signal=confirmed_sell,
+            entry_price=confirmed_entry_price if (confirmed_buy or confirmed_sell) else candle.close,
             target_state=self.position_state,
         )

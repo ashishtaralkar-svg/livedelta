@@ -237,86 +237,82 @@ class TradingEngine:
             await self._act_on_decision(decision)
 
     async def _handle_forming_candle(self, candle: Candle) -> None:
-        """Check if intracandle price crosses the stop-loss level."""
+        """Check intracandle price for pending entry confirmation and stop-loss."""
         if not self.strategy.ready:
             return
-        
-        # Check both high and low of the forming candle for SL triggers
+
+        # --- Pending entry: confirm or invalidate intracandle ---
+        confirmed, invalidated, entry_price = self.strategy.apply_intracandle_pending(candle)
+        if confirmed:
+            is_long = self.strategy.position_state == PositionState.LONG
+            log.info(
+                "Intracandle pending entry confirmed",
+                extra={"extra": {"t": candle.start_time, "price": entry_price, "side": "LONG" if is_long else "SHORT"}},
+            )
+            dec = StrategyDecision(
+                candle=candle,
+                long_exit=False, short_exit=False,
+                long_exit_sl=False, short_exit_sl=False,
+                long_sq_off=False, short_sq_off=False,
+                long_exit_price=candle.close,
+                short_exit_price=candle.close,
+                buy_signal=is_long,
+                sell_signal=not is_long,
+                entry_price=entry_price,
+                target_state=self.strategy.position_state,
+            )
+            await self._act_on_decision(dec)
+            return
+
+        if invalidated:
+            log.info(
+                "Intracandle pending entry invalidated — SL crossed before trigger",
+                extra={"extra": {"t": candle.start_time}},
+            )
+            return
+
+        # --- Existing position: check intracandle SL ---
         for price in [candle.low, candle.high]:
             sl_check = self.strategy.check_intracandle_sl(price)
-            
-            if sl_check.long_exit_sl or sl_check.short_exit_sl:
-                log.info(
-                    "Intracandle SL triggered",
-                    extra={
-                        "extra": {
-                            "t": candle.start_time,
-                            "price": price,
-                            "long_sl": sl_check.long_exit_sl,
-                            "short_sl": sl_check.short_exit_sl,
-                        }
-                    },
-                )
-                
-                # Trigger exit immediately at the SL price
+            if not (sl_check.long_exit_sl or sl_check.short_exit_sl):
+                continue
+            log.info(
+                "Intracandle SL triggered",
+                extra={"extra": {"t": candle.start_time, "price": price,
+                                 "long_sl": sl_check.long_exit_sl, "short_sl": sl_check.short_exit_sl}},
+            )
+            if sl_check.long_exit_sl:
                 dec = StrategyDecision(
                     candle=candle,
-                    long_exit=sl_check.long_exit_sl,
-                    short_exit=sl_check.short_exit_sl,
-                    long_exit_sl=sl_check.long_exit_sl,
-                    short_exit_sl=sl_check.short_exit_sl,
-                    long_sq_off=False,
-                    short_sq_off=False,
+                    long_exit=True, short_exit=False,
+                    long_exit_sl=True, short_exit_sl=False,
+                    long_sq_off=False, short_sq_off=False,
                     long_exit_price=sl_check.long_exit_price or price,
-                    short_exit_price=sl_check.short_exit_price or price,
-                    buy_signal=False,
-                    sell_signal=False,
+                    short_exit_price=price,
+                    buy_signal=False, sell_signal=False,
                     entry_price=price,
-                    target_state=self.strategy.position_state,
+                    target_state=PositionState.FLAT,
                 )
-                
-                # Update position state based on SL trigger
-                if sl_check.long_exit_sl:
-                    dec = StrategyDecision(
-                        candle=candle,
-                        long_exit=True,
-                        short_exit=False,
-                        long_exit_sl=True,
-                        short_exit_sl=False,
-                        long_sq_off=False,
-                        short_sq_off=False,
-                        long_exit_price=sl_check.long_exit_price or price,
-                        short_exit_price=price,
-                        buy_signal=False,
-                        sell_signal=False,
-                        entry_price=price,
-                        target_state=PositionState.FLAT if self.strategy.position_state == PositionState.LONG else self.strategy.position_state,
-                    )
-                    self.strategy._in_long = False
-                    self.strategy._long_prev_low = None
-                    self.strategy._long_entry = None
-                elif sl_check.short_exit_sl:
-                    dec = StrategyDecision(
-                        candle=candle,
-                        long_exit=False,
-                        short_exit=True,
-                        long_exit_sl=False,
-                        short_exit_sl=True,
-                        long_sq_off=False,
-                        short_sq_off=False,
-                        long_exit_price=price,
-                        short_exit_price=sl_check.short_exit_price or price,
-                        buy_signal=False,
-                        sell_signal=False,
-                        entry_price=price,
-                        target_state=PositionState.FLAT if self.strategy.position_state == PositionState.SHORT else self.strategy.position_state,
-                    )
-                    self.strategy._in_short = False
-                    self.strategy._short_prev_high = None
-                    self.strategy._short_entry = None
-                
-                await self._act_on_decision(dec)
-                break
+                self.strategy._in_long = False
+                self.strategy._long_prev_low = None
+                self.strategy._long_entry = None
+            else:
+                dec = StrategyDecision(
+                    candle=candle,
+                    long_exit=False, short_exit=True,
+                    long_exit_sl=False, short_exit_sl=True,
+                    long_sq_off=False, short_sq_off=False,
+                    long_exit_price=price,
+                    short_exit_price=sl_check.short_exit_price or price,
+                    buy_signal=False, sell_signal=False,
+                    entry_price=price,
+                    target_state=PositionState.FLAT,
+                )
+                self.strategy._in_short = False
+                self.strategy._short_prev_high = None
+                self.strategy._short_entry = None
+            await self._act_on_decision(dec)
+            break
 
     async def _act_on_decision(self, dec: StrategyDecision) -> None:
         was = self.sm.state
