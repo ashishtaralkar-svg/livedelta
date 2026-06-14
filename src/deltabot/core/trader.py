@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from ..config import Settings
 from ..enums import NotifyEvent, OptionType, PositionState, SignalDir
@@ -31,6 +34,8 @@ from .candle_aggregator import CandleAggregator
 from .options_executor import OptionsExecutor, OptionsMarginError
 from .order_engine import OrderEngine, OrderExecutionError
 from .state_machine import PositionStateMachine, plan_actions
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 log = get_logger(__name__)
 
@@ -62,6 +67,13 @@ class TradingEngine:
         self._last_closed_start: int | None = None
         self._bar_seconds = _RESOLUTION_SECONDS.get(settings.resolution, 60)
         self._tasks: set[asyncio.Task] = set()
+
+        # Wall-clock EOD square-off (independent of candle closes): fires at
+        # square_off_hour:minute IST so positions flatten BEFORE the daily options
+        # settle at 17:30 — the candle-driven square-off only fires when the
+        # crossing bar closes, which can lag past settlement.
+        self._sq_off_task: asyncio.Task | None = None
+        self._sq_off_date: date | None = None  # IST date entries are blocked for
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -106,12 +118,17 @@ class TradingEngine:
             on_reconnect=self._on_reconnect,
             heartbeat_timeout_s=self.settings.heartbeat_timeout_s,
         )
+        # 7. Wall-clock EOD square-off scheduler (independent of candle closes).
+        self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
+
         log.info("Starting live engine")
         await self.ws.run()
 
     async def stop(self) -> None:
         if self.ws:
             self.ws.stop()
+        if self._sq_off_task is not None:
+            self._sq_off_task.cancel()
         if self.settings.close_on_shutdown:
             await self._close_on_shutdown()
 
@@ -217,9 +234,7 @@ class TradingEngine:
         self._last_closed_start = candle.start_time
 
         decision = self.strategy.update(candle)
-        if decision is None:
-            return
-        if decision.has_exit or decision.has_entry:
+        if decision is not None and (decision.has_exit or decision.has_entry):
             log.info(
                 "Closed candle",
                 extra={
@@ -315,6 +330,18 @@ class TradingEngine:
             break
 
     async def _act_on_decision(self, dec: StrategyDecision) -> None:
+        # After the wall-clock EOD square-off, stay flat for the rest of the IST
+        # day: honour exits but suppress new entries (the strategy re-enters by
+        # its own rules, which we override here so we don't re-open into settlement).
+        if self._entries_blocked() and dec.has_entry:
+            if not dec.has_exit:
+                log.info("EOD square-off active — suppressing new entry")
+                return
+            log.info("EOD square-off active — exit only, entry suppressed")
+            dec = replace(
+                dec, buy_signal=False, sell_signal=False, target_state=PositionState.FLAT
+            )
+
         was = self.sm.state
 
         # ---- Options execution path ----
@@ -514,6 +541,97 @@ class TradingEngine:
         direction = SignalDir.LONG.value if pos.size > 0 else SignalDir.SHORT.value
         if not self.ledger.has_open:
             self.ledger.open(direction, pos.entry_price or 0.0)
+
+    # ------------------------------------------------------------------ #
+    # Wall-clock EOD square-off
+    # ------------------------------------------------------------------ #
+    def _entries_blocked(self) -> bool:
+        """True once the wall-clock square-off has fired for the current IST day."""
+        return self._sq_off_date is not None and datetime.now(_IST).date() == self._sq_off_date
+
+    async def _square_off_scheduler(self) -> None:
+        """Fire the EOD square-off at square_off_hour:minute IST, every day.
+
+        This is a wall-clock timer, deliberately independent of candle closes: the
+        strategy's candle-driven square-off only triggers when the crossing bar
+        *closes*, which on a 5m series lands at/after the 17:30 option settlement.
+        Firing on the clock guarantees we flatten before settlement.
+        """
+        while True:
+            now = datetime.now(_IST)
+            target = now.replace(
+                hour=self.settings.square_off_hour,
+                minute=self.settings.square_off_minute,
+                second=0,
+                microsecond=0,
+            )
+            if now >= target:
+                target += timedelta(days=1)
+            wait_s = (target - now).total_seconds()
+            log.info(
+                "Next EOD square-off scheduled",
+                extra={"extra": {"at": target.isoformat(), "in_s": int(wait_s)}},
+            )
+            try:
+                await asyncio.sleep(wait_s)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self._square_off_all()
+            except Exception as exc:  # noqa: BLE001 — never let the scheduler die
+                log.error("EOD square-off failed", extra={"extra": {"error": str(exc)}})
+            # Step past the firing minute so the next loop schedules tomorrow.
+            await asyncio.sleep(60)
+
+    async def _square_off_all(self) -> None:
+        """Force-close every open leg now (S1 + S2) and block re-entry for the day."""
+        ts = int(time.time())
+        # Block re-entry for the rest of the IST day even if nothing is open, so the
+        # bot does not open a fresh position in the window before settlement.
+        self._sq_off_date = datetime.now(_IST).date()
+        log.info("EOD square-off firing", extra={"extra": {"date": str(self._sq_off_date)}})
+
+        # --- Strategy 1: options leg ---
+        if self.settings.options_mode and self.options_executor is not None:
+            try:
+                if self.options_executor.has_open_position:
+                    fill = await self.options_executor.close_option()
+                    if self.ledger.has_open:
+                        self.ledger.close(fill if fill is not None else 0.0, ts)
+                    self.strategy.sync_position(PositionState.FLAT)
+                    self.sm.set_state(PositionState.FLAT)
+                    log.info("EOD square-off: closed short-option leg")
+                    await self.notifier.notify(
+                        NotifyEvent.EXIT, reason="EOD", size=self.settings.option_contracts
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.error("EOD square-off failed for option leg", extra={"extra": {"error": str(exc)}})
+                await self._sync_options_to_exchange()
+            return
+
+        # --- Strategy 1: futures leg ---
+        try:
+            pos = await self.order_engine.current_position()
+            if pos.size == 0:
+                return
+            from ..enums import Side
+
+            side = Side.SELL if pos.size > 0 else Side.BUY
+            await asyncio.to_thread(
+                self.rest.place_market_order, self.settings.product_id, pos.abs_size, side, True
+            )
+            if self.ledger.has_open:
+                self.ledger.close(0.0, ts)
+            self.strategy.sync_position(PositionState.FLAT)
+            self.sm.set_state(PositionState.FLAT)
+            log.info("EOD square-off: closed futures position")
+            await self.notifier.notify(NotifyEvent.EXIT, reason="EOD", size=pos.abs_size)
+        except Exception as exc:  # noqa: BLE001
+            log.error("EOD square-off failed for futures position", extra={"extra": {"error": str(exc)}})
+            await reconciler.reconcile(
+                self.rest, self.settings.product_id, self.sm, context="post-eod"
+            )
+            await self._sync_strategy_to_exchange()
 
     async def _close_on_shutdown(self) -> None:
         # In options mode, buy back the tracked short option rather than touching
