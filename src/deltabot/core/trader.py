@@ -17,8 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from ..config import Settings
@@ -73,7 +72,6 @@ class TradingEngine:
         # settle at 17:30 — the candle-driven square-off only fires when the
         # crossing bar closes, which can lag past settlement.
         self._sq_off_task: asyncio.Task | None = None
-        self._sq_off_date: date | None = None  # IST date entries are blocked for
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -330,18 +328,6 @@ class TradingEngine:
             break
 
     async def _act_on_decision(self, dec: StrategyDecision) -> None:
-        # After the wall-clock EOD square-off, stay flat for the rest of the IST
-        # day: honour exits but suppress new entries (the strategy re-enters by
-        # its own rules, which we override here so we don't re-open into settlement).
-        if self._entries_blocked() and dec.has_entry:
-            if not dec.has_exit:
-                log.info("EOD square-off active — suppressing new entry")
-                return
-            log.info("EOD square-off active — exit only, entry suppressed")
-            dec = replace(
-                dec, buy_signal=False, sell_signal=False, target_state=PositionState.FLAT
-            )
-
         was = self.sm.state
 
         # ---- Options execution path ----
@@ -545,10 +531,6 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     # Wall-clock EOD square-off
     # ------------------------------------------------------------------ #
-    def _entries_blocked(self) -> bool:
-        """True once the wall-clock square-off has fired for the current IST day."""
-        return self._sq_off_date is not None and datetime.now(_IST).date() == self._sq_off_date
-
     async def _square_off_scheduler(self) -> None:
         """Fire the EOD square-off at square_off_hour:minute IST, every day.
 
@@ -584,12 +566,10 @@ class TradingEngine:
             await asyncio.sleep(60)
 
     async def _square_off_all(self) -> None:
-        """Force-close every open leg now (S1 + S2) and block re-entry for the day."""
+        """Force-close any open position now. New entries resume on the next signal
+        (matching the Pine strategy's re-entry after square-off)."""
         ts = int(time.time())
-        # Block re-entry for the rest of the IST day even if nothing is open, so the
-        # bot does not open a fresh position in the window before settlement.
-        self._sq_off_date = datetime.now(_IST).date()
-        log.info("EOD square-off firing", extra={"extra": {"date": str(self._sq_off_date)}})
+        log.info("EOD square-off firing", extra={"extra": {"date": str(datetime.now(_IST).date())}})
 
         # --- Strategy 1: options leg ---
         if self.settings.options_mode and self.options_executor is not None:
