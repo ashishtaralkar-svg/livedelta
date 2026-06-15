@@ -330,9 +330,10 @@ class TradingEngine:
             break
 
     async def _act_on_decision(self, dec: StrategyDecision) -> None:
-        # After the wall-clock EOD square-off, stay flat for the rest of the IST
-        # day: honour exits but suppress new entries (the strategy re-enters by
-        # its own rules, which we override here so we don't re-open into settlement).
+        # During the settlement window (square-off time until entry-resume time,
+        # default 17:25–17:30 IST) honour exits but suppress new entries, so the
+        # bot does not re-open into the 17:30 options settlement. After the resume
+        # time entries flow normally again.
         if self._entries_blocked() and dec.has_entry:
             if not dec.has_exit:
                 log.info("EOD square-off active — suppressing new entry")
@@ -546,8 +547,19 @@ class TradingEngine:
     # Wall-clock EOD square-off
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
-        """True once the wall-clock square-off has fired for the current IST day."""
-        return self._sq_off_date is not None and datetime.now(_IST).date() == self._sq_off_date
+        """True only inside the settlement window: from the square-off until the
+        entry-resume time (default 17:25–17:30 IST). Outside that window entries
+        are allowed, so the bot resumes finding signals after 17:30."""
+        now = datetime.now(_IST)
+        if self._sq_off_date != now.date():
+            return False
+        resume = now.replace(
+            hour=self.settings.entry_resume_hour,
+            minute=self.settings.entry_resume_minute,
+            second=0,
+            microsecond=0,
+        )
+        return now < resume
 
     async def _square_off_scheduler(self) -> None:
         """Fire the EOD square-off at square_off_hour:minute IST, every day.

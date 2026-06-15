@@ -58,8 +58,12 @@ class Settings(BaseSettings):
     day_tz: str = "Asia/Kolkata"
     day_start_hour: int = 5  # a new custom "day" begins at 05:30 in day_tz
     day_start_minute: int = 30
-    square_off_hour: int = 17  # force-exit any open position at 17:29 in day_tz
-    square_off_minute: int = 29
+    square_off_hour: int = 17  # force-exit any open position at 17:25 in day_tz
+    square_off_minute: int = 25
+    # Entries resume at this IST time (after the 17:30 options settlement). Between
+    # the square-off and this time the bot stays flat (the settlement window).
+    entry_resume_hour: int = 17
+    entry_resume_minute: int = 30
 
     # --- Notifications ---
     telegram_token: SecretStr | None = None
