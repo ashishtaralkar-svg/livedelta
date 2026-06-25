@@ -1,0 +1,172 @@
+//@version=5
+// Strategy port of the LIVE BOT logic (src/deltabot/strategy/pine_strategy.py),
+// not just the ashish.pine indicator. Faithful to the bot:
+//   * Entry filters: price clears prev-day open, prev-day close, EMA(high),
+//     EMA(low) AND Supertrend(10,3) aligned (same as the indicator).
+//   * BREAKOUT CONFIRMATION: a signal only arms a pending entry. The trade is
+//     entered when price breaks the signal candle's HIGH (long) / LOW (short).
+//     If the stop level is hit BEFORE the breakout, the pending trade is cancelled.
+//   * STOP = lowest low of the signal bar and its previous bar (long) / highest
+//     high of those two bars (short). Fixed for the life of the trade (no trailing).
+//   * Forced square-off at 17:25 IST; entries stay blocked through the 17:25-17:30
+//     settlement window and resume after 17:30.
+//   * One position at a time; custom trading day starts 05:30 IST.
+strategy("Prev Day O/C + ST + EMA H/L — Bot-faithful Strategy",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpPD = "Previous Day Open/Close"
+dayTZ       = input.string("Asia/Kolkata", "Day Boundary Timezone",  group=grpPD)
+dayStartHr  = input.int(5,  "New Day Start Hour",   minval=0, maxval=23, group=grpPD)
+dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpPD)
+
+grpST = "Supertrend"
+stFactor = input.float(3.0, "Supertrend Factor",     step=0.1, group=grpST)
+stATR    = input.int(10,    "Supertrend ATR Period", minval=1, group=grpST)
+
+grpEMA = "EMA High/Low"
+emaLen = input.int(50, "EMA Length", minval=1, group=grpEMA)
+
+grpSig = "Signals"
+useClose  = input.bool(true, "Use bar close for price (uncheck = use high/low)", group=grpSig)
+sqOffHr   = input.int(17, "Square-Off Hour (IST)",   minval=0, maxval=23, group=grpSig)
+sqOffMin  = input.int(25, "Square-Off Minute",       minval=0, maxval=59, group=grpSig)
+resumeHr  = input.int(17, "Entry Resume Hour (IST)", minval=0, maxval=23, group=grpSig)
+resumeMin = input.int(30, "Entry Resume Minute",     minval=0, maxval=59, group=grpSig)
+
+// ============================================================
+// Custom-day previous OPEN / CLOSE (new day starts 05:30 IST)
+// ============================================================
+offsetMs = (dayStartHr * 60 + dayStartMin) * 60 * 1000
+dayId    = dayofmonth(time - offsetMs, dayTZ)
+isNewDay = ta.change(dayId) != 0
+
+var float pdOpen    = na
+var float pdClose   = na
+var float curOpen   = na
+var float lastClose = na
+if isNewDay
+    pdOpen  := curOpen
+    pdClose := lastClose
+    curOpen := open
+lastClose := close
+
+plot(pdOpen,  "Prev Day Open",  color=color.blue,   style=plot.style_linebr, linewidth=2)
+plot(pdClose, "Prev Day Close", color=color.orange, style=plot.style_linebr, linewidth=2)
+
+// ============================================================
+// Indicators
+// ============================================================
+[stLine, stDir] = ta.supertrend(stFactor, stATR)   // stDir < 0 => uptrend
+emaHigh = ta.ema(high, emaLen)
+emaLow  = ta.ema(low,  emaLen)
+plot(emaHigh, "50 EMA High", color=color.teal,    linewidth=2)
+plot(emaLow,  "50 EMA Low",  color=color.fuchsia, linewidth=2)
+plot(stDir < 0 ? stLine : na, "Supertrend Up",   color=color.green, style=plot.style_linebr, linewidth=2)
+plot(stDir > 0 ? stLine : na, "Supertrend Down", color=color.red,   style=plot.style_linebr, linewidth=2)
+
+// ============================================================
+// Entry conditions (same filters as the bot)
+// ============================================================
+buyPrice  = useClose ? close : low
+sellPrice = useClose ? close : high
+stUp = stDir < 0
+stDn = stDir > 0
+levelsReady = not na(pdOpen) and not na(pdClose)
+levelsAbove = math.max(pdOpen, pdClose, emaHigh, emaLow)
+levelsBelow = math.min(pdOpen, pdClose, emaHigh, emaLow)
+buyCond  = levelsReady and buyPrice  > levelsAbove and stUp
+sellCond = levelsReady and sellPrice < levelsBelow and stDn
+
+// ============================================================
+// Time windows: square-off at 17:25, settlement window 17:25-17:30
+// ============================================================
+sqMins     = sqOffHr   * 60 + sqOffMin
+resumeMins = resumeHr  * 60 + resumeMin
+nowMins    = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOff   = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins  // first bar at/after 17:25
+inWindow    = nowMins >= sqMins and nowMins < resumeMins                        // 17:25-17:30: flat, no entries
+justResumed = inWindow[1] and not inWindow                                      // first bar after 17:30
+
+// ============================================================
+// State machine (mirrors the bot's pending/breakout entry)
+// ============================================================
+var bool  pendLong  = false
+var bool  pendShort = false
+var float pendTrig  = na   // breakout trigger = signal candle high (long) / low (short)
+var float pendSL    = na   // invalidation / protective stop level
+var float longStop  = na   // active long stop once entered
+var float shortStop = na   // active short stop once entered
+
+// ----- 1. Resolve pending entries armed on PRIOR bars (SL-first, like the bot) -----
+if pendLong
+    if open <= pendSL or low <= pendSL
+        pendLong := false                                   // stop hit before breakout -> cancel
+        strategy.cancel("Long")
+    else
+        strategy.entry("Long", strategy.long, stop=pendTrig) // breakout stop-buy at signal candle high
+        longStop := pendSL
+if pendShort
+    if open >= pendSL or high >= pendSL
+        pendShort := false                                  // stop hit before breakout -> cancel
+        strategy.cancel("Short")
+    else
+        strategy.entry("Short", strategy.short, stop=pendTrig) // breakout stop-sell at signal candle low
+        shortStop := pendSL
+
+// ----- 2. Forced square-off + clear any pending inside the settlement window -----
+if squareOff or inWindow
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pendLong  := false
+    pendShort := false
+if squareOff
+    strategy.close_all(comment="EOD")
+
+// ----- 3. Once a position is open, the pending is consumed -----
+if strategy.position_size != 0
+    pendLong  := false
+    pendShort := false
+
+// ----- 4. Protective stop-loss (fixed at entry; fills intrabar at the stop) -----
+if strategy.position_size > 0
+    strategy.exit("Long SL",  from_entry="Long",  stop=longStop)
+if strategy.position_size < 0
+    strategy.exit("Short SL", from_entry="Short", stop=shortStop)
+
+// ----- 5. New signals arm a pending entry (flat, no pending, outside the window) -----
+//        Fresh crossing required, except on the first bar after the 17:30 resume.
+flatNow    = strategy.position_size == 0
+hasPending = pendLong or pendShort
+canSignal  = flatNow and not hasPending and not inWindow and not squareOff
+buySignal  = buyCond  and canSignal and (not buyCond[1]  or justResumed)
+sellSignal = sellCond and canSignal and (not sellCond[1] or justResumed)
+if buySignal
+    pendLong := true
+    pendTrig := high
+    pendSL   := math.min(low, low[1])     // lowest low of signal bar + previous bar
+else if sellSignal
+    pendShort := true
+    pendTrig := low
+    pendSL   := math.max(high, high[1])   // highest high of signal bar + previous bar
+
+// ============================================================
+// Visuals
+// ============================================================
+plotshape(buySignal,  "BUY signal",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(sellSignal, "SELL signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny)
+plot(strategy.position_size > 0 ? longStop  : na, "Long SL",  color=color.red, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 ? shortStop : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=1)
+bgcolor(inWindow ? color.new(color.gray, 85) : na, title="Settlement window (flat)")
