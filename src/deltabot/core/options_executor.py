@@ -48,6 +48,8 @@ class OptionsExecutor:
         self._product_id: int | None = None
         self._size: int = 0
         self._option_type: OptionType | None = None
+        self._symbol: str | None = None  # human-readable contract, e.g. C-BTC-61400-250626
+        self._strike: float | None = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -68,11 +70,23 @@ class OptionsExecutor:
     def tracked_product_id(self) -> int | None:
         return self._product_id
 
-    def adopt(self, product_id: int, size: int, option_type: OptionType) -> None:
-        """Adopt an existing short option position discovered during reconciliation."""
+    @property
+    def tracked_symbol(self) -> str | None:
+        """Human-readable contract symbol of the tracked leg (e.g. C-BTC-61400-250626)."""
+        return self._symbol
+
+    @property
+    def tracked_strike(self) -> float | None:
+        return self._strike
+
+    def adopt(
+        self, product_id: int, size: int, option_type: OptionType, symbol: str | None = None
+    ) -> None:
+        """Adopt an existing long option position discovered during reconciliation."""
         self._product_id = product_id
         self._size = abs(size)
         self._option_type = option_type
+        self._symbol = symbol
         log.info(
             "Adopted existing option position",
             extra={"extra": {"product_id": product_id, "size": self._size, "type": option_type.value}},
@@ -83,6 +97,8 @@ class OptionsExecutor:
         self._product_id = None
         self._size = 0
         self._option_type = None
+        self._symbol = None
+        self._strike = None
 
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
         """Open a long option position from the strategy signal direction.
@@ -124,7 +140,7 @@ class OptionsExecutor:
         # Margin pre-check (best-effort balance floor; the exchange is the final authority).
         await self._check_balance()
 
-        product_id, strike = await self._select_contract(
+        product_id, strike, symbol = await self._select_contract(
             underlying, expiry, target_strike, option_type
         )
 
@@ -137,6 +153,8 @@ class OptionsExecutor:
         self._product_id = product_id
         self._size = size
         self._option_type = option_type
+        self._symbol = symbol
+        self._strike = strike
 
         log.info(
             "Option BUY order placed",
@@ -194,7 +212,7 @@ class OptionsExecutor:
     # ------------------------------------------------------------------ #
     async def _select_contract(
         self, underlying: str, expiry: date, target_strike: int, option_type: OptionType
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float, str]:
         """Pick the best (nearest-to-target) LISTED option contract.
 
         Queries the live chain and snaps to the listed strike closest to
@@ -202,7 +220,7 @@ class OptionsExecutor:
         (100/200/250/1000) and never builds an unlisted symbol. Falls back to
         direct symbol resolution if the chain query returns nothing.
 
-        Returns ``(product_id, chosen_strike)``.
+        Returns ``(product_id, chosen_strike, symbol)``.
         """
         try:
             chain = await asyncio.to_thread(
@@ -229,7 +247,7 @@ class OptionsExecutor:
                     }
                 },
             )
-            return best["product_id"], best["strike"]
+            return best["product_id"], best["strike"], best["symbol"]
 
         # Fallback: build the symbol directly with the rounded target strike.
         log.warning(
@@ -239,7 +257,8 @@ class OptionsExecutor:
         product_id = await asyncio.to_thread(
             self._rest.resolve_option_product_id, underlying, expiry, target_strike, option_type
         )
-        return product_id, float(target_strike)
+        symbol = f"{option_type.value}-{underlying}-{target_strike}-{expiry.strftime('%d%m%y')}"
+        return product_id, float(target_strike), symbol
 
     async def _check_balance(self) -> None:
         """Best-effort margin gate: skip the sell if available balance is below the

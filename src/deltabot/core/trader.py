@@ -348,24 +348,29 @@ class TradingEngine:
         # ---- Options execution path ----
         if self.settings.options_mode:
             assert self.options_executor is not None
+            exit_trip = None
+            exit_contract: str | None = None
+            entry_fill: float | None = None
             try:
                 # Exit before entry so a same-bar reversal sells the old long first.
                 if dec.has_exit:
+                    # Capture the contract BEFORE closing (close clears the tracking).
+                    exit_contract = self.options_executor.tracked_symbol
                     fill = await self.options_executor.close_option()
                     if self.ledger.has_open:
-                        self.ledger.close(
+                        exit_trip = self.ledger.close(
                             fill if fill is not None else dec.candle.close, dec.candle.start_time
                         )
                 if dec.has_entry:
                     signal_dir = SignalDir.LONG if dec.buy_signal else SignalDir.SHORT
-                    fill = await self.options_executor.open_option(signal_dir, dec.candle.close)
+                    entry_fill = await self.options_executor.open_option(signal_dir, dec.candle.close)
                     # We are LONG the option leg regardless of the BTC direction; track
                     # it in the ledger with the option-lot quantity so PnL/summary work
                     # (long option => profit when the premium rises).
                     qty = self.settings.option_contracts * 0.001
                     self.ledger.open(
                         SignalDir.LONG.value,
-                        fill if fill is not None else dec.candle.close,
+                        entry_fill if entry_fill is not None else dec.candle.close,
                         dec.candle.start_time,
                         qty_btc=qty,
                     )
@@ -380,7 +385,7 @@ class TradingEngine:
                 await self._sync_options_to_exchange()
                 return
             self.sm.set_state(dec.target_state)
-            await self._notify_decision(was, dec)
+            await self._notify_option_decision(dec, exit_trip, exit_contract, entry_fill)
             return
 
         # ---- Futures execution path (unchanged) ----
@@ -418,6 +423,35 @@ class TradingEngine:
 
         self.sm.set_state(dec.target_state)
         await self._notify_decision(was, dec)
+
+    async def _notify_option_decision(
+        self,
+        dec: StrategyDecision,
+        exit_trip,
+        exit_contract: str | None,
+        entry_fill: float | None,
+    ) -> None:
+        """Telegram alerts for the options leg: contract, premiums, per-trade PnL."""
+        # Exit first (so a reversal reports the closed trade, then the new entry).
+        if dec.has_exit and exit_trip is not None:
+            await self.notifier.notify(
+                NotifyEvent.EXIT,
+                reason=dec.exit_reason or "EXIT",
+                contract=exit_contract or "?",
+                entry_premium=exit_trip.entry_price,  # what we paid to buy
+                exit_premium=exit_trip.exit_price,     # what we sold it back for
+                pnl=exit_trip.pnl,
+                size=self.settings.option_contracts,
+            )
+        if dec.has_entry:
+            is_long = dec.buy_signal
+            await self.notifier.notify(
+                NotifyEvent.ENTRY_LONG if is_long else NotifyEvent.ENTRY_SHORT,
+                direction="CALL" if is_long else "PUT",
+                contract=self.options_executor.tracked_symbol or "?",
+                premium=entry_fill,
+                btc_price=dec.candle.close,
+            )
 
     async def _notify_decision(self, was: PositionState, dec: StrategyDecision) -> None:
         if dec.has_exit and not dec.has_entry:
@@ -507,7 +541,7 @@ class TradingEngine:
             )
         pos = longs[0]
         opt_type = OptionType.CALL if pos["symbol"].startswith("C-") else OptionType.PUT
-        self.options_executor.adopt(pos["product_id"], pos["size"], opt_type)
+        self.options_executor.adopt(pos["product_id"], pos["size"], opt_type, pos.get("symbol"))
         # Long CALL => BTC-bullish (LONG); long PUT => BTC-bearish (SHORT).
         state = PositionState.LONG if opt_type == OptionType.CALL else PositionState.SHORT
         self.strategy.sync_position(state, entry_price=pos["entry_price"])
@@ -608,14 +642,25 @@ class TradingEngine:
         if self.settings.options_mode and self.options_executor is not None:
             try:
                 if self.options_executor.has_open_position:
+                    contract = self.options_executor.tracked_symbol
                     fill = await self.options_executor.close_option()
-                    if self.ledger.has_open:
+                    trip = (
                         self.ledger.close(fill if fill is not None else 0.0, ts)
+                        if self.ledger.has_open
+                        else None
+                    )
                     self.strategy.sync_position(PositionState.FLAT)
                     self.sm.set_state(PositionState.FLAT)
-                    log.info("EOD square-off: closed short-option leg")
+                    log.info("EOD square-off: closed long-option leg")
+                    extra = (
+                        {"contract": contract or "?", "entry_premium": trip.entry_price,
+                         "exit_premium": trip.exit_price, "pnl": trip.pnl}
+                        if trip is not None and fill is not None
+                        else {}
+                    )
                     await self.notifier.notify(
-                        NotifyEvent.EXIT, reason="EOD", size=self.settings.option_contracts
+                        NotifyEvent.EXIT, reason="EOD",
+                        size=self.settings.option_contracts, **extra
                     )
             except Exception as exc:  # noqa: BLE001
                 log.error("EOD square-off failed for option leg", extra={"extra": {"error": str(exc)}})
