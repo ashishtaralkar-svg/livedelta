@@ -349,7 +349,7 @@ class TradingEngine:
         if self.settings.options_mode:
             assert self.options_executor is not None
             try:
-                # Exit before entry so a same-bar reversal buys back the old short first.
+                # Exit before entry so a same-bar reversal sells the old long first.
                 if dec.has_exit:
                     fill = await self.options_executor.close_option()
                     if self.ledger.has_open:
@@ -359,11 +359,12 @@ class TradingEngine:
                 if dec.has_entry:
                     signal_dir = SignalDir.LONG if dec.buy_signal else SignalDir.SHORT
                     fill = await self.options_executor.open_option(signal_dir, dec.candle.close)
-                    # We are SHORT the option leg regardless of the BTC direction; track
-                    # it in the ledger with the option-lot quantity so PnL/summary work.
+                    # We are LONG the option leg regardless of the BTC direction; track
+                    # it in the ledger with the option-lot quantity so PnL/summary work
+                    # (long option => profit when the premium rises).
                     qty = self.settings.option_contracts * 0.001
                     self.ledger.open(
-                        SignalDir.SHORT.value,
+                        SignalDir.LONG.value,
                         fill if fill is not None else dec.candle.close,
                         dec.candle.start_time,
                         qty_btc=qty,
@@ -467,8 +468,8 @@ class TradingEngine:
     async def _sync_options_to_exchange(self) -> None:
         """Reconcile the tracked option leg and strategy state against the exchange.
 
-        On startup/reconnect, scan for any open SHORT option on our underlying. A
-        short PUT corresponds to a BTC-bullish (LONG) strategy state; a short CALL
+        On startup/reconnect, scan for any open LONG option on our underlying. A
+        long CALL corresponds to a BTC-bullish (LONG) strategy state; a long PUT
         to a BTC-bearish (SHORT) state. If none is open, reset everything to flat.
 
         Note: the BTC stop level cannot be recovered after a restart (it is unknown
@@ -489,36 +490,36 @@ class TradingEngine:
             )
             return
 
-        shorts = [p for p in positions if p["size"] < 0]
-        if not shorts:
+        longs = [p for p in positions if p["size"] > 0]
+        if not longs:
             self.options_executor.clear()
             self.strategy.sync_position(PositionState.FLAT)
             self.sm.set_state(PositionState.FLAT)
             if self.ledger.has_open:
                 self.ledger.close(0.0)
-            log.info("Options reconcile: no open short option — state FLAT")
+            log.info("Options reconcile: no open long option — state FLAT")
             return
 
-        if len(shorts) > 1:
+        if len(longs) > 1:
             log.warning(
-                "Options reconcile: multiple open short options found — adopting the first",
-                extra={"extra": {"symbols": [p["symbol"] for p in shorts]}},
+                "Options reconcile: multiple open long options found — adopting the first",
+                extra={"extra": {"symbols": [p["symbol"] for p in longs]}},
             )
-        pos = shorts[0]
+        pos = longs[0]
         opt_type = OptionType.CALL if pos["symbol"].startswith("C-") else OptionType.PUT
         self.options_executor.adopt(pos["product_id"], pos["size"], opt_type)
-        # Short PUT => BTC-bullish (LONG); short CALL => BTC-bearish (SHORT).
-        state = PositionState.LONG if opt_type == OptionType.PUT else PositionState.SHORT
+        # Long CALL => BTC-bullish (LONG); long PUT => BTC-bearish (SHORT).
+        state = PositionState.LONG if opt_type == OptionType.CALL else PositionState.SHORT
         self.strategy.sync_position(state, entry_price=pos["entry_price"])
         self.sm.set_state(state)
         if not self.ledger.has_open:
             self.ledger.open(
-                SignalDir.SHORT.value,
+                SignalDir.LONG.value,
                 pos["entry_price"] or 0.0,
                 qty_btc=self.settings.option_contracts * 0.001,
             )
         log.info(
-            "Options reconcile: adopted open short option",
+            "Options reconcile: adopted open long option",
             extra={
                 "extra": {
                     "symbol": pos["symbol"],
@@ -646,7 +647,7 @@ class TradingEngine:
             await self._sync_strategy_to_exchange()
 
     async def _close_on_shutdown(self) -> None:
-        # In options mode, buy back the tracked short option rather than touching
+        # In options mode, sell the tracked long option rather than touching
         # the perpetual product_id (which would find a flat position and no-op).
         if self.settings.options_mode and self.options_executor is not None:
             try:

@@ -1,12 +1,12 @@
-"""Options execution engine — translates strategy signals into C/P short trades.
+"""Options execution engine — translates strategy signals into C/P long trades.
 
 When OPTIONS_MODE is enabled the underlying BTC price and the existing
 Supertrend/EMA/Prev-Day strategy are still used for signal generation.
 Execution is replaced:
 
-  BUY  signal  -> Sell ITM PUT  (P)  (strike = round(btc_close + offset, interval))
-  SELL signal  -> Sell ITM CALL (C)  (strike = round(btc_close - offset, interval))
-  Exit (SL/EOD)-> Buy back (reduce-only) the tracked short option at market price
+  BUY  signal  -> Buy ITM CALL (C)  (strike = round(btc_close - offset, interval))
+  SELL signal  -> Buy ITM PUT  (P)  (strike = round(btc_close + offset, interval))
+  Exit (SL/EOD)-> Sell (reduce-only) the tracked long option at market price
 
 Delta Exchange uses single-letter C/P designators (NOT the NSE CE/PE convention).
 The contract symbol is ``{C|P}-{UNDERLYING}-{STRIKE}-{ddmmyy}`` (e.g.
@@ -85,13 +85,13 @@ class OptionsExecutor:
         self._option_type = None
 
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
-        """Open a short option position from the strategy signal direction.
+        """Open a long option position from the strategy signal direction.
 
-        ``signal_dir``: ``SignalDir.LONG`` (+1) -> sell PUT; ``SignalDir.SHORT``
-        (-1) -> sell CALL. ``btc_price``: close of the just-closed BTC candle used
+        ``signal_dir``: ``SignalDir.LONG`` (+1) -> buy CALL; ``SignalDir.SHORT``
+        (-1) -> buy PUT. ``btc_price``: close of the just-closed BTC candle used
         for the ATM reference. Returns the average fill price (or ``None``).
 
-        State is recorded ONLY after the SELL is accepted, so a failure before the
+        State is recorded ONLY after the BUY is accepted, so a failure before the
         fill leaves us cleanly flat. Raises :class:`OptionsMarginError` if the
         balance pre-check fails, or :class:`DeltaRestError` if the contract cannot
         be resolved — both are handled by the caller without crashing the engine.
@@ -103,7 +103,7 @@ class OptionsExecutor:
             )
             return None
 
-        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
+        option_type = OptionType.CALL if signal_dir == SignalDir.LONG else OptionType.PUT
         target_strike = self._calc_strike(btc_price, option_type)
         expiry = self._select_expiry()
         underlying = self.underlying
@@ -130,16 +130,16 @@ class OptionsExecutor:
 
         size = self._settings.option_contracts
         result = await asyncio.to_thread(
-            self._rest.place_market_order, product_id, size, Side.SELL
+            self._rest.place_market_order, product_id, size, Side.BUY
         )
 
-        # Record state only AFTER the SELL has been accepted by the exchange.
+        # Record state only AFTER the BUY has been accepted by the exchange.
         self._product_id = product_id
         self._size = size
         self._option_type = option_type
 
         log.info(
-            "Option SELL order placed",
+            "Option BUY order placed",
             extra={
                 "extra": {
                     "product_id": product_id,
@@ -152,10 +152,10 @@ class OptionsExecutor:
         return result.average_fill_price
 
     async def close_option(self) -> float | None:
-        """Buy back (reduce-only) the tracked short option to close the position.
+        """Sell (reduce-only) the tracked long option to close the position.
 
         Returns the average fill price (or ``None`` if nothing was tracked). State
-        is cleared ONLY after the buy-back is accepted, so a failure leaves the
+        is cleared ONLY after the sell is accepted, so a failure leaves the
         position tracked for a retry rather than orphaning it.
         """
         if self._product_id is None:
@@ -168,16 +168,16 @@ class OptionsExecutor:
         log.info("Options exit", extra={"extra": {"product_id": product_id, "size": size}})
 
         result = await asyncio.to_thread(
-            self._rest.place_market_order, product_id, size, Side.BUY, True  # reduce_only=True
+            self._rest.place_market_order, product_id, size, Side.SELL, True  # reduce_only=True
         )
 
-        # Clear state only AFTER the buy-back has been accepted.
+        # Clear state only AFTER the sell has been accepted.
         self._product_id = None
         self._size = 0
         self._option_type = None
 
         log.info(
-            "Option BUY (close) order placed",
+            "Option SELL (close) order placed",
             extra={
                 "extra": {
                     "product_id": product_id,
@@ -271,8 +271,8 @@ class OptionsExecutor:
     def _calc_strike(self, btc_price: float, option_type: OptionType) -> int:
         """Compute the TARGET strike (the bot then snaps to the nearest listed one).
 
-        PUT (sold on a BUY signal):  strike = price + offset  (ITM put)
-        CALL (sold on a SELL signal): strike = price - offset  (ITM call)
+        CALL (bought on a BUY signal): strike = price - offset  (ITM call)
+        PUT  (bought on a SELL signal): strike = price + offset  (ITM put)
 
         Rounded to ``option_strike_interval`` for a tidy target; the actual traded
         strike is the nearest LISTED strike chosen by :meth:`_select_contract`, so
