@@ -144,9 +144,19 @@ def main() -> None:
              "long = BUY ITM CALL on BUY signal, BUY ITM PUT on SELL signal; "
              "both = both strategies in one file (default)",
     )
+    ap.add_argument("--offset", type=int, default=None, help="ITM depth in points (default from .env option_offset)")
+    ap.add_argument("--lots", type=int, default=None, help="option lots (default from .env option_contracts)")
+    ap.add_argument("--target-premium", type=float, default=None,
+                    help="pick the strike whose entry premium is closest to this (overrides --offset)")
+    ap.add_argument("--take-profit", type=float, default=None,
+                    help="take-profit %% of premium for long options (e.g. 100 = exit at 2x entry)")
     args = ap.parse_args()
 
     settings = load_settings()
+    if args.offset is not None:
+        settings.option_offset = args.offset
+    if args.lots is not None:
+        settings.option_contracts = args.lots
     setup_logging("WARNING")  # quiet the download/info logs; we print our own report
     resolution = args.resolution or settings.resolution
     step = _RES_SECONDS.get(resolution, 300)
@@ -185,7 +195,9 @@ def main() -> None:
     with httpx.Client(base_url=settings.rest_base_url, timeout=30.0) as client:
         for mode in modes:
             recs = _price_trips(client, window_trips, mode, settings,
-                                underlying, lots, resolution, step)
+                                underlying, lots, resolution, step,
+                                target_premium=args.target_premium, cache={},
+                                take_profit_pct=args.take_profit)
             results[mode] = recs
             priced = sum(1 for r in recs if r["pnl_usd"] is not None)
             wins = sum(1 for r in recs if (r["pnl_usd"] or 0) > 0)
@@ -229,9 +241,58 @@ def main() -> None:
     print(f"\nSingle Excel written to {out_path.resolve()}")
 
 
-def _price_trips(client, window_trips, mode, settings, underlying, lots, resolution, step):
+def _resolve_by_premium(
+    client, underlying, otype, entry_btc, expiry, interval, target_premium,
+    entry_ts, exit_ts, win_start, win_end, resolution, step, cache,
+):
+    """Pick the strike whose ENTRY premium is closest to ``target_premium``.
+
+    Scans from ATM outward toward OTM (premium falls) until it brackets the
+    target, plus a few ITM steps in case the ATM premium is already below it.
+    Returns ``(symbol, strike, candles)`` or None.
+    """
+    ddmmyy = expiry.strftime("%d%m%y")
+    atm = int(round(entry_btc / interval) * interval)
+    otm = interval if otype == OptionType.CALL else -interval  # toward OTM = cheaper
+
+    def ev(strike):
+        symbol = f"{otype.value}-{underlying}-{strike}-{ddmmyy}"
+        if symbol not in cache:
+            cache[symbol] = _fetch_option_candles(client, symbol, win_start, win_end, resolution)
+        candles = cache[symbol]
+        if not candles:
+            return None
+        ein = _premium_at(candles, entry_ts, step)
+        eout = _premium_at(candles, exit_ts, step)
+        return (symbol, strike, candles, ein) if (ein is not None and eout is not None) else None
+
+    best = None  # (abs_diff, symbol, strike, candles)
+    strike = atm
+    for _ in range(30):                 # OTM scan, premium decreasing
+        r = ev(strike)
+        if r is not None:
+            diff = abs(r[3] - target_premium)
+            if best is None or diff < best[0]:
+                best = (diff, r[0], r[1], r[2])
+            if r[3] <= target_premium:  # bracketed the target
+                break
+        strike += otm
+    strike = atm - otm
+    for _ in range(6):                  # a few ITM steps (premium increasing)
+        r = ev(strike)
+        if r is not None:
+            diff = abs(r[3] - target_premium)
+            if best is None or diff < best[0]:
+                best = (diff, r[0], r[1], r[2])
+        strike -= otm
+    return (best[1], best[2], best[3]) if best else None
+
+
+def _price_trips(client, window_trips, mode, settings, underlying, lots, resolution, step,
+                 target_premium=None, cache=None, take_profit_pct=None):
     """Price every trip for one option strategy ``mode`` and return record dicts."""
     off = settings.option_offset
+    cache = cache if cache is not None else {}
     records: list[dict] = []
     for t in window_trips:
         is_buy = t.direction == SignalDir.LONG.value
@@ -248,18 +309,35 @@ def _price_trips(client, window_trips, mode, settings, underlying, lots, resolut
         expiry = _select_expiry_date(t.entry_time, settings.option_expiry_cutoff_hour)
         o_start = t.entry_time - 2 * 86400
         o_end = t.exit_time + 2 * 86400
-        resolved = _resolve_contract(
-            client, underlying, otype, int(target), expiry,
-            settings.option_strike_interval, t.entry_time, t.exit_time,
-            o_start, o_end, resolution, step,
-        )
+        if target_premium is not None:
+            resolved = _resolve_by_premium(
+                client, underlying, otype, t.entry_price, expiry,
+                settings.option_strike_interval, target_premium,
+                t.entry_time, t.exit_time, o_start, o_end, resolution, step, cache,
+            )
+        else:
+            resolved = _resolve_contract(
+                client, underlying, otype, int(target), expiry,
+                settings.option_strike_interval, t.entry_time, t.exit_time,
+                o_start, o_end, resolution, step,
+            )
         sym = None
         strike = int(round(target / settings.option_strike_interval) * settings.option_strike_interval)
         entry_prem = exit_prem = pnl_gross = fee = pnl_net = None
+        exit_time_eff = t.exit_time
+        tp_hit = False
         if resolved is not None:
             sym, strike, ocandles = resolved
             entry_prem = _premium_at(ocandles, t.entry_time, step)
             exit_prem = _premium_at(ocandles, t.exit_time, step)
+            # Take-profit (long only): exit when the option premium first reaches
+            # entry*(1+tp/100) intrabar, before the strategy's SL/EOD exit.
+            if take_profit_pct is not None and mode != "short" and entry_prem:
+                tp_price = entry_prem * (1.0 + take_profit_pct / 100.0)
+                for ts in sorted(k for k in ocandles if t.entry_time < k <= t.exit_time):
+                    if ocandles[ts].high >= tp_price:
+                        exit_prem, exit_time_eff, tp_hit = tp_price, ts, True
+                        break
             # Short profits when premium falls; long profits when it rises.
             pnl_gross = ((entry_prem - exit_prem) if mode == "short" else (exit_prem - entry_prem)) * lots * _LOT_BTC
             fee = _side_fee(t.entry_price, entry_prem, lots) + _side_fee(t.exit_price, exit_prem, lots)
@@ -271,7 +349,8 @@ def _price_trips(client, window_trips, mode, settings, underlying, lots, resolut
             "contract": sym or f"{otype.value}-{underlying}-{strike}-{expiry:%d%m%y}",
             "strike": strike,
             "entry_time_ist": _ist(t.entry_time),
-            "exit_time_ist": _ist(t.exit_time),
+            "exit_time_ist": _ist(exit_time_eff),
+            "exit_reason": "TP" if tp_hit else "SL/EOD",
             "btc_entry_price": round(t.entry_price, 1),
             "btc_exit_price": round(t.exit_price, 1),
             "option_entry_price": round(entry_prem, 1) if entry_prem is not None else None,
