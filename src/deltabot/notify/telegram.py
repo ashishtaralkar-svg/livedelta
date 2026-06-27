@@ -36,11 +36,11 @@ def _num(x, digits: int = 1) -> str:
 def _format(event: NotifyEvent, ctx: dict) -> str:
     emoji = _EMOJI.get(event, "ℹ️")
     if event in (NotifyEvent.ENTRY_LONG, NotifyEvent.ENTRY_SHORT):
-        # Options entry: show the contract bought and the premium paid.
+        # Options entry: show the contract sold and the premium received.
         if ctx.get("contract"):
             return (
-                f"{emoji} <b>BUY {ctx.get('direction')}</b> {ctx.get('contract')}\n"
-                f"Buy premium: {_num(ctx.get('premium'))}\n"
+                f"{emoji} <b>SELL {ctx.get('direction')}</b> {ctx.get('contract')}\n"
+                f"Sell premium: {_num(ctx.get('premium'))}\n"
                 f"BTC: {_num(ctx.get('btc_price'))}"
             )
         return f"{emoji} <b>ENTRY {ctx.get('direction')}</b> {ctx.get('symbol')} @ {ctx.get('price'):.2f}"
@@ -56,7 +56,7 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
             pnl_mark = "🟢" if isinstance(pnl, (int, float)) and pnl >= 0 else "🔴"
             return (
                 f"{emoji} <b>EXIT</b> ({ctx.get('reason', '')}) {ctx.get('contract')}\n"
-                f"Buy: {_num(ctx.get('entry_premium'))} → Sell: {_num(ctx.get('exit_premium'))}\n"
+                f"Sell: {_num(ctx.get('entry_premium'))} → Buy: {_num(ctx.get('exit_premium'))}\n"
                 f"{pnl_mark} PnL: {_num(pnl, 2)} USD"
             )
         return f"{emoji} <b>EXIT</b> ({ctx.get('reason', '')}) size={ctx.get('size')}"
