@@ -57,6 +57,7 @@ class TradingEngine:
             square_off_hour=settings.square_off_hour,
             square_off_minute=settings.square_off_minute,
             use_close=settings.use_close,
+            skip_weekdays=settings.skip_weekday_ints,
         )
         self.sm = PositionStateMachine(contracts=settings.contracts)
         self.ledger = TradeLedger(contract_value=0.001, contracts=settings.contracts)

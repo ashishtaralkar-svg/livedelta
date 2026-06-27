@@ -108,6 +108,7 @@ class PineStrategy:
         square_off_hour: int = 17,
         square_off_minute: int = 30,
         use_close: bool = True,
+        skip_weekdays: frozenset[int] = frozenset(),
     ) -> None:
         self.atr_period = atr_period
         self.st_multiplier = st_multiplier
@@ -116,6 +117,8 @@ class PineStrategy:
         self._day_offset_s = (day_start_hour * 60 + day_start_minute) * 60
         self._sq_mins = square_off_hour * 60 + square_off_minute
         self.use_close = use_close
+        # IST weekdays (Mon=0..Sun=6) on which NEW entries are blocked (exits run).
+        self._skip_weekdays = skip_weekdays
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -263,13 +266,17 @@ class PineStrategy:
         Returns ``(confirmed, invalidated, entry_price)``.  Mutates strategy state
         on confirmation or invalidation so the closed-candle path sees no pending.
         """
+        skip_day = (
+            datetime.fromtimestamp(candle.start_time, tz=self._tz).weekday()
+            in self._skip_weekdays
+        )
         if self._pending_long and self._pending_long_trigger is not None and self._pending_long_sl is not None:
             sl, trig = self._pending_long_sl, self._pending_long_trigger
             if candle.open <= sl or candle.low <= sl:
                 self._pending_long = False
                 self._pending_long_trigger = self._pending_long_sl = None
                 return False, True, 0.0
-            if candle.open >= trig or candle.high >= trig:
+            if (candle.open >= trig or candle.high >= trig) and not skip_day:
                 self._in_long, self._in_short = True, False
                 self._long_prev_low = sl
                 self._long_entry = trig
@@ -283,7 +290,7 @@ class PineStrategy:
                 self._pending_short = False
                 self._pending_short_trigger = self._pending_short_sl = None
                 return False, True, 0.0
-            if candle.open <= trig or candle.low <= trig:
+            if (candle.open <= trig or candle.low <= trig) and not skip_day:
                 self._in_short, self._in_long = True, False
                 self._short_prev_high = sl
                 self._short_entry = trig
@@ -325,6 +332,7 @@ class PineStrategy:
             and self._prev_now_mins < self._sq_mins
         )
         after_sq_off = self._prev_square_off
+        skip_day = local.weekday() in self._skip_weekdays  # block NEW entries this IST day
 
         # --- Entry conditions ---
         buy_price = candle.close if self.use_close else candle.low
@@ -365,7 +373,7 @@ class PineStrategy:
                     # SL crossed before trigger — trade invalid
                     self._pending_long = False
                     self._pending_long_trigger = self._pending_long_sl = None
-                elif candle.open >= trig or candle.high >= trig:
+                elif (candle.open >= trig or candle.high >= trig) and not skip_day:
                     # Price crossed above signal candle high — confirmed entry
                     confirmed_buy = True
                     confirmed_entry_price = trig
@@ -381,7 +389,7 @@ class PineStrategy:
                     # SL crossed before trigger — trade invalid
                     self._pending_short = False
                     self._pending_short_trigger = self._pending_short_sl = None
-                elif candle.open <= trig or candle.low <= trig:
+                elif (candle.open <= trig or candle.low <= trig) and not skip_day:
                     # Price crossed below signal candle low — confirmed entry
                     confirmed_sell = True
                     confirmed_entry_price = trig
@@ -396,10 +404,12 @@ class PineStrategy:
         has_pending = self._pending_long or self._pending_short
         flat = (not self._in_long or long_exit) and (not self._in_short or short_exit) and not has_pending
         new_buy_signal = bool(
-            buy_cond and flat and not square_off and (not self._prev_buy_cond or after_sq_off)
+            buy_cond and flat and not square_off and not skip_day
+            and (not self._prev_buy_cond or after_sq_off)
         )
         new_sell_signal = bool(
-            sell_cond and flat and not square_off and (not self._prev_sell_cond or after_sq_off)
+            sell_cond and flat and not square_off and not skip_day
+            and (not self._prev_sell_cond or after_sq_off)
         )
 
         long_exit_price = (

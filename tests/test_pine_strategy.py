@@ -76,6 +76,18 @@ def test_prev_day_levels_track_custom_day_boundary():
 
 
 # --------------------------------------------------------------------------- #
+# Day-of-week entry filter
+# --------------------------------------------------------------------------- #
+def test_skip_weekdays_blocks_new_entries():
+    # Baseline: the uptrend fires at least one buy.
+    base = _uptrend(_strategy(square_off_hour=23))
+    assert any(d and d.buy_signal for d in base)
+    # Skipping every weekday blocks all entries (exits/levels still run).
+    blocked = _uptrend(_strategy(square_off_hour=23, skip_weekdays=frozenset(range(7))))
+    assert not any(d and (d.buy_signal or d.sell_signal) for d in blocked)
+
+
+# --------------------------------------------------------------------------- #
 # Entries
 # --------------------------------------------------------------------------- #
 def test_uptrend_fires_a_single_buy_and_goes_long():

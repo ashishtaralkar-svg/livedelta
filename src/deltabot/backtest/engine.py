@@ -59,6 +59,7 @@ class BacktestEngine:
             square_off_hour=s.square_off_hour,
             square_off_minute=s.square_off_minute,
             use_close=s.use_close,
+            skip_weekdays=s.skip_weekday_ints,
         )
 
     def run(self, candles: list[Candle]) -> BacktestResult:

@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # the square-off and this time the bot stays flat (the settlement window).
     entry_resume_hour: int = 17
     entry_resume_minute: int = 30
+    # Day-of-week entry filter: comma-separated IST day names whose NEW entries are
+    # blocked (exits still run). e.g. "Sat" or "Sat,Sun". Empty = trade every day.
+    skip_weekdays: str = ""
 
     # --- Notifications ---
     telegram_token: SecretStr | None = None
@@ -84,6 +87,14 @@ class Settings(BaseSettings):
     heartbeat_timeout_s: float = 35.0
     fill_confirm_timeout_s: float = 10.0
     log_level: str = "INFO"
+
+    @property
+    def skip_weekday_ints(self) -> frozenset[int]:
+        """``skip_weekdays`` parsed to weekday ints (Mon=0 .. Sun=6)."""
+        idx = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+        out = {idx[t.strip().lower()[:3]] for t in self.skip_weekdays.replace(";", ",").split(",")
+               if t.strip().lower()[:3] in idx}
+        return frozenset(out)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
