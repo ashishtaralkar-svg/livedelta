@@ -1,31 +1,13 @@
 services:
-  deltabot:
+  revbreakbot:
     build: .
     image: deltabot:latest
-    container_name: deltabot
-    # Auto-restart on crash and on host reboot (with Docker service enabled).
-    restart: always
-    env_file:
-      - .env
-    volumes:
-      - ./state:/app/state   # persists position_state.json across restarts
-    # Structured JSON logs to stdout are captured by the json-file driver and
-    # can be shipped to CloudWatch via the CW agent.
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-    stop_grace_period: 30s
-
-  revbreakbot:
-    image: deltabot:latest   # same image, different env
     container_name: revbreakbot
     restart: always
     env_file:
-      - .env.revbreak         # separate credentials + RevBreak settings
+      - .env.revbreak
     volumes:
-      - ./state:/app/state   # shared state dir; each bot uses its own file inside
+      - ./state:/app/state
     logging:
       driver: json-file
       options:
