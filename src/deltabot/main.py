@@ -6,6 +6,7 @@ import asyncio
 import signal
 
 from .config import Settings, load_settings
+from .core.revbreak_trader import RevBreakEngine
 from .core.trader import TradingEngine
 from .enums import NotifyEvent
 from .exchange.rest_client import RestClient
@@ -25,7 +26,10 @@ async def run(settings: Settings) -> None:
     notifier = TelegramNotifier(settings)
     await notifier.start()
 
-    engine = TradingEngine(settings, rest, notifier)
+    if settings.strategy == "revbreak":
+        engine: TradingEngine | RevBreakEngine = RevBreakEngine(settings, rest, notifier)
+    else:
+        engine = TradingEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)
 
     stop_event = asyncio.Event()

@@ -38,11 +38,14 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
     if event in (NotifyEvent.ENTRY_LONG, NotifyEvent.ENTRY_SHORT):
         # Options entry: show the contract sold and the premium received.
         if ctx.get("contract"):
-            return (
+            msg = (
                 f"{emoji} <b>SELL {ctx.get('direction')}</b> {ctx.get('contract')}\n"
                 f"Sell premium: {_num(ctx.get('premium'))}\n"
                 f"BTC: {_num(ctx.get('btc_price'))}"
             )
+            if ctx.get("sl_level") is not None:
+                msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
+            return msg
         return f"{emoji} <b>ENTRY {ctx.get('direction')}</b> {ctx.get('symbol')} @ {ctx.get('price'):.2f}"
     if event == NotifyEvent.REVERSAL:
         return (

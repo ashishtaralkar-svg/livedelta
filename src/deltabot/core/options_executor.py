@@ -100,6 +100,71 @@ class OptionsExecutor:
         self._symbol = None
         self._strike = None
 
+    async def open_option_by_premium(
+        self, signal_dir: int, target_premium: float
+    ) -> tuple[float | None, str | None]:
+        """Open a short option whose MARK PRICE is closest to ``target_premium``.
+
+        Queries the live option chain, picks the nearest-premium listed strike,
+        places a SELL order, and returns ``(fill_price, symbol)``. Returns
+        ``(None, None)`` on failure (chain empty, margin error, etc.) — the caller
+        must handle this gracefully without crashing.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_premium called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None
+
+        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
+        expiry = self._select_expiry()
+        underlying = self.underlying
+
+        try:
+            chain = await asyncio.to_thread(
+                self._rest.get_option_chain, underlying, expiry, option_type
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("get_option_chain failed in open_option_by_premium", extra={"extra": {"error": str(exc)}})
+            return None, None
+
+        candidates = [c for c in chain if c.get("mark_price") is not None]
+        if not candidates:
+            log.warning("No option contracts with mark_price — cannot open by premium")
+            return None, None
+
+        best = min(candidates, key=lambda c: abs(c["mark_price"] - target_premium))
+        log.info(
+            "Selected option by premium",
+            extra={"extra": {
+                "symbol": best["symbol"], "mark_price": best["mark_price"],
+                "target_premium": target_premium, "strike": best["strike"],
+            }},
+        )
+
+        await self._check_balance()
+
+        size = self._settings.option_contracts
+        result = await asyncio.to_thread(
+            self._rest.place_market_order, best["product_id"], size, Side.SELL
+        )
+
+        self._product_id = best["product_id"]
+        self._size = size
+        self._option_type = option_type
+        self._symbol = best["symbol"]
+        self._strike = best["strike"]
+
+        log.info(
+            "Option SELL (by premium) placed",
+            extra={"extra": {
+                "product_id": best["product_id"], "size": size,
+                "fill_price": result.average_fill_price, "mark_price": best["mark_price"],
+            }},
+        )
+        return result.average_fill_price, best["symbol"]
+
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
         """Open a short option position from the strategy signal direction.
 

@@ -183,6 +183,19 @@ class RestClient:
             )
         return out
 
+    def get_mark_price(self, symbol: str) -> float | None:
+        """Return the current mark price for a single option contract symbol.
+
+        Uses ``GET /v2/tickers?symbols=<symbol>``. Returns ``None`` if the
+        contract is not found or has no mark price (e.g. expired).
+        """
+        data = self._request("GET", "/v2/tickers", params={"symbols": symbol})
+        for r in data.get("result") or []:
+            if str(r.get("symbol", "")) == symbol:
+                mark = r.get("mark_price")
+                return float(mark) if mark not in (None, "") else None
+        return None
+
     def get_candles(self, symbol: str, resolution: str, start: int, end: int) -> list[Candle]:
         data = self._request(
             "GET",

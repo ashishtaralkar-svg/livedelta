@@ -7,8 +7,25 @@ services:
     restart: always
     env_file:
       - .env
+    volumes:
+      - ./state:/app/state   # persists position_state.json across restarts
     # Structured JSON logs to stdout are captured by the json-file driver and
-    # can be shipped to CloudWatch via the awslogs driver or the CW agent.
+    # can be shipped to CloudWatch via the CW agent.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
+
+  revbreakbot:
+    image: deltabot:latest   # same image, different env
+    container_name: revbreakbot
+    restart: always
+    env_file:
+      - .env.revbreak         # separate credentials + RevBreak settings
+    volumes:
+      - ./state:/app/state   # shared state dir; each bot uses its own file inside
     logging:
       driver: json-file
       options:

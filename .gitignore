@@ -1,5 +1,7 @@
 # Secrets
 .env
+.env.revbreak
+state/
 
 # Python
 __pycache__/

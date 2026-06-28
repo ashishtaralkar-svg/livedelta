@@ -29,7 +29,7 @@ from ..logging_setup import get_logger
 from ..models import Candle
 from ..pnl import TradeLedger
 from ..strategy.pine_strategy import PineStrategy, StrategyDecision, IntracandelSLCheck
-from . import reconciler
+from . import reconciler, position_state
 from .candle_aggregator import CandleAggregator
 from .options_executor import OptionsExecutor, OptionsMarginError
 from .order_engine import OrderEngine, OrderExecutionError
@@ -358,6 +358,8 @@ class TradingEngine:
                     # Capture the contract BEFORE closing (close clears the tracking).
                     exit_contract = self.options_executor.tracked_symbol
                     fill = await self.options_executor.close_option()
+                    if self.settings.state_file:
+                        position_state.clear(self.settings.state_file)
                     if self.ledger.has_open:
                         exit_trip = self.ledger.close(
                             fill if fill is not None else dec.candle.close, dec.candle.start_time
@@ -365,6 +367,11 @@ class TradingEngine:
                 if dec.has_entry:
                     signal_dir = SignalDir.LONG if dec.buy_signal else SignalDir.SHORT
                     entry_fill = await self.options_executor.open_option(signal_dir, dec.candle.close)
+                    if entry_fill is not None and self.settings.state_file:
+                        position_state.save(
+                            self.settings.state_file,
+                            symbol=self.options_executor.tracked_symbol or "",
+                        )
                     # We are SHORT the option leg regardless of the BTC direction; track
                     # it in the ledger with the option-lot quantity so PnL/summary work
                     # (short option => profit when the premium falls).
@@ -526,6 +533,28 @@ class TradingEngine:
             return
 
         shorts = [p for p in positions if p["size"] < 0]
+
+        # State-file filter: only adopt the symbol this bot opened.
+        # If a state file is configured and present, restrict to its symbol so we
+        # never steal the other bot's position. If absent, fall back to adopting
+        # any short (backward-compatible single-bot behaviour).
+        state_file = self.settings.state_file
+        if state_file:
+            saved = position_state.load(state_file)
+            if saved:
+                owned_symbol = saved.get("symbol")
+                shorts = [p for p in shorts if p.get("symbol") == owned_symbol]
+                if not shorts:
+                    log.info(
+                        "Options reconcile: no position matching state file — state FLAT",
+                        extra={"extra": {"expected": owned_symbol}},
+                    )
+            else:
+                # No state file → we had no open position; ignore all shorts (they
+                # belong to the other bot).
+                shorts = []
+                log.info("Options reconcile: no state file — starting flat (two-bot mode)")
+
         if not shorts:
             self.options_executor.clear()
             self.strategy.sync_position(PositionState.FLAT)
@@ -645,6 +674,8 @@ class TradingEngine:
                 if self.options_executor.has_open_position:
                     contract = self.options_executor.tracked_symbol
                     fill = await self.options_executor.close_option()
+                    if self.settings.state_file:
+                        position_state.clear(self.settings.state_file)
                     trip = (
                         self.ledger.close(fill if fill is not None else 0.0, ts)
                         if self.ledger.has_open

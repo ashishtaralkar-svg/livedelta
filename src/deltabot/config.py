@@ -81,6 +81,21 @@ class Settings(BaseSettings):
     option_min_available_balance: float = 0.0  # skip selling if available balance below this (0 = no check)
     option_margin_asset: str | None = None  # wallet asset to check balance for (None = max across wallets)
 
+    # --- Strategy selector ---
+    # "pine"     = PineStrategy (EMA/Supertrend, fixed ITM offset)
+    # "revbreak" = RevBreakStrategy (prev-day-zone breakout, premium-targeted strike, option TP)
+    strategy: str = "pine"
+
+    # RevBreak-specific settings (ignored when strategy="pine")
+    target_premium: float = 900.0       # target option mark price at entry
+    take_profit_pct: float = 70.0       # option TP: exit when premium falls by this %
+    revbreak_gate: str = "open"         # "open" = vs today's 05:30 open; "zone" = prev-day O/C zone
+    revbreak_st_filter: bool = True     # require Supertrend aligned to enter
+
+    # State file for position ownership (prevents reconcile conflict when two bots share one account).
+    # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).
+    state_file: str = ""
+
     # --- Operational ---
     close_on_shutdown: bool = False
     daily_summary_hour_utc: int = 0
