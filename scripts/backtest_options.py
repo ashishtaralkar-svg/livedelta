@@ -139,11 +139,14 @@ def main() -> None:
     ap.add_argument("--warmup-days", type=int, default=4, help="Extra prior days for indicator/level warmup")
     ap.add_argument("--excel", default="option_backtest_IST.xlsx", help="Output .xlsx path")
     ap.add_argument(
-        "--mode", choices=["short", "long", "both"], default="both",
+        "--mode", choices=["short", "long", "both", "debit"], default="both",
         help="short = SELL ITM PUT(buy)/CALL(sell) [current bot]; "
              "long = BUY ITM CALL on BUY signal, BUY ITM PUT on SELL signal; "
-             "both = both strategies in one file (default)",
+             "both = both strategies in one file (default); "
+             "debit = bull-call / bear-put DEBIT SPREAD (buy ITM + sell OTM leg)",
     )
+    ap.add_argument("--short-offset", type=int, default=1000,
+                    help="debit mode: OTM distance of the sold leg from spot (default 1000)")
     ap.add_argument("--offset", type=int, default=None, help="ITM depth in points (default from .env option_offset)")
     ap.add_argument("--lots", type=int, default=None, help="option lots (default from .env option_contracts)")
     ap.add_argument("--target-premium", type=float, default=None,
@@ -188,6 +191,11 @@ def main() -> None:
 
     underlying = symbol.replace("USDT", "").replace("USD", "")
     lots = settings.option_contracts
+
+    if args.mode == "debit":
+        _run_debit(window_trips, settings, underlying, lots, resolution, step, args, win_start, now)
+        return
+
     modes = ["short", "long"] if args.mode == "both" else [args.mode]
 
     results: dict[str, list[dict]] = {}
@@ -286,6 +294,93 @@ def _resolve_by_premium(
                 best = (diff, r[0], r[1], r[2])
         strike -= otm
     return (best[1], best[2], best[3]) if best else None
+
+
+def _run_debit(window_trips, settings, underlying, lots, resolution, step, args, win_start, now):
+    """Price each signal as a DEBIT SPREAD and report.
+
+      BUY  signal -> bull call spread: long CALL @ price-offset (ITM), short CALL @ price+short_offset (OTM)
+      SELL signal -> bear put  spread: long PUT  @ price+offset (ITM), short PUT  @ price-short_offset (OTM)
+
+    Long leg profits when its premium rises; short leg (sold) profits when its
+    premium falls. Brokerage is charged on all 4 fills (2 legs x entry+exit).
+    """
+    long_off = settings.option_offset
+    short_off = args.short_offset
+    interval = settings.option_strike_interval
+    cutoff = settings.option_expiry_cutoff_hour
+    cache: dict[tuple, object] = {}
+
+    def resolve(client, otype, target, t):
+        expiry = _select_expiry_date(t.entry_time, cutoff)
+        base = int(round(target / interval) * interval)
+        key = (otype.value, base, expiry.strftime("%d%m%y"))
+        if key not in cache:
+            cache[key] = _resolve_contract(
+                client, underlying, otype, int(target), expiry, interval,
+                t.entry_time, t.exit_time, t.entry_time - 2 * 86400, t.exit_time + 2 * 86400,
+                resolution, step,
+            ) or "MISS"
+        return cache[key]
+
+    records, gross_tot, fee_tot, net_tot, wins, priced = [], 0.0, 0.0, 0.0, 0, 0
+    print(f"\n{settings.symbol}  {resolution}  DEBIT SPREAD (long {long_off} ITM / short {short_off} OTM), "
+          f"lots {lots}")
+    print(f"Window {_ist(win_start)} -> {_ist(now)}   signals {len(window_trips)}")
+    print("=" * 104)
+    print(f"{'Entry(IST)':<15}{'Sig':<5}{'Long leg':<22}{'Short leg':<22}{'Gross':>9}{'Fee':>8}{'Net$':>9}")
+    print("-" * 104)
+    with httpx.Client(base_url=settings.rest_base_url, timeout=30.0) as client:
+        for t in window_trips:
+            is_buy = t.direction == SignalDir.LONG.value
+            otype = OptionType.CALL if is_buy else OptionType.PUT
+            long_target = (t.entry_price - long_off) if is_buy else (t.entry_price + long_off)
+            short_target = (t.entry_price + short_off) if is_buy else (t.entry_price - short_off)
+            lr, sr = resolve(client, otype, long_target, t), resolve(client, otype, short_target, t)
+            row = {"signal": "BUY" if is_buy else "SELL", "entry_time_ist": _ist(t.entry_time),
+                   "exit_time_ist": _ist(t.exit_time), "btc_entry": round(t.entry_price, 1),
+                   "btc_exit": round(t.exit_price, 1), "long_leg": None, "short_leg": None,
+                   "long_in": None, "long_out": None, "short_in": None, "short_out": None,
+                   "gross_usd": None, "fee_usd": None, "net_usd": None}
+            if lr != "MISS" and sr != "MISS":
+                lsym, _, lc = lr  # type: ignore[misc]
+                ssym, _, sc = sr  # type: ignore[misc]
+                lin, lout = _premium_at(lc, t.entry_time, step), _premium_at(lc, t.exit_time, step)
+                sin, sout = _premium_at(sc, t.entry_time, step), _premium_at(sc, t.exit_time, step)
+                if None not in (lin, lout, sin, sout):
+                    # long leg gain + short leg gain (we are short the OTM leg).
+                    gross = ((lout - lin) + (sin - sout)) * lots * _LOT_BTC
+                    fee = (_side_fee(t.entry_price, lin, lots) + _side_fee(t.exit_price, lout, lots)
+                           + _side_fee(t.entry_price, sin, lots) + _side_fee(t.exit_price, sout, lots))
+                    net = gross - fee
+                    gross_tot += gross; fee_tot += fee; net_tot += net; priced += 1
+                    wins += 1 if net > 0 else 0
+                    row.update(long_leg=lsym, short_leg=ssym, long_in=round(lin, 1), long_out=round(lout, 1),
+                               short_in=round(sin, 1), short_out=round(sout, 1),
+                               gross_usd=round(gross, 2), fee_usd=round(fee, 2), net_usd=round(net, 2))
+            records.append(row)
+            g = lambda v, w=9, d=2: (f"{v:>{w}.{d}f}" if isinstance(v, (int, float)) else f"{'n/a':>{w}}")
+            print(f"{row['entry_time_ist'][5:14]:<15}{row['signal']:<5}"
+                  f"{(row['long_leg'] or '?'):<22}{(row['short_leg'] or '?'):<22}"
+                  f"{g(row['gross_usd'])}{g(row['fee_usd'],8)}{g(row['net_usd'])}")
+    print("=" * 104)
+    wr = (wins / priced * 100.0) if priced else 0.0
+    print(f"Priced {priced}/{len(records)}   Wins/Losses {wins}/{priced - wins}   Win rate {wr:.1f}%")
+    print(f"Gross {gross_tot:,.2f}  -  brokerage {fee_tot:,.2f} (4 fills/trade)  =  NET {net_tot:,.2f} USD")
+    summary = [
+        {"metric": "window_IST", "value": f"{_ist(win_start)} -> {_ist(now)}"},
+        {"metric": "mode", "value": f"debit spread (long {long_off} ITM / short {short_off} OTM)"},
+        {"metric": "lots", "value": lots},
+        {"metric": "priced_trades", "value": f"{priced}/{len(records)}"},
+        {"metric": "win_rate_pct", "value": round(wr, 1)},
+        {"metric": "gross_usd", "value": round(gross_tot, 2)},
+        {"metric": "brokerage_usd", "value": round(fee_tot, 2)},
+        {"metric": "net_usd", "value": round(net_tot, 2)},
+    ]
+    with pd.ExcelWriter(Path(args.excel), engine="openpyxl") as xl:
+        pd.DataFrame(summary).to_excel(xl, sheet_name="Summary", index=False)
+        pd.DataFrame(records).to_excel(xl, sheet_name="Debit_Spread", index=False)
+    print(f"\nExcel written to {Path(args.excel).resolve()}")
 
 
 def _price_trips(client, window_trips, mode, settings, underlying, lots, resolution, step,
