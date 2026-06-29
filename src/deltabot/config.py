@@ -91,6 +91,7 @@ class Settings(BaseSettings):
     take_profit_pct: float = 70.0       # option TP: exit when premium falls by this %
     revbreak_gate: str = "open"         # "open" = vs today's 05:30 open; "zone" = prev-day O/C zone
     revbreak_st_filter: bool = True     # require Supertrend aligned to enter
+    revbreak_reentry_block: bool = True  # block same-dir re-entry after a TP until an ST flip
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
     # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).

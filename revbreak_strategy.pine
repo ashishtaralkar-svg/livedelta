@@ -1,0 +1,219 @@
+//@version=5
+// ============================================================================
+// RevBreakBot — TradingView port of the LIVE strategy
+//   Source of truth: src/deltabot/strategy/revbreak.py + supertrend.py
+//   Live config:     .env.revbreak  (gate=open, st-filter=on, EOD 17:25 IST,
+//                    target premium ~900, -70% option TP, skip Sat)
+//
+// What the live bot does (and what this script mirrors):
+//   * GATE: a new custom trading day starts 05:30 IST. "open" gate = compare the
+//     bar close to TODAY'S 05:30 session open: close > open -> bullish-only;
+//     close < open -> bearish-only. ("zone" gate option = prev-day O/C no-trade
+//     zone, also supported below.)
+//   * SUPERTREND(10,3) FILTER: a bullish setup needs ST up; bearish needs ST down.
+//   * PATTERN (regular OHLC): a RED bar then a GREEN bar arms a BULLISH setup;
+//     a GREEN bar then a RED bar arms a BEARISH setup.
+//       trigger = far extreme of the two bars (max high bull / min low bear)
+//       stop    = opposite extreme        (min low  bull / max high bear)
+//     Breakout is watched from the NEXT bar; enter intrabar at the trigger.
+//   * STOP-LOSS is on BTC price (the pattern extreme), fixed for the trade.
+//   * EOD square-off at 17:25 IST.
+//
+// IMPORTANT — how the bot trades vs what this chart shows:
+//   The bot SELLS options:  bullish signal -> SELL a PUT,  bearish -> SELL a CALL.
+//   A sold PUT profits when BTC rises; a sold CALL profits when BTC falls. So on
+//   the BTC price chart the directional P&L is equivalent to LONG (bullish) /
+//   SHORT (bearish) — that is how this strategy maps them.
+//   The bot's real take-profit is a -70% drop in the OPTION premium, which cannot
+//   be computed from BTC price alone. Therefore this Pine version exits ONLY on
+//   the BTC stop-loss or EOD (the "worst case" path). Live results are BETTER than
+//   this script because the -70% premium TP closes many trades early for a profit.
+//   An OPTIONAL price-based TP is provided below for experimentation only.
+// ============================================================================
+strategy("RevBreakBot — Bot-faithful Strategy",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpDay = "Custom Trading Day (05:30 IST)"
+dayTZ       = input.string("Asia/Kolkata", "Day Boundary Timezone", group=grpDay)
+dayStartHr  = input.int(5,  "New Day Start Hour",   minval=0, maxval=23, group=grpDay)
+dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpDay)
+
+grpGate = "Directional Gate"
+gateMode = input.string("open", "Gate", options=["open", "zone"], group=grpGate,
+     tooltip="open = vs today's 05:30 session open (LIVE setting); zone = prev-day O/C no-trade zone")
+
+grpST = "Supertrend Filter"
+useST    = input.bool(true, "Require Supertrend aligned", group=grpST)
+stFactor = input.float(3.0, "Supertrend Factor",     step=0.1, group=grpST)
+stATR    = input.int(10,    "Supertrend ATR Period", minval=1, group=grpST)
+
+grpTime = "Square-Off (IST)"
+sqOffHr   = input.int(17, "Square-Off Hour",   minval=0, maxval=23, group=grpTime)
+sqOffMin  = input.int(25, "Square-Off Minute", minval=0, maxval=59, group=grpTime)
+resumeHr  = input.int(17, "Entry Resume Hour", minval=0, maxval=23, group=grpTime)
+resumeMin = input.int(30, "Entry Resume Min",  minval=0, maxval=59, group=grpTime)
+
+grpFilter = "Day-of-Week Filter"
+skipSat = input.bool(true, "Block new entries on Saturday (IST)", group=grpFilter)
+skipSun = input.bool(false,"Block new entries on Sunday (IST)",   group=grpFilter)
+
+grpTP = "Optional price TP (NOT the real option TP)"
+useBtcTP = input.bool(false, "Enable a BTC % take-profit", group=grpTP,
+     tooltip="For experimentation only. The live bot's TP is -70% of OPTION premium, which cannot be modeled from BTC price.")
+btcTPpct = input.float(1.0, "BTC move % for TP", step=0.1, minval=0.1, group=grpTP)
+
+// ============================================================
+// Custom-day session open + previous day O/C (new day 05:30 IST)
+// ============================================================
+offsetMs = (dayStartHr * 60 + dayStartMin) * 60 * 1000
+dayId    = dayofmonth(time - offsetMs, dayTZ)
+isNewDay = ta.change(dayId) != 0
+
+var float sessOpen  = na   // today's 05:30 session open (the "open" gate)
+var float pdOpen    = na   // previous day's open  (the "zone" gate)
+var float pdClose   = na   // previous day's close
+var float curOpen   = na
+var float lastClose = na
+if isNewDay
+    pdOpen  := curOpen
+    pdClose := lastClose
+    curOpen := open
+    sessOpen := open
+else if na(curOpen)
+    curOpen := open
+    sessOpen := open
+lastClose := close
+
+plot(gateMode == "open" ? sessOpen : na, "Session Open (gate)", color=color.blue,  style=plot.style_linebr, linewidth=2)
+plot(gateMode == "zone" ? pdOpen   : na, "Prev Day Open",       color=color.blue,  style=plot.style_linebr, linewidth=1)
+plot(gateMode == "zone" ? pdClose  : na, "Prev Day Close",      color=color.orange,style=plot.style_linebr, linewidth=1)
+
+// ============================================================
+// Supertrend(10,3)
+// ============================================================
+[stLine, stDir] = ta.supertrend(stFactor, stATR)   // stDir < 0 => uptrend, > 0 => downtrend
+stUp = stDir < 0
+stDn = stDir > 0
+plot(stUp ? stLine : na, "Supertrend Up",   color=color.green, style=plot.style_linebr, linewidth=2)
+plot(stDn ? stLine : na, "Supertrend Down", color=color.red,   style=plot.style_linebr, linewidth=2)
+
+// ============================================================
+// Directional gate
+// ============================================================
+zoneReady = not na(pdOpen) and not na(pdClose)
+zoneHi = zoneReady ? math.max(pdOpen, pdClose) : na
+zoneLo = zoneReady ? math.min(pdOpen, pdClose) : na
+
+bullGate = gateMode == "open" ? (not na(sessOpen) and close > sessOpen) : (zoneReady and close > zoneHi)
+bearGate = gateMode == "open" ? (not na(sessOpen) and close < sessOpen) : (zoneReady and close < zoneLo)
+
+// Supertrend filter (hard entry filter when enabled)
+stOkUp = (not useST) or stUp
+stOkDn = (not useST) or stDn
+
+// ============================================================
+// Time windows: square-off 17:25, settlement window 17:25-17:30
+// ============================================================
+sqMins     = sqOffHr  * 60 + sqOffMin
+resumeMins = resumeHr * 60 + resumeMin
+nowMins    = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOff  = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+inWindow   = nowMins >= sqMins and nowMins < resumeMins
+
+// Day-of-week block (IST). dayofweek: Sat=7, Sun=1 in Pine.
+dow = dayofweek(time, dayTZ)
+dayBlocked = (skipSat and dow == dayofweek.saturday) or (skipSun and dow == dayofweek.sunday)
+
+// ============================================================
+// State machine — mirrors revbreak.py (pending / breakout / SL)
+// ============================================================
+var bool  pendLong  = false
+var bool  pendShort = false
+var float pendTrig  = na   // breakout trigger = pair far extreme
+var float pendSL    = na   // pattern opposite extreme (invalidation + protective stop)
+var float longStop  = na
+var float shortStop = na
+
+// ----- 1. Resolve pending breakouts armed on PRIOR bars (trigger-first, SL cancels) -----
+if pendLong
+    if high >= pendTrig
+        strategy.entry("Long", strategy.long, stop=pendTrig)   // intrabar breakout buy
+        longStop := pendSL
+    else if low <= pendSL
+        pendLong := false                                      // invalidated before breakout
+        strategy.cancel("Long")
+    else
+        strategy.entry("Long", strategy.long, stop=pendTrig)   // keep the resting stop order
+if pendShort
+    if low <= pendTrig
+        strategy.entry("Short", strategy.short, stop=pendTrig)
+        shortStop := pendSL
+    else if high >= pendSL
+        pendShort := false
+        strategy.cancel("Short")
+    else
+        strategy.entry("Short", strategy.short, stop=pendTrig)
+
+// ----- 2. EOD square-off + clear pending in the settlement window -----
+if squareOff or inWindow
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pendLong  := false
+    pendShort := false
+if squareOff
+    strategy.close_all(comment="EOD")
+
+// ----- 3. Once a position is open, the pending is consumed -----
+if strategy.position_size != 0
+    pendLong  := false
+    pendShort := false
+
+// ----- 4. Protective stop-loss (BTC pattern extreme; fixed at entry) -----
+if strategy.position_size > 0
+    strategy.exit("Long X",  from_entry="Long",  stop=longStop,
+         limit = useBtcTP ? strategy.position_avg_price * (1 + btcTPpct / 100) : na)
+if strategy.position_size < 0
+    strategy.exit("Short X", from_entry="Short", stop=shortStop,
+         limit = useBtcTP ? strategy.position_avg_price * (1 - btcTPpct / 100) : na)
+
+// ----- 5. Pattern detection -> arm a new setup (flat, outside window, day allowed) -----
+prevRed   = close[1] < open[1]
+prevGreen = close[1] > open[1]
+curRed    = close < open
+curGreen  = close > open
+
+flatNow    = strategy.position_size == 0
+hasPending = pendLong or pendShort
+canSignal  = flatNow and not hasPending and not inWindow and not squareOff and not dayBlocked
+
+armLong  = canSignal and prevRed   and curGreen and bullGate and stOkUp
+armShort = canSignal and prevGreen and curRed   and bearGate and stOkDn
+
+if armLong
+    pendLong := true
+    pendTrig := math.max(high, high[1])   // far extreme = breakout trigger
+    pendSL   := math.min(low,  low[1])    // opposite extreme = stop
+else if armShort
+    pendShort := true
+    pendTrig := math.min(low,  low[1])
+    pendSL   := math.max(high, high[1])
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(armLong,  "Arm Bullish (sell PUT)",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(armShort, "Arm Bearish (sell CALL)", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
+bgcolor(inWindow ? color.new(color.gray, 90) : na, title="Settlement window")

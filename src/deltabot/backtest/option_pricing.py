@@ -54,7 +54,16 @@ def fetch_option_candles(
             resp = client.get("/v2/history/candles", params=params)
             resp.raise_for_status()
             break
-        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError):
+        except httpx.HTTPStatusError as exc:
+            # 4xx (except 429 rate-limit) is not transient — this contract/range is
+            # not queryable, so skip it rather than aborting a long backtest.
+            sc = exc.response.status_code
+            if 400 <= sc < 500 and sc != 429:
+                return {}
+            if attempt == 3:
+                raise
+            time.sleep(1.0 + attempt)
+        except (httpx.TimeoutException, httpx.TransportError):
             if attempt == 3:
                 raise
             time.sleep(1.0 + attempt)

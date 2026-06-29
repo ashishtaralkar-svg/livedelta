@@ -51,8 +51,10 @@ def run(candles, settings, args):
     strategy = RevBreakStrategy(
         atr_period=settings.atr_period, st_multiplier=settings.st_multiplier,
         gate=args.gate, st_entry_filter=args.st_filter,
-        day_tz=settings.day_tz, day_start_hour=settings.day_start_hour,
-        day_start_minute=settings.day_start_minute,
+        reentry_block=not args.no_reentry_block,
+        day_tz=settings.day_tz,
+        day_start_hour=args.day_start_hour if args.day_start_hour is not None else settings.day_start_hour,
+        day_start_minute=args.day_start_minute if args.day_start_minute is not None else settings.day_start_minute,
         square_off_hour=settings.square_off_hour, square_off_minute=settings.square_off_minute,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
@@ -158,6 +160,12 @@ def main() -> None:
                     help="zone = prev-day O/C no-trade zone; open = vs today's 05:30 open")
     ap.add_argument("--st-filter", action="store_true",
                     help="require Supertrend aligned to enter (replaces the re-entry block)")
+    ap.add_argument("--no-reentry-block", action="store_true",
+                    help="never block same-dir re-entry after a TP (fully ignore Supertrend gating)")
+    ap.add_argument("--day-start-hour", type=int, default=None,
+                    help="custom-day boundary hour in day_tz (default from .env, =5). Use 17 for 5:30 PM.")
+    ap.add_argument("--day-start-minute", type=int, default=None,
+                    help="custom-day boundary minute in day_tz (default from .env, =30)")
     ap.add_argument("--target-premium", type=float, default=300.0)
     ap.add_argument("--take-profit", type=float, default=50.0,
                     help="%% premium target: BUY exits at +TP%%, SELL exits at -TP%% (default 50)")

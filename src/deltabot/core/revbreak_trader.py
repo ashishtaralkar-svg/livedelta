@@ -53,6 +53,7 @@ class RevBreakEngine:
             st_multiplier=settings.st_multiplier,
             gate=settings.revbreak_gate,
             st_entry_filter=settings.revbreak_st_filter,
+            reentry_block=settings.revbreak_reentry_block,
             day_tz=settings.day_tz,
             day_start_hour=settings.day_start_hour,
             day_start_minute=settings.day_start_minute,

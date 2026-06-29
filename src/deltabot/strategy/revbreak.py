@@ -64,6 +64,7 @@ class RevBreakStrategy:
         st_multiplier: float = 3.0,
         gate: str = "zone",            # "zone" = prev-day O/C; "open" = today's 05:30 open
         st_entry_filter: bool = False,  # require Supertrend aligned to take the entry
+        reentry_block: bool = True,     # block same-dir re-entry after a TP until an ST flip
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 5,
         day_start_minute: int = 30,
@@ -74,6 +75,7 @@ class RevBreakStrategy:
         self.st_multiplier = st_multiplier
         self.gate = gate
         self.st_entry_filter = st_entry_filter
+        self.reentry_block = reentry_block
         self._tz = ZoneInfo(day_tz)
         self._day_offset_s = (day_start_hour * 60 + day_start_minute) * 60
         self._sq_mins = square_off_hour * 60 + square_off_minute
@@ -212,9 +214,10 @@ class RevBreakStrategy:
         # --- Supertrend filter (hard entry filter when enabled) ---
         st_up = (not self.st_entry_filter) or (self.st.ready and self.st.direction() == 1)
         st_down = (not self.st_entry_filter) or (self.st.ready and self.st.direction() == -1)
-        # --- Re-entry block (only in the zone/re-entry mode) ---
-        buy_ok = True if self.st_entry_filter else not self._buy_blocked
-        sell_ok = True if self.st_entry_filter else not self._sell_blocked
+        # --- Re-entry block (only in the zone/re-entry mode, and only if enabled) ---
+        no_block = self.st_entry_filter or not self.reentry_block
+        buy_ok = True if no_block else not self._buy_blocked
+        sell_ok = True if no_block else not self._sell_blocked
 
         # --- Pattern detection -> arm a new setup (flat + gates allowed) ---
         if self._prev_candle is not None and not self._in_long and not self._in_short:
