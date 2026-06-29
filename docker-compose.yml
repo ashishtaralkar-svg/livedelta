@@ -1,21 +1,6 @@
 services:
-  deltabot:
-    build: .
-    image: deltabot:latest
-    container_name: deltabot
-    restart: always
-    env_file:
-      - .env
-    volumes:
-      - ./state:/app/state
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-    stop_grace_period: 30s
-
   revbreakbot:
+    build: .
     image: deltabot:latest
     container_name: revbreakbot
     restart: always
