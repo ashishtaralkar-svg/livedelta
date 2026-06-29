@@ -2,15 +2,17 @@
 // ============================================================================
 // RevBreakBot — TradingView port of the LIVE strategy
 //   Source of truth: src/deltabot/strategy/revbreak.py + supertrend.py
-//   Live config:     .env.revbreak  (gate=open, st-filter=on, EOD 17:25 IST,
-//                    target premium ~900, -70% option TP, skip Sat)
+//   DEPLOYED config (since 2026-06-29): gate=open, day boundary 17:30 IST,
+//   Supertrend filter OFF, re-entry block OFF, EOD 17:25 IST, target premium
+//   ~900, -70% option TP, skip Sat. Best 4-month backtest: NET +$4,823.
 //
 // What the live bot does (and what this script mirrors):
-//   * GATE: a new custom trading day starts 05:30 IST. "open" gate = compare the
-//     bar close to TODAY'S 05:30 session open: close > open -> bullish-only;
-//     close < open -> bearish-only. ("zone" gate option = prev-day O/C no-trade
-//     zone, also supported below.)
-//   * SUPERTREND(10,3) FILTER: a bullish setup needs ST up; bearish needs ST down.
+//   * GATE: a new custom trading day starts 17:30 IST (= options settlement).
+//     "open" gate = compare the bar close to TODAY'S 17:30 session open:
+//     close > open -> bullish-only; close < open -> bearish-only. ("zone" gate
+//     option = prev-day O/C no-trade zone, also supported below.)
+//   * SUPERTREND(10,3) FILTER: OFF in the deployed config (toggle in inputs). When
+//     on, a bullish setup needs ST up; bearish needs ST down.
 //   * PATTERN (regular OHLC): a RED bar then a GREEN bar arms a BULLISH setup;
 //     a GREEN bar then a RED bar arms a BEARISH setup.
 //       trigger = far extreme of the two bars (max high bull / min low bear)
@@ -46,17 +48,17 @@ strategy("RevBreakBot — Bot-faithful Strategy",
 // ============================================================
 // Inputs
 // ============================================================
-grpDay = "Custom Trading Day (05:30 IST)"
+grpDay = "Custom Trading Day (17:30 IST = options settlement)"
 dayTZ       = input.string("Asia/Kolkata", "Day Boundary Timezone", group=grpDay)
-dayStartHr  = input.int(5,  "New Day Start Hour",   minval=0, maxval=23, group=grpDay)
+dayStartHr  = input.int(17, "New Day Start Hour",   minval=0, maxval=23, group=grpDay)
 dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpDay)
 
 grpGate = "Directional Gate"
 gateMode = input.string("open", "Gate", options=["open", "zone"], group=grpGate,
-     tooltip="open = vs today's 05:30 session open (LIVE setting); zone = prev-day O/C no-trade zone")
+     tooltip="open = vs today's 17:30 session open (LIVE setting); zone = prev-day O/C no-trade zone")
 
 grpST = "Supertrend Filter"
-useST    = input.bool(true, "Require Supertrend aligned", group=grpST)
+useST    = input.bool(false, "Require Supertrend aligned", group=grpST)
 stFactor = input.float(3.0, "Supertrend Factor",     step=0.1, group=grpST)
 stATR    = input.int(10,    "Supertrend ATR Period", minval=1, group=grpST)
 
@@ -217,3 +219,14 @@ else if armShort
 plotshape(armLong,  "Arm Bullish (sell PUT)",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
 plotshape(armShort, "Arm Bearish (sell CALL)", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
 bgcolor(inWindow ? color.new(color.gray, 90) : na, title="Settlement window")
+
+// --- Stop-loss line (active while in a position) ---
+inPos    = strategy.position_size != 0
+activeSL = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+// --- Pending trigger + SL lines (shown while a setup is armed, before entry) ---
+armed = (pendLong or pendShort) and not inPos
+plot(armed ? pendTrig : na, "Pending Trigger", color=color.new(color.aqua, 0),    style=plot.style_circles, linewidth=2)
+plot(armed ? pendSL   : na, "Pending SL",      color=color.new(color.orange, 0),  style=plot.style_circles, linewidth=2)

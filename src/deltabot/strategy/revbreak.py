@@ -115,6 +115,57 @@ class RevBreakStrategy:
             return PositionState.SHORT
         return PositionState.FLAT
 
+    @property
+    def ready(self) -> bool:
+        """True once the Supertrend has warmed up (enough history consumed)."""
+        return self.st.ready
+
+    @property
+    def has_pending(self) -> bool:
+        return self._pending_long or self._pending_short
+
+    @property
+    def sl_level(self) -> float | None:
+        return self._sl_level
+
+    def check_intracandle_sl(self, price: float) -> tuple[bool, bool, float | None]:
+        """Has an intracandle price crossed the open position's stop? -> (long_sl, short_sl, level)."""
+        long_sl = self._in_long and self._sl_level is not None and price <= self._sl_level
+        short_sl = self._in_short and self._sl_level is not None and price >= self._sl_level
+        return bool(long_sl), bool(short_sl), self._sl_level
+
+    def apply_intracandle_pending(self, candle: Candle) -> tuple[bool, bool, float]:
+        """Check a forming candle against a pending breakout — enter ASAP on a cross.
+
+        Called by the live engine on every intracandle update so entry fires the
+        instant price crosses the pattern trigger (not at the 5m close), and the
+        setup is invalidated the instant price hits the opposite extreme (SL) first.
+        SL is checked BEFORE the trigger (conservative: a touch of the stop before
+        the breakout kills the setup). Mutates state so the closed-candle path then
+        sees no pending. Returns ``(confirmed, invalidated, entry_price)``.
+        """
+        if self._pending_long and self._pending_trigger is not None and self._pending_sl is not None:
+            sl, trig = self._pending_sl, self._pending_trigger
+            if candle.open <= sl or candle.low <= sl:        # SL hit before breakout -> invalid
+                self._clear_pending()
+                return False, True, 0.0
+            if candle.open >= trig or candle.high >= trig:   # price broke above the pattern high
+                self._in_long, self._in_short = True, False
+                self._sl_level = sl
+                self._clear_pending()
+                return True, False, trig
+        elif self._pending_short and self._pending_trigger is not None and self._pending_sl is not None:
+            sl, trig = self._pending_sl, self._pending_trigger
+            if candle.open >= sl or candle.high >= sl:        # SL hit before breakout -> invalid
+                self._clear_pending()
+                return False, True, 0.0
+            if candle.open <= trig or candle.low <= trig:     # price broke below the pattern low
+                self._in_short, self._in_long = True, False
+                self._sl_level = sl
+                self._clear_pending()
+                return True, False, trig
+        return False, False, 0.0
+
     # ------------------------------------------------------------------ #
     def notify_exit(self, direction: int, reason: str) -> None:
         """Backtest tells us how an open trade closed (esp. the option +50% TP).

@@ -78,6 +78,12 @@ def run(candles, settings, args):
         fee = (op.side_fee(pos["entry_btc"], pos["entry_prem"], lots)
                + op.side_fee(exit_btc, exit_prem, lots))
         action = ("SELL " if sell else "BUY ") + ("CALL" if pos["sym"].startswith("C-") else "PUT")
+        # Max adverse excursion: worst unrealized premium move during the hold.
+        # SELL is hurt when premium RISES (use highs); BUY when it FALLS (use lows).
+        adverse = [(c.high if sell else c.low) for t, c in pos["candles"].items()
+                   if pos["entry_time"] <= t <= exit_time]
+        worst_prem = (max(adverse) if sell else min(adverse)) if adverse else exit_prem
+        mae = ((pos["entry_prem"] - worst_prem) if sell else (worst_prem - pos["entry_prem"])) * lots * op.LOT_BTC
         trips.append({
             "action": action,
             "signal": "BUY" if pos["dir"] == SignalDir.LONG.value else "SELL",
@@ -85,6 +91,7 @@ def run(candles, settings, args):
             "exit_time_ist": _ist(exit_time), "exit_reason": reason,
             "btc_entry": round(pos["entry_btc"], 1), "btc_exit": round(exit_btc, 1),
             "opt_in": round(pos["entry_prem"], 1), "opt_out": round(exit_prem, 1),
+            "worst_prem": round(worst_prem, 1), "mae_usd": round(mae, 2),
             "lots": lots, "gross_usd": round(gross, 2),
             "fee_usd": round(fee, 2), "net_usd": round(gross - fee, 2),
         })

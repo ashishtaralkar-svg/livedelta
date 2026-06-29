@@ -62,7 +62,7 @@ class RevBreakEngine:
         )
         self.executor = OptionsExecutor(rest, settings)
         self.aggregator = CandleAggregator(
-            on_closed=self._on_closed_candle, on_forming=None
+            on_closed=self._on_closed_candle, on_forming=self._on_forming_candle
         )
         self.ws: WebSocketManager | None = None
         self._last_closed_start: int | None = None
@@ -75,6 +75,8 @@ class RevBreakEngine:
         self._tp_price: float | None = None
         self._current_dir: int | None = None  # SignalDir value of open position
         self._tp_mult = 1.0 - settings.take_profit_pct / 100.0
+        # Re-entrancy guard so intracandle + closed-candle paths can't double-open.
+        self._entry_in_progress = False
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -214,9 +216,51 @@ class RevBreakEngine:
             exit_price = dec.long_exit_price if dec.long_exit else dec.short_exit_price
             await self._close_btc_exit(dec.exit_reason or "SL", exit_price, candle)
 
-        # 4. New entry (only if now flat and not in settlement window).
+        # 4. New entry (only if now flat and not in settlement window). The
+        #    intracandle path usually fires first; this is the closed-bar fallback.
         if dec.has_entry and not self.executor.has_open_position and not self._entries_blocked():
-            await self._open_entry(dec, candle)
+            signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
+            await self._open_entry(signal_dir, dec.sl_level, candle.close)
+
+    # ------------------------------------------------------------------ #
+    def _on_forming_candle(self, candle: Candle) -> None:
+        task = asyncio.create_task(self._handle_forming_candle(candle))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _handle_forming_candle(self, candle: Candle) -> None:
+        """Intracandle updates: enter ASAP when price crosses the pattern trigger,
+        and exit ASAP when the BTC pattern-extreme stop is touched — instead of
+        waiting for the 5m candle to close."""
+        if not self.strategy.ready:
+            return
+
+        # Open position → check the BTC stop against the running low/high.
+        if self.executor.has_open_position:
+            for price in (candle.low, candle.high):
+                long_sl, short_sl, level = self.strategy.check_intracandle_sl(price)
+                if long_sl or short_sl:
+                    direction = SignalDir.LONG.value if long_sl else SignalDir.SHORT.value
+                    log.info("RevBreak: intracandle SL touched", extra={"extra": {"price": price, "sl": level}})
+                    await self._close_btc_exit("SL", level if level is not None else price, candle)
+                    self.strategy.notify_exit(direction, "SL")
+                    return
+            return
+
+        # Flat → watch the armed setup for an ASAP breakout entry.
+        if self._entry_in_progress or not self.strategy.has_pending or self._entries_blocked():
+            return
+        confirmed, invalidated, entry_price = self.strategy.apply_intracandle_pending(candle)
+        if invalidated:
+            log.info("RevBreak: setup invalidated intracandle (SL crossed before trigger)")
+            return
+        if confirmed:
+            signal_dir = (SignalDir.LONG.value
+                          if self.strategy.position_state == PositionState.LONG
+                          else SignalDir.SHORT.value)
+            log.info("RevBreak: intracandle breakout — entering ASAP",
+                     extra={"extra": {"trigger": entry_price}})
+            await self._open_entry(signal_dir, self.strategy.sl_level, entry_price)
 
     # ------------------------------------------------------------------ #
     async def _close_tp(self, mark: float, candle: Candle) -> None:
@@ -254,6 +298,8 @@ class RevBreakEngine:
 
     async def _close_btc_exit(self, reason: str, btc_exit_price: float, candle: Candle) -> None:
         """Close position because BTC hit the pattern stop-loss or EOD fired."""
+        if not self.executor.has_open_position:
+            return  # already closed (e.g. intracandle SL beat the closed-candle exit)
         contract = self.executor.tracked_symbol
         try:
             fill = await self.executor.close_option()
@@ -286,59 +332,66 @@ class RevBreakEngine:
             size=lots,
         )
 
-    async def _open_entry(self, dec, candle: Candle) -> None:
-        """Open a short option (sell) for a new RevBreak signal."""
-        signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
+    async def _open_entry(self, signal_dir: int, sl_level: float | None, btc_price: float) -> None:
+        """Open a short option for a new RevBreak signal. Callable from both the
+        intracandle (ASAP) and closed-candle (fallback) paths; guarded so the two
+        can never double-open. ``signal_dir`` is a SignalDir value; bullish sells a
+        PUT, bearish sells a CALL."""
+        if self._entry_in_progress or self.executor.has_open_position:
+            return
+        self._entry_in_progress = True
         try:
-            fill, symbol = await self.executor.open_option_by_premium(
-                signal_dir, self.settings.target_premium
+            is_buy = signal_dir == SignalDir.LONG.value
+            try:
+                fill, symbol = await self.executor.open_option_by_premium(
+                    signal_dir, self.settings.target_premium
+                )
+            except OptionsMarginError as exc:
+                log.error("RevBreak: margin error", extra={"extra": {"error": str(exc)}})
+                await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"Margin: {exc}")
+                self.strategy.notify_exit(signal_dir, "SL")  # unblock + flatten strategy
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.error("RevBreak: open_option_by_premium failed", extra={"extra": {"error": str(exc)}})
+                await self.notifier.notify(NotifyEvent.API_ERROR, detail=str(exc))
+                self.strategy.notify_exit(signal_dir, "SL")
+                return
+
+            if fill is None:
+                log.warning("RevBreak: no option fill — skipping entry")
+                self.strategy.notify_exit(signal_dir, "SL")
+                return
+
+            self._entry_premium = fill
+            self._tp_price = fill * self._tp_mult
+            self._current_dir = signal_dir
+
+            if self.settings.state_file:
+                position_state.save(
+                    self.settings.state_file,
+                    symbol=symbol or "",
+                    entry_premium=fill,
+                    tp_price=self._tp_price,
+                    direction=signal_dir,
+                )
+
+            direction = "PUT" if is_buy else "CALL"
+            log.info("RevBreak entry", extra={"extra": {
+                "direction": direction, "symbol": symbol, "fill": fill,
+                "tp_price": round(self._tp_price, 1), "sl_level": sl_level,
+            }})
+            event = NotifyEvent.ENTRY_LONG if is_buy else NotifyEvent.ENTRY_SHORT
+            await self.notifier.notify(
+                event,
+                direction=direction,
+                contract=symbol or "?",
+                premium=fill,
+                btc_price=btc_price,
+                sl_level=sl_level,
+                tp_price=round(self._tp_price, 1),
             )
-        except OptionsMarginError as exc:
-            log.error("RevBreak: margin error", extra={"extra": {"error": str(exc)}})
-            await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"Margin: {exc}")
-            self.strategy.notify_exit(signal_dir, "SL")  # unblock re-entry gate
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.error("RevBreak: open_option_by_premium failed", extra={"extra": {"error": str(exc)}})
-            await self.notifier.notify(NotifyEvent.API_ERROR, detail=str(exc))
-            self.strategy.notify_exit(signal_dir, "SL")
-            return
-
-        if fill is None:
-            log.warning("RevBreak: no option fill — skipping entry")
-            self.strategy.notify_exit(signal_dir, "SL")
-            return
-
-        self._entry_premium = fill
-        self._tp_price = fill * self._tp_mult
-        self._current_dir = signal_dir
-
-        if self.settings.state_file:
-            position_state.save(
-                self.settings.state_file,
-                symbol=symbol or "",
-                entry_premium=fill,
-                tp_price=self._tp_price,
-                direction=signal_dir,
-            )
-
-        direction = "PUT" if dec.buy_signal else "CALL"
-        sl_level = dec.sl_level  # BTC stop from RevBreak pattern extreme
-
-        log.info("RevBreak entry", extra={"extra": {
-            "direction": direction, "symbol": symbol, "fill": fill,
-            "tp_price": round(self._tp_price, 1), "sl_level": sl_level,
-        }})
-        event = NotifyEvent.ENTRY_LONG if dec.buy_signal else NotifyEvent.ENTRY_SHORT
-        await self.notifier.notify(
-            event,
-            direction=direction,
-            contract=symbol or "?",
-            premium=fill,
-            btc_price=candle.close,
-            sl_level=sl_level,
-            tp_price=round(self._tp_price, 1),
-        )
+        finally:
+            self._entry_in_progress = False
 
     # ------------------------------------------------------------------ #
     async def _sync_options_to_exchange(self) -> None:
