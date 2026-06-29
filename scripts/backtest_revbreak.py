@@ -158,7 +158,7 @@ def op_entry_ts(trip: dict) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Zone reversal-breakout option-buy backtest")
-    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--days", type=float, default=7, help="look-back window in days (fractional ok, e.g. 0.333 = 8h)")
     ap.add_argument("--resolution", default="5m", help="BTC candle resolution (default 5m)")
     ap.add_argument("--warmup-days", type=int, default=2)
     ap.add_argument("--side", choices=["buy", "sell"], default="buy",
