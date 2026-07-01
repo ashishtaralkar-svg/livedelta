@@ -476,6 +476,12 @@ class RevBreakEngine:
         if not shorts:
             self.executor.clear()
             self._entry_premium = self._tp_price = self._current_dir = None
+            # Flatten the strategy too: warmup may have re-derived an in-position
+            # state (e.g. a position that was closed manually on the exchange, which
+            # never appears in the price history). Without this the bot would think
+            # it still holds a trade and never look for new entries.
+            self.strategy.force_flat()
+            self._closing = False
             log.info("RevBreak reconcile: no owned position — state FLAT")
             return
 

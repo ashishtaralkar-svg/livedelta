@@ -71,6 +71,19 @@ def test_no_action_when_price_between_levels() -> None:
     assert s.has_pending  # still armed, still watching
 
 
+def test_force_flat_clears_position_and_pending() -> None:
+    # A position re-derived from warmup (or a pending setup) must be clearable when
+    # the exchange reconcile shows we're actually flat (e.g. after a manual close).
+    s = RevBreakStrategy(gate="open", st_entry_filter=False, reentry_block=False)
+    _arm_short(s)
+    s.apply_intracandle_pending(_c(1, 60_050, 60_100, 59_990, 60_010))  # now SHORT
+    assert s.position_state == PositionState.SHORT
+    s.force_flat()
+    assert s.position_state == PositionState.FLAT
+    assert not s.has_pending
+    assert s.sl_level is None
+
+
 def test_check_intracandle_sl_after_short_entry() -> None:
     s = RevBreakStrategy(gate="open", st_entry_filter=False, reentry_block=False)
     _arm_short(s)

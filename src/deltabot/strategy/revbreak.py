@@ -128,6 +128,14 @@ class RevBreakStrategy:
     def sl_level(self) -> float | None:
         return self._sl_level
 
+    def force_flat(self) -> None:
+        """Reset position + any pending setup to FLAT, leaving indicators/day state
+        intact. Used on reconcile when the exchange shows no owned position (e.g.
+        after a manual close) so the strategy stops thinking it holds a trade."""
+        self._in_long = self._in_short = False
+        self._sl_level = None
+        self._clear_pending()
+
     def check_intracandle_sl(self, price: float) -> tuple[bool, bool, float | None]:
         """Has an intracandle price crossed the open position's stop? -> (long_sl, short_sl, level)."""
         long_sl = self._in_long and self._sl_level is not None and price <= self._sl_level
