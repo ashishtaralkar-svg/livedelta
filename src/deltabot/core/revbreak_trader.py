@@ -77,6 +77,10 @@ class RevBreakEngine:
         self._tp_mult = 1.0 - settings.take_profit_pct / 100.0
         # Re-entrancy guard so intracandle + closed-candle paths can't double-open.
         self._entry_in_progress = False
+        # Shared guard so the TP poller, intracandle SL, and closed-candle exit
+        # can never double-close the same position.
+        self._closing = False
+        self._tp_poll_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -100,6 +104,8 @@ class RevBreakEngine:
             heartbeat_timeout_s=self.settings.heartbeat_timeout_s,
         )
         self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
+        if self.settings.revbreak_tp_poll_seconds > 0:
+            self._tp_poll_task = asyncio.create_task(self._tp_poll_loop())
         log.info("RevBreakEngine: starting live")
         await self.ws.run()
 
@@ -108,6 +114,8 @@ class RevBreakEngine:
             self.ws.stop()
         if self._sq_off_task is not None:
             self._sq_off_task.cancel()
+        if self._tp_poll_task is not None:
+            self._tp_poll_task.cancel()
         if self.settings.close_on_shutdown and self.executor.has_open_position:
             try:
                 await self.executor.close_option()
@@ -263,8 +271,42 @@ class RevBreakEngine:
             await self._open_entry(signal_dir, self.strategy.sl_level, entry_price)
 
     # ------------------------------------------------------------------ #
-    async def _close_tp(self, mark: float, candle: Candle) -> None:
+    async def _tp_poll_loop(self) -> None:
+        """Poll the option mark price on a short interval so the −N% TP fires ASAP,
+        not only at the 5m candle close. BTC entry/stop already fire intracandle via
+        the forming candle; the option premium needs its own (cheap) poll."""
+        interval = self.settings.revbreak_tp_poll_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            if (self._closing or self._tp_price is None
+                    or not self.executor.has_open_position):
+                continue
+            try:
+                mark = await asyncio.to_thread(
+                    self.rest.get_mark_price, self.executor.tracked_symbol or ""
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("RevBreak: TP-poll mark fetch failed", extra={"extra": {"error": str(exc)}})
+                continue
+            if mark is not None and self._tp_price is not None and mark <= self._tp_price:
+                log.info("RevBreak: intracandle TP hit (poll)", extra={"extra": {"mark": mark, "tp": self._tp_price}})
+                await self._close_tp(mark)
+
+    # ------------------------------------------------------------------ #
+    async def _close_tp(self, mark: float, candle: Candle | None = None) -> None:
         """Close position because option mark price hit the −N% take-profit."""
+        if self._closing or not self.executor.has_open_position:
+            return
+        self._closing = True
+        try:
+            await self._do_close_tp(mark)
+        finally:
+            self._closing = False
+
+    async def _do_close_tp(self, mark: float) -> None:
         contract = self.executor.tracked_symbol
         try:
             fill = await self.executor.close_option()
@@ -298,8 +340,15 @@ class RevBreakEngine:
 
     async def _close_btc_exit(self, reason: str, btc_exit_price: float, candle: Candle) -> None:
         """Close position because BTC hit the pattern stop-loss or EOD fired."""
-        if not self.executor.has_open_position:
-            return  # already closed (e.g. intracandle SL beat the closed-candle exit)
+        if self._closing or not self.executor.has_open_position:
+            return  # already closing (e.g. TP poll / intracandle SL beat this path)
+        self._closing = True
+        try:
+            await self._do_close_btc_exit(reason, btc_exit_price)
+        finally:
+            self._closing = False
+
+    async def _do_close_btc_exit(self, reason: str, btc_exit_price: float) -> None:
         contract = self.executor.tracked_symbol
         try:
             fill = await self.executor.close_option()
