@@ -75,6 +75,7 @@ class RevBreakEngine:
         self._tp_price: float | None = None
         self._current_dir: int | None = None  # SignalDir value of open position
         self._tp_mult = 1.0 - settings.take_profit_pct / 100.0
+        self._is_paper_trade: bool = False  # True if current position is paper-only (wide-SL)
         # Re-entrancy guard so intracandle + closed-candle paths can't double-open.
         self._entry_in_progress = False
         # Shared guard so the TP poller, intracandle SL, and closed-candle exit
@@ -227,21 +228,38 @@ class RevBreakEngine:
         # 4. New entry (only if now flat and not in settlement window). The
         #    intracandle path usually fires first; this is the closed-bar fallback.
         if dec.has_entry and not self.executor.has_open_position and not self._entries_blocked():
-            # Skip if SL is too far away (high-risk trades have poor edge).
+            # Check if SL is too far away (wide-SL trades have poor edge).
             max_sl = self.settings.revbreak_max_sl_distance
+            is_wide_sl = False
             if max_sl > 0 and dec.sl_level is not None:
                 sl_distance = abs(dec.sl_level - candle.close)
-                if sl_distance > max_sl:
-                    log.info("RevBreak: skipped entry (SL too far)",
-                             extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
-                    await self.notifier.notify(
-                        NotifyEvent.SKIPPED,
-                        reason="SL too far",
-                        btc_price=candle.close,
-                        sl_level=dec.sl_level,
-                        sl_distance=round(sl_distance, 1),
-                    )
-                    return
+                is_wide_sl = sl_distance > max_sl
+
+            # If wide-SL and paper-trading enabled, mark as paper instead of skipping.
+            if is_wide_sl and self.settings.revbreak_paper_trade_wide_sl:
+                self._is_paper_trade = True
+                log.info("RevBreak: paper-trade entry (wide SL)",
+                         extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                await self.notifier.notify(
+                    NotifyEvent.SKIPPED,
+                    reason="Paper trade (wide SL)",
+                    btc_price=candle.close,
+                    sl_level=dec.sl_level,
+                    sl_distance=round(sl_distance, 1),
+                )
+            elif is_wide_sl:
+                # Wide-SL and paper-trading disabled: skip entry.
+                log.info("RevBreak: skipped entry (SL too far)",
+                         extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                await self.notifier.notify(
+                    NotifyEvent.SKIPPED,
+                    reason="SL too far",
+                    btc_price=candle.close,
+                    sl_level=dec.sl_level,
+                    sl_distance=round(sl_distance, 1),
+                )
+                return
+
             signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
             await self._open_entry(signal_dir, dec.sl_level, candle.close)
 
@@ -331,6 +349,15 @@ class RevBreakEngine:
     # ------------------------------------------------------------------ #
     async def _close_tp(self, mark: float, candle: Candle | None = None) -> None:
         """Close position because option mark price hit the −N% take-profit."""
+        # Paper trades: just clear internal tracking, no exchange action.
+        if self._is_paper_trade:
+            log.info("RevBreak: paper position TP hit",
+                     extra={"extra": {"mark": mark}})
+            self._entry_premium = self._tp_price = self._current_dir = None
+            self._is_paper_trade = False
+            self.strategy.notify_exit(self._current_dir or SignalDir.SHORT.value, "TP")
+            return
+
         if self._closing or not self.executor.has_open_position:
             return
         self._closing = True
@@ -373,6 +400,15 @@ class RevBreakEngine:
 
     async def _close_btc_exit(self, reason: str, btc_exit_price: float, candle: Candle) -> None:
         """Close position because BTC hit the pattern stop-loss or EOD fired."""
+        # Paper trades: just clear internal tracking, no exchange action.
+        if self._is_paper_trade:
+            log.info("RevBreak: paper position closed",
+                     extra={"extra": {"reason": reason, "btc_exit_price": btc_exit_price}})
+            self._entry_premium = self._tp_price = self._current_dir = None
+            self._is_paper_trade = False
+            self.strategy.notify_exit(self._current_dir or SignalDir.SHORT.value, reason)
+            return
+
         if self._closing or not self.executor.has_open_position:
             return  # already closing (e.g. TP poll / intracandle SL beat this path)
         self._closing = True
@@ -418,12 +454,25 @@ class RevBreakEngine:
         """Open a short option for a new RevBreak signal. Callable from both the
         intracandle (ASAP) and closed-candle (fallback) paths; guarded so the two
         can never double-open. ``signal_dir`` is a SignalDir value; bullish sells a
-        PUT, bearish sells a CALL."""
-        if self._entry_in_progress or self.executor.has_open_position:
-            return
+        PUT, bearish sells a CALL. If this is a paper trade (wide-SL), track it
+        internally but don't execute on the exchange."""
+        if self._entry_in_progress or self.executor.has_open_position or self._entry_premium is not None:
+            return  # Max 1 active trade: real OR paper
         self._entry_in_progress = True
         try:
             is_buy = signal_dir == SignalDir.LONG.value
+
+            # Paper trades: don't execute, just track internally.
+            if self._is_paper_trade:
+                self._entry_premium = self.settings.target_premium  # use target as notional entry
+                self._tp_price = self._entry_premium * self._tp_mult
+                self._current_dir = signal_dir
+                log.info("RevBreak: paper position opened (wide SL, no real trade)",
+                         extra={"extra": {"signal_dir": signal_dir, "entry_prem": self._entry_premium,
+                                          "sl_level": sl_level, "btc_price": btc_price}})
+                return
+
+            # Real trades: execute on the exchange.
             try:
                 fill, symbol = await self.executor.open_option_by_premium(
                     signal_dir, self.settings.target_premium
@@ -432,16 +481,19 @@ class RevBreakEngine:
                 log.error("RevBreak: margin error", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"Margin: {exc}")
                 self.strategy.notify_exit(signal_dir, "SL")  # unblock + flatten strategy
+                self._is_paper_trade = False
                 return
             except Exception as exc:  # noqa: BLE001
                 log.error("RevBreak: open_option_by_premium failed", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=str(exc))
                 self.strategy.notify_exit(signal_dir, "SL")
+                self._is_paper_trade = False
                 return
 
             if fill is None:
                 log.warning("RevBreak: no option fill — skipping entry")
                 self.strategy.notify_exit(signal_dir, "SL")
+                self._is_paper_trade = False
                 return
 
             self._entry_premium = fill
