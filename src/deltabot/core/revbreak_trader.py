@@ -448,22 +448,23 @@ class RevBreakEngine:
     async def _sync_options_to_exchange(self) -> None:
         """Reconcile the open option position with the exchange on start/reconnect.
 
-        The STATE FILE is the source of truth for ownership. If it names a symbol we
-        consider ourselves in that position. We try to confirm it against the
-        exchange (retrying, since a read right after a WS reconnect can come back
-        incomplete). Three outcomes:
-          1. Exchange returns our position -> adopt it (authoritative).
-          2. State file claims a position the exchange did NOT return -> RE-ADOPT
-             FROM THE STATE FILE and do NOT open new trades. (Assuming "flat" here
-             is what previously orphaned a live short and let the bot open a second
-             one.) close_option is reduce-only, so a phantom re-adopt is safe.
-          3. State file claims nothing -> genuinely FLAT.
+        SINGLE-BOT SAFETY MODEL (this account runs only revbreakbot): any open
+        short option on the account is ours, so the bot adopts it and will NOT open
+        a second position while one exists. Ownership is decided from THREE signals,
+        so no single failure (state-file write, flaky fetch) can cause a double-open:
+          A. the exchange currently reports an open short  -> adopt it
+          B. we are already tracking a position in memory  -> keep it (a WS reconnect
+             must never drop the live position we opened)
+          C. the state file names a position               -> re-adopt from it
+        Only when NONE of these hold do we treat ourselves as genuinely FLAT.
+        The state file (when writable) additionally restores TP/direction tracking.
         """
         state_file = self.settings.state_file
         saved = position_state.load(state_file) if state_file else None
         owned_symbol = saved.get("symbol") if saved else None
+        believe_owned = owned_symbol is not None or self.executor.has_open_position
 
-        # Fetch, retrying while we believe we own a symbol the fetch hasn't shown.
+        # Fetch, retrying while we believe we own a position the fetch hasn't shown.
         shorts: list[dict] = []
         for attempt in range(3):
             try:
@@ -475,44 +476,46 @@ class RevBreakEngine:
                           extra={"extra": {"error": str(exc), "attempt": attempt}})
                 positions = []
             shorts = [p for p in positions if p["size"] < 0]
-            if owned_symbol is None or any(p.get("symbol") == owned_symbol for p in shorts):
+            if shorts or not believe_owned:
                 break
-            log.warning("RevBreak reconcile: owned symbol not in fetch — retrying",
-                        extra={"extra": {"owned": owned_symbol, "attempt": attempt,
-                                         "seen": [p.get("symbol") for p in shorts]}})
+            log.warning("RevBreak reconcile: expected a position but fetch is empty — retrying",
+                        extra={"extra": {"owned": owned_symbol,
+                                         "tracked": self.executor.tracked_symbol, "attempt": attempt}})
             await asyncio.sleep(1.5)
 
-        # 1) Exchange confirms our owned position -> adopt from the exchange.
-        match = next((p for p in shorts if p.get("symbol") == owned_symbol), None) if owned_symbol else None
-        if match is not None:
-            if saved:
+        # A) The exchange reports a short -> adopt it (prefer the one our state file
+        #    names, so TP/direction tracking is restored; otherwise the first).
+        if shorts:
+            match = next((p for p in shorts if p.get("symbol") == owned_symbol), shorts[0])
+            if saved and match.get("symbol") == owned_symbol:
                 self._entry_premium = saved.get("entry_premium")
                 self._tp_price = saved.get("tp_price")
                 self._current_dir = saved.get("direction")
             opt_type = OptionType.CALL if match["symbol"].startswith("C-") else OptionType.PUT
             self.executor.adopt(match["product_id"], match["size"], opt_type, match.get("symbol"))
-            log.info("RevBreak reconcile: adopted own position (exchange-confirmed)",
-                     extra={"extra": {"symbol": match["symbol"], "tp_price": self._tp_price}})
+            log.info("RevBreak reconcile: adopted open short",
+                     extra={"extra": {"symbol": match["symbol"],
+                                      "matched_state_file": match.get("symbol") == owned_symbol}})
             return
 
-        # 2) State file claims a position the exchange did NOT return. Never assume
-        #    flat here — that orphans live shorts and double-opens. Re-adopt from
-        #    the state file so the bot keeps managing it and will NOT open new.
-        if owned_symbol:
-            if saved and saved.get("product_id"):
+        # B/C) Exchange fetch is empty but we believe we own a position (in-memory
+        #      tracking and/or state file). NEVER clear-and-trade here — that is what
+        #      orphaned live shorts and double-opened. Keep/re-adopt and hold.
+        if believe_owned:
+            if not self.executor.has_open_position and saved and saved.get("product_id"):
                 self._entry_premium = saved.get("entry_premium")
                 self._tp_price = saved.get("tp_price")
                 self._current_dir = saved.get("direction")
-                opt_type = OptionType.CALL if owned_symbol.startswith("C-") else OptionType.PUT
+                opt_type = OptionType.CALL if str(owned_symbol).startswith("C-") else OptionType.PUT
                 self.executor.adopt(int(saved["product_id"]), int(saved.get("size") or 0),
                                     opt_type, owned_symbol)
-            log.warning("RevBreak reconcile: owned position NOT returned by exchange — "
-                        "re-adopted from state file, will NOT open new trades. If it was "
-                        "closed manually, clear the state file and restart.",
-                        extra={"extra": {"symbol": owned_symbol}})
+            log.warning("RevBreak reconcile: position not returned by exchange — preserving "
+                        "tracked/state position, will NOT open new trades. If it was closed "
+                        "manually, clear the state file and restart.",
+                        extra={"extra": {"owned": owned_symbol, "tracked": self.executor.tracked_symbol}})
             return
 
-        # 3) Nothing claimed -> genuinely flat.
+        # Genuinely flat: no exchange short, nothing tracked, nothing in the state file.
         self.executor.clear()
         self._entry_premium = self._tp_price = self._current_dir = None
         self.strategy.force_flat()

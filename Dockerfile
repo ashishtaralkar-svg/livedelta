@@ -12,8 +12,12 @@ COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --upgrade pip && pip install .
 
-# Run as a non-root user.
-RUN useradd --create-home --uid 10001 botuser
+# Run as a non-root user. Pre-create the state dir owned by botuser so writes
+# work when using a named volume; for a host bind-mount, the HOST dir must also be
+# writable by uid 10001 (e.g. `sudo chown -R 10001:10001 state`).
+RUN useradd --create-home --uid 10001 botuser \
+    && mkdir -p /app/state \
+    && chown -R botuser:botuser /app/state
 USER botuser
 
 # CMD runs the live engine; override with `backtest`/`download` as needed.
