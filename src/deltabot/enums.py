@@ -54,6 +54,7 @@ class NotifyEvent(StrEnum):
     ENTRY_LONG = "ENTRY_LONG"
     ENTRY_SHORT = "ENTRY_SHORT"
     EXIT = "EXIT"
+    SKIPPED = "SKIPPED"
     REVERSAL = "REVERSAL"
     API_ERROR = "API_ERROR"
     RESTART = "RESTART"

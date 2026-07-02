@@ -21,6 +21,7 @@ _EMOJI = {
     NotifyEvent.ENTRY_LONG: "🟢",
     NotifyEvent.ENTRY_SHORT: "🔴",
     NotifyEvent.EXIT: "⚪",
+    NotifyEvent.SKIPPED: "⏭️",
     NotifyEvent.REVERSAL: "🔁",
     NotifyEvent.API_ERROR: "⚠️",
     NotifyEvent.RESTART: "🚀",
@@ -47,6 +48,12 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
                 msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
             return msg
         return f"{emoji} <b>ENTRY {ctx.get('direction')}</b> {ctx.get('symbol')} @ {ctx.get('price'):.2f}"
+    if event == NotifyEvent.SKIPPED:
+        return (
+            f"{emoji} <b>ENTRY SKIPPED</b> ({ctx.get('reason')})\n"
+            f"BTC: {_num(ctx.get('btc_price'))}\n"
+            f"SL distance: {ctx.get('sl_distance')} pts"
+        )
     if event == NotifyEvent.REVERSAL:
         return (
             f"{emoji} <b>REVERSAL</b> {ctx.get('symbol')} {ctx.get('from_state')} → "

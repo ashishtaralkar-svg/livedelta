@@ -234,6 +234,13 @@ class RevBreakEngine:
                 if sl_distance > max_sl:
                     log.info("RevBreak: skipped entry (SL too far)",
                              extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                    await self.notifier.notify(
+                        NotifyEvent.SKIPPED,
+                        reason="SL too far",
+                        btc_price=candle.close,
+                        sl_level=dec.sl_level,
+                        sl_distance=round(sl_distance, 1),
+                    )
                     return
             signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
             await self._open_entry(signal_dir, dec.sl_level, candle.close)
@@ -278,6 +285,12 @@ class RevBreakEngine:
                 if sl_distance > max_sl:
                     log.info("RevBreak: intracandle setup skipped (SL too far)",
                              extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                    await self.notifier.notify(
+                        NotifyEvent.SKIPPED,
+                        reason="SL too far",
+                        btc_price=candle.close,
+                        sl_distance=round(sl_distance, 1),
+                    )
                     self.strategy.notify_exit(
                         SignalDir.LONG.value if self.strategy.position_state == PositionState.LONG else SignalDir.SHORT.value,
                         "SL"  # unblock the re-entry gate
