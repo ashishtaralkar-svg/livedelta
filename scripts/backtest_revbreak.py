@@ -84,12 +84,15 @@ def run(candles, settings, args):
                    if pos["entry_time"] <= t <= exit_time]
         worst_prem = (max(adverse) if sell else min(adverse)) if adverse else exit_prem
         mae = ((pos["entry_prem"] - worst_prem) if sell else (worst_prem - pos["entry_prem"])) * lots * op.LOT_BTC
+        sl_distance = abs(pos["sl_level"] - pos["entry_btc"]) if pos.get("sl_level") else None
         trips.append({
             "action": action,
             "signal": "BUY" if pos["dir"] == SignalDir.LONG.value else "SELL",
             "contract": pos["sym"], "entry_time_ist": _ist(pos["entry_time"]),
             "exit_time_ist": _ist(exit_time), "exit_reason": reason,
-            "btc_entry": round(pos["entry_btc"], 1), "btc_exit": round(exit_btc, 1),
+            "btc_entry": round(pos["entry_btc"], 1), "btc_sl": round(pos.get("sl_level") or 0, 1),
+            "sl_distance": round(sl_distance, 1) if sl_distance else None,
+            "btc_exit": round(exit_btc, 1),
             "opt_in": round(pos["entry_prem"], 1), "opt_out": round(exit_prem, 1),
             "worst_prem": round(worst_prem, 1), "mae_usd": round(mae, 2),
             "lots": lots, "gross_usd": round(gross, 2),
@@ -124,6 +127,11 @@ def run(candles, settings, args):
             #   BUY side : buy CALL on a buy signal / PUT on a sell signal.
             #   SELL side: sell PUT on a buy signal / CALL on a sell signal (same bias, sold).
             if pos is None and dec is not None and dec.has_entry:
+                # Real-time SL filter: skip trades with wide stops.
+                if args.max_sl_distance and dec.sl_level:
+                    sl_dist = abs(dec.sl_level - c.close)
+                    if sl_dist > args.max_sl_distance:
+                        continue  # Skip this entry, continue to next candle
                 is_buy = dec.buy_signal
                 if sell:
                     otype = OptionType.PUT if is_buy else OptionType.CALL
@@ -146,6 +154,7 @@ def run(candles, settings, args):
                     "sym": sym, "candles": ocandles, "entry_time": c.start_time,
                     "entry_btc": c.close, "entry_prem": entry_prem,
                     "tp_price": entry_prem * tp_mult, "last_check": c.start_time,
+                    "sl_level": dec.sl_level,  # BTC stop-loss level (pattern extreme)
                 }
 
     return [t for t in trips if op_entry_ts(t) >= win_start]
@@ -161,6 +170,7 @@ def main() -> None:
     ap.add_argument("--days", type=float, default=7, help="look-back window in days (fractional ok, e.g. 0.333 = 8h)")
     ap.add_argument("--resolution", default="5m", help="BTC candle resolution (default 5m)")
     ap.add_argument("--warmup-days", type=int, default=2)
+    ap.add_argument("--max-sl-distance", type=float, default=None, help="skip trades where BTC SL is > this many points from entry (e.g. 400)")
     ap.add_argument("--side", choices=["buy", "sell"], default="buy",
                     help="buy = long option (+TP%% target); sell = short option (-TP%% target)")
     ap.add_argument("--gate", choices=["zone", "open"], default="zone",

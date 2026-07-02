@@ -227,6 +227,14 @@ class RevBreakEngine:
         # 4. New entry (only if now flat and not in settlement window). The
         #    intracandle path usually fires first; this is the closed-bar fallback.
         if dec.has_entry and not self.executor.has_open_position and not self._entries_blocked():
+            # Skip if SL is too far away (high-risk trades have poor edge).
+            max_sl = self.settings.revbreak_max_sl_distance
+            if max_sl > 0 and dec.sl_level is not None:
+                sl_distance = abs(dec.sl_level - candle.close)
+                if sl_distance > max_sl:
+                    log.info("RevBreak: skipped entry (SL too far)",
+                             extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                    return
             signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
             await self._open_entry(signal_dir, dec.sl_level, candle.close)
 
@@ -263,6 +271,18 @@ class RevBreakEngine:
             log.info("RevBreak: setup invalidated intracandle (SL crossed before trigger)")
             return
         if confirmed:
+            # Skip if SL is too far away.
+            max_sl = self.settings.revbreak_max_sl_distance
+            if max_sl > 0 and self.strategy.sl_level is not None:
+                sl_distance = abs(self.strategy.sl_level - candle.close)
+                if sl_distance > max_sl:
+                    log.info("RevBreak: intracandle setup skipped (SL too far)",
+                             extra={"extra": {"sl_distance": round(sl_distance, 1), "max": max_sl}})
+                    self.strategy.notify_exit(
+                        SignalDir.LONG.value if self.strategy.position_state == PositionState.LONG else SignalDir.SHORT.value,
+                        "SL"  # unblock the re-entry gate
+                    )
+                    return
             signal_dir = (SignalDir.LONG.value
                           if self.strategy.position_state == PositionState.LONG
                           else SignalDir.SHORT.value)
