@@ -208,7 +208,7 @@ class RevBreakEngine:
             except Exception as exc:  # noqa: BLE001
                 log.warning("RevBreak: get_mark_price failed", extra={"extra": {"error": str(exc)}})
                 mark = None
-            if mark is not None and mark <= self._tp_price:
+            if mark is not None and self._tp_price is not None and mark <= self._tp_price:
                 await self._close_tp(mark, candle)
                 # Still call strategy.update so Supertrend/day state advances.
                 self.strategy.update(candle)
@@ -419,6 +419,8 @@ class RevBreakEngine:
                 position_state.save(
                     self.settings.state_file,
                     symbol=symbol or "",
+                    product_id=self.executor.tracked_product_id,
+                    size=self.settings.option_contracts,
                     entry_premium=fill,
                     tp_price=self._tp_price,
                     direction=signal_dir,
@@ -444,52 +446,78 @@ class RevBreakEngine:
 
     # ------------------------------------------------------------------ #
     async def _sync_options_to_exchange(self) -> None:
-        """Reconcile open option position against the exchange on start/reconnect.
+        """Reconcile the open option position with the exchange on start/reconnect.
 
-        Loads the state file (if configured) to identify which symbol this bot
-        owns. Only adopts a position matching that symbol; ignores all others.
+        The STATE FILE is the source of truth for ownership. If it names a symbol we
+        consider ourselves in that position. We try to confirm it against the
+        exchange (retrying, since a read right after a WS reconnect can come back
+        incomplete). Three outcomes:
+          1. Exchange returns our position -> adopt it (authoritative).
+          2. State file claims a position the exchange did NOT return -> RE-ADOPT
+             FROM THE STATE FILE and do NOT open new trades. (Assuming "flat" here
+             is what previously orphaned a live short and let the bot open a second
+             one.) close_option is reduce-only, so a phantom re-adopt is safe.
+          3. State file claims nothing -> genuinely FLAT.
         """
-        try:
-            positions = await asyncio.to_thread(
-                self.rest.get_option_positions, self.executor.underlying
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.error("RevBreak reconcile: failed to fetch positions", extra={"extra": {"error": str(exc)}})
-            return
-
-        shorts = [p for p in positions if p["size"] < 0]
-
         state_file = self.settings.state_file
-        if state_file:
-            saved = position_state.load(state_file)
-            if saved:
-                owned_symbol = saved.get("symbol")
-                shorts = [p for p in shorts if p.get("symbol") == owned_symbol]
-                if shorts:
-                    # Restore TP tracking from state file.
-                    self._entry_premium = saved.get("entry_premium")
-                    self._tp_price = saved.get("tp_price")
-                    self._current_dir = saved.get("direction")
-            else:
-                shorts = []  # No state file → start flat.
+        saved = position_state.load(state_file) if state_file else None
+        owned_symbol = saved.get("symbol") if saved else None
 
-        if not shorts:
-            self.executor.clear()
-            self._entry_premium = self._tp_price = self._current_dir = None
-            # Flatten the strategy too: warmup may have re-derived an in-position
-            # state (e.g. a position that was closed manually on the exchange, which
-            # never appears in the price history). Without this the bot would think
-            # it still holds a trade and never look for new entries.
-            self.strategy.force_flat()
-            self._closing = False
-            log.info("RevBreak reconcile: no owned position — state FLAT")
+        # Fetch, retrying while we believe we own a symbol the fetch hasn't shown.
+        shorts: list[dict] = []
+        for attempt in range(3):
+            try:
+                positions = await asyncio.to_thread(
+                    self.rest.get_option_positions, self.executor.underlying
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error("RevBreak reconcile: fetch failed",
+                          extra={"extra": {"error": str(exc), "attempt": attempt}})
+                positions = []
+            shorts = [p for p in positions if p["size"] < 0]
+            if owned_symbol is None or any(p.get("symbol") == owned_symbol for p in shorts):
+                break
+            log.warning("RevBreak reconcile: owned symbol not in fetch — retrying",
+                        extra={"extra": {"owned": owned_symbol, "attempt": attempt,
+                                         "seen": [p.get("symbol") for p in shorts]}})
+            await asyncio.sleep(1.5)
+
+        # 1) Exchange confirms our owned position -> adopt from the exchange.
+        match = next((p for p in shorts if p.get("symbol") == owned_symbol), None) if owned_symbol else None
+        if match is not None:
+            if saved:
+                self._entry_premium = saved.get("entry_premium")
+                self._tp_price = saved.get("tp_price")
+                self._current_dir = saved.get("direction")
+            opt_type = OptionType.CALL if match["symbol"].startswith("C-") else OptionType.PUT
+            self.executor.adopt(match["product_id"], match["size"], opt_type, match.get("symbol"))
+            log.info("RevBreak reconcile: adopted own position (exchange-confirmed)",
+                     extra={"extra": {"symbol": match["symbol"], "tp_price": self._tp_price}})
             return
 
-        pos = shorts[0]
-        opt_type = OptionType.CALL if pos["symbol"].startswith("C-") else OptionType.PUT
-        self.executor.adopt(pos["product_id"], pos["size"], opt_type, pos.get("symbol"))
-        log.info("RevBreak reconcile: adopted own position",
-                 extra={"extra": {"symbol": pos["symbol"], "tp_price": self._tp_price}})
+        # 2) State file claims a position the exchange did NOT return. Never assume
+        #    flat here — that orphans live shorts and double-opens. Re-adopt from
+        #    the state file so the bot keeps managing it and will NOT open new.
+        if owned_symbol:
+            if saved and saved.get("product_id"):
+                self._entry_premium = saved.get("entry_premium")
+                self._tp_price = saved.get("tp_price")
+                self._current_dir = saved.get("direction")
+                opt_type = OptionType.CALL if owned_symbol.startswith("C-") else OptionType.PUT
+                self.executor.adopt(int(saved["product_id"]), int(saved.get("size") or 0),
+                                    opt_type, owned_symbol)
+            log.warning("RevBreak reconcile: owned position NOT returned by exchange — "
+                        "re-adopted from state file, will NOT open new trades. If it was "
+                        "closed manually, clear the state file and restart.",
+                        extra={"extra": {"symbol": owned_symbol}})
+            return
+
+        # 3) Nothing claimed -> genuinely flat.
+        self.executor.clear()
+        self._entry_premium = self._tp_price = self._current_dir = None
+        self.strategy.force_flat()
+        self._closing = False
+        log.info("RevBreak reconcile: no owned position — state FLAT")
 
     # ------------------------------------------------------------------ #
     # EOD wall-clock square-off (mirrors TradingEngine._square_off_scheduler)
