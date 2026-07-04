@@ -20,9 +20,10 @@ _IST = ZoneInfo("Asia/Kolkata")
 LOT_BTC = 0.001  # 1 option lot = 0.001 BTC underlying on Delta BTC options
 RES_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 
-# Delta options taker fee (brokerage): 0.03% of underlying notional, capped at
-# 10% of premium, charged per side. Excludes bid/ask spread.
-TAKER_FEE_PCT = 0.0003
+# Delta options taker fee (brokerage), calibrated to actual account fills
+# (2026-07 order log: ~$0.37 per 50-lot leg ≈ 0.012% of underlying notional),
+# capped at 10% of premium, charged per side. Excludes bid/ask spread.
+TAKER_FEE_PCT = 0.00012
 PREMIUM_FEE_CAP_PCT = 0.10
 
 

@@ -63,6 +63,10 @@ def run(candles, settings, args):
     lots = args.lots if args.lots is not None else settings.option_contracts
     step = op.RES_SECONDS.get(args.opt_resolution, 60)
     sell = args.side == "sell"
+    # Slippage on market-order fills (as a fraction of premium). A SELL receives
+    # LESS on the sell-to-open and pays MORE on the buy-to-close; BUY is the mirror.
+    es = args.entry_slippage_pct / 100.0
+    xs = args.exit_slippage_pct / 100.0
     # SELL: take-profit when premium decays to (1 - tp%) of entry; BUY: rises to (1 + tp%).
     tp_mult = (1.0 - args.take_profit / 100.0) if sell else (1.0 + args.take_profit / 100.0)
     win_start = int(time.time()) - args.days * 86400
@@ -73,10 +77,18 @@ def run(candles, settings, args):
     def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float):
         nonlocal pos
         assert pos is not None
-        # SELL: profit when premium falls (entry - exit); BUY: when it rises (exit - entry).
-        gross = ((pos["entry_prem"] - exit_prem) if sell else (exit_prem - pos["entry_prem"])) * lots * op.LOT_BTC
-        fee = (op.side_fee(pos["entry_btc"], pos["entry_prem"], lots)
-               + op.side_fee(exit_btc, exit_prem, lots))
+        # Apply slippage to the actual fills. SELL: worse = receive less at entry,
+        # pay more at exit. BUY: pay more at entry, receive less at exit.
+        if sell:
+            entry_fill = pos["entry_prem"] * (1 - es)
+            exit_fill = exit_prem * (1 + xs)
+            gross = (entry_fill - exit_fill) * lots * op.LOT_BTC
+        else:
+            entry_fill = pos["entry_prem"] * (1 + es)
+            exit_fill = exit_prem * (1 - xs)
+            gross = (exit_fill - entry_fill) * lots * op.LOT_BTC
+        fee = (op.side_fee(pos["entry_btc"], entry_fill, lots)
+               + op.side_fee(exit_btc, exit_fill, lots))
         action = ("SELL " if sell else "BUY ") + ("CALL" if pos["sym"].startswith("C-") else "PUT")
         # Max adverse excursion: worst unrealized premium move during the hold.
         # SELL is hurt when premium RISES (use highs); BUY when it FALLS (use lows).
@@ -93,7 +105,7 @@ def run(candles, settings, args):
             "btc_entry": round(pos["entry_btc"], 1), "btc_sl": round(pos.get("sl_level") or 0, 1),
             "sl_distance": round(sl_distance, 1) if sl_distance else None,
             "btc_exit": round(exit_btc, 1),
-            "opt_in": round(pos["entry_prem"], 1), "opt_out": round(exit_prem, 1),
+            "opt_in": round(entry_fill, 1), "opt_out": round(exit_fill, 1),
             "worst_prem": round(worst_prem, 1), "mae_usd": round(mae, 2),
             "lots": lots, "gross_usd": round(gross, 2),
             "fee_usd": round(fee, 2), "net_usd": round(gross - fee, 2),
@@ -186,6 +198,10 @@ def main() -> None:
     ap.add_argument("--target-premium", type=float, default=300.0)
     ap.add_argument("--take-profit", type=float, default=50.0,
                     help="%% premium target: BUY exits at +TP%%, SELL exits at -TP%% (default 50)")
+    ap.add_argument("--entry-slippage-pct", type=float, default=0.0,
+                    help="premium %% given up on the entry market fill (default 0)")
+    ap.add_argument("--exit-slippage-pct", type=float, default=0.0,
+                    help="premium %% paid through the spread on the exit market fill (default 0)")
     ap.add_argument("--opt-resolution", default="1m")
     ap.add_argument("--lots", type=int, default=None)
     ap.add_argument("--excel", default="revbreak_backtest_IST.xlsx")
