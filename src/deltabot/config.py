@@ -94,7 +94,13 @@ class Settings(BaseSettings):
     revbreak_reentry_block: bool = True  # block same-dir re-entry after a TP until an ST flip
     revbreak_tp_poll_seconds: float = 15.0  # how often to poll the option mark for the TP (0 = only at 5m close)
     revbreak_max_sl_distance: float = 0.0  # skip trades where BTC SL is > this many points from entry (0 = no limit)
-    revbreak_paper_trade_wide_sl: bool = False  # paper-trade wide-SL (>max_sl_distance) instead of real; monitor only
+    # Percentage-of-price SL band for REAL execution (adapts to BTC price). When
+    # max_sl_pct > 0 this band takes precedence over the fixed max_sl_distance:
+    # a trade whose BTC SL distance is < min_sl_pct or > max_sl_pct of the entry
+    # price is out-of-band (paper-traded if enabled, else skipped). E.g. 0.25 / 0.75.
+    revbreak_min_sl_pct: float = 0.0  # floor: skip/paper trades with SL closer than this % of price
+    revbreak_max_sl_pct: float = 0.0  # ceiling: skip/paper trades with SL wider than this % of price
+    revbreak_paper_trade_wide_sl: bool = False  # paper-trade out-of-band SL trades instead of real; monitor only
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
     # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).
