@@ -294,7 +294,15 @@ class RevBreakEngine:
     async def _handle_forming_candle(self, candle: Candle) -> None:
         """Intracandle updates: enter ASAP when price crosses the pattern trigger,
         and exit ASAP when the BTC pattern-extreme stop is touched — instead of
-        waiting for the 5m candle to close."""
+        waiting for the 5m candle to close.
+
+        Gated by ``revbreak_intracandle_enabled`` (default OFF): the backtest only
+        ever evaluates signals at closed-candle boundaries, so this path has no
+        backtest coverage. Live-vs-backtest reconciliation found it responsible for
+        a stream of whipsaw losses (see config.py). All entries/exits then run
+        through ``_handle_closed_candle`` only, matching the validated backtest."""
+        if not self.settings.revbreak_intracandle_enabled:
+            return
         if not self.strategy.ready:
             return
 

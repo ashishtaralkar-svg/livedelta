@@ -101,6 +101,14 @@ class Settings(BaseSettings):
     revbreak_min_sl_pct: float = 0.0  # floor: skip/paper trades with SL closer than this % of price
     revbreak_max_sl_pct: float = 0.0  # ceiling: skip/paper trades with SL wider than this % of price
     revbreak_paper_trade_wide_sl: bool = False  # paper-trade out-of-band SL trades instead of real; monitor only
+    # ASAP intracandle entry/SL (fires mid-bar instead of waiting for the 5m
+    # close). The backtest only ever evaluates signals at closed-candle
+    # boundaries, so this path is NOT modeled there. Live analysis (2026-07 order
+    # history vs backtest, same window) found every trade held <10 minutes was a
+    # whipsaw loser (0% win, -$85 gross) coming from this path, while the
+    # candle-close-matched trades performed in line with the backtest (31% win,
+    # +$53 gross). Default OFF so live behavior matches the validated backtest.
+    revbreak_intracandle_enabled: bool = False
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
     # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).
