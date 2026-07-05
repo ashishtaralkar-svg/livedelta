@@ -1,6 +1,6 @@
 """RevBreak live trading engine.
 
-Runs RevBreakStrategy on 5-minute BTC candles; executes option trades via
+Runs RevBreakSellStrategy on 5-minute BTC candles; executes option trades via
 OptionsExecutor in SELL mode; checks the option's mark price on every closed bar
 for the -N% take-profit; manages BTC-stop-based SL and wall-clock EOD square-off.
 
@@ -10,7 +10,7 @@ reconciles its own position on restart.
 
 Data flow per closed 5m BTC candle:
     1. If position open: fetch option mark price → check TP
-    2. RevBreakStrategy.update(candle) → exits (BTC SL / EOD) + new entries
+    2. RevBreakSellStrategy.update(candle) → exits (BTC SL / EOD) + new entries
     3. If BTC exit fires: close option via REST
     4. If new entry signal: open option nearest to target_premium via option chain
 """
@@ -29,7 +29,7 @@ from ..exchange.rest_client import RestClient
 from ..exchange.ws_manager import WebSocketManager
 from ..logging_setup import get_logger
 from ..models import Candle
-from ..strategy.revbreak import RevBreakStrategy
+from ..strategy.revbreak import RevBreakSellStrategy
 from . import position_state
 from .candle_aggregator import CandleAggregator
 from .options_executor import OptionsExecutor, OptionsMarginError
@@ -40,15 +40,15 @@ _BAR_SECONDS = 300  # 5 minutes — RevBreak always runs on 5m BTC candles
 log = get_logger(__name__)
 
 
-class RevBreakEngine:
-    """Live trading engine wired to RevBreakStrategy."""
+class RevBreakSellEngine:
+    """Live trading engine wired to RevBreakSellStrategy."""
 
     def __init__(self, settings: Settings, rest: RestClient, notifier) -> None:
         self.settings = settings
         self.rest = rest
         self.notifier = notifier
 
-        self.strategy = RevBreakStrategy(
+        self.strategy = RevBreakSellStrategy(
             atr_period=settings.atr_period,
             st_multiplier=settings.st_multiplier,
             gate=settings.revbreak_gate,
@@ -86,7 +86,7 @@ class RevBreakEngine:
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         mode = "TESTNET" if self.settings.testnet else "LIVE"
-        await self.notifier.notify(NotifyEvent.RESTART, mode=f"{mode} [RevBreak]")
+        await self.notifier.notify(NotifyEvent.RESTART, mode=f"{mode} [RevBreak-Sell]")
 
         # Warmup strategy with historical 5m candles.
         await self._warmup()
@@ -107,7 +107,7 @@ class RevBreakEngine:
         self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
         if self.settings.revbreak_tp_poll_seconds > 0:
             self._tp_poll_task = asyncio.create_task(self._tp_poll_loop())
-        log.info("RevBreakEngine: starting live")
+        log.info("RevBreakSellEngine: starting live")
         await self.ws.run()
 
     async def stop(self) -> None:

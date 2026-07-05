@@ -83,7 +83,7 @@ class Settings(BaseSettings):
 
     # --- Strategy selector ---
     # "pine"     = PineStrategy (EMA/Supertrend, fixed ITM offset)
-    # "revbreak" = RevBreakStrategy (prev-day-zone breakout, premium-targeted strike, option TP)
+    # "revbreak" = RevBreakSellStrategy, aka "RevBreak-Sell" (prev-day-zone breakout, premium-targeted strike, option TP)
     strategy: str = "pine"
 
     # RevBreak-specific settings (ignored when strategy="pine")

@@ -27,7 +27,7 @@ from deltabot.backtest.data_loader import df_to_candles, download
 from deltabot.config import load_settings
 from deltabot.enums import OptionType, SignalDir
 from deltabot.logging_setup import setup_logging
-from deltabot.strategy.revbreak import RevBreakStrategy
+from deltabot.strategy.revbreak import RevBreakSellStrategy
 
 _IST = ZoneInfo("Asia/Kolkata")
 
@@ -48,7 +48,7 @@ def _first_tp_time(candles: dict, after: int, upto: int, tp_price: float, step: 
 
 
 def run(candles, settings, args):
-    strategy = RevBreakStrategy(
+    strategy = RevBreakSellStrategy(
         atr_period=settings.atr_period, st_multiplier=settings.st_multiplier,
         gate=args.gate, st_entry_filter=args.st_filter,
         reentry_block=not args.no_reentry_block,

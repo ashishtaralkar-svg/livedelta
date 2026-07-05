@@ -56,7 +56,7 @@ class RevDecision:
         return self.buy_signal or self.sell_signal
 
 
-class RevBreakStrategy:
+class RevBreakSellStrategy:
     def __init__(
         self,
         *,
