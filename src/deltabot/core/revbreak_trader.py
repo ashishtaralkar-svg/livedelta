@@ -236,13 +236,8 @@ class RevBreakSellEngine:
             if is_paper:
                 log.info("RevBreak: paper-trade entry (SL out of band)",
                          extra={"extra": {"sl_distance": round(sl_distance, 1), "reason": reason}})
-                await self.notifier.notify(
-                    NotifyEvent.SKIPPED,
-                    reason=f"Paper ({reason})",
-                    btc_price=candle.close,
-                    sl_level=dec.sl_level,
-                    sl_distance=round(sl_distance, 1),
-                )
+                # PAPER_ENTRY Telegram is sent inside _open_entry once the paper
+                # position actually opens (after the max-1-trade guard).
             elif out_of_band:
                 # Out-of-band and paper-trading disabled: skip entry.
                 log.info("RevBreak: skipped entry (SL out of band)",
@@ -257,7 +252,8 @@ class RevBreakSellEngine:
                 return
 
             signal_dir = SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value
-            await self._open_entry(signal_dir, dec.sl_level, candle.close, is_paper=is_paper)
+            await self._open_entry(signal_dir, dec.sl_level, candle.close,
+                                   is_paper=is_paper, paper_reason=reason)
 
     # ------------------------------------------------------------------ #
     def _sl_out_of_band(self, sl_level: float | None, btc_price: float) -> tuple[bool, float, str]:
@@ -336,12 +332,7 @@ class RevBreakSellEngine:
             if is_paper:
                 log.info("RevBreak: intracandle paper-trade entry (SL out of band)",
                          extra={"extra": {"sl_distance": round(sl_distance, 1), "reason": reason}})
-                await self.notifier.notify(
-                    NotifyEvent.SKIPPED,
-                    reason=f"Paper ({reason})",
-                    btc_price=candle.close,
-                    sl_distance=round(sl_distance, 1),
-                )
+                # PAPER_ENTRY Telegram is sent inside _open_entry once it opens.
             elif out_of_band:
                 log.info("RevBreak: intracandle setup skipped (SL out of band)",
                          extra={"extra": {"sl_distance": round(sl_distance, 1), "reason": reason}})
@@ -356,7 +347,8 @@ class RevBreakSellEngine:
 
             log.info("RevBreak: intracandle breakout — entering ASAP",
                      extra={"extra": {"trigger": entry_price}})
-            await self._open_entry(signal_dir, self.strategy.sl_level, entry_price, is_paper=is_paper)
+            await self._open_entry(signal_dir, self.strategy.sl_level, entry_price,
+                                   is_paper=is_paper, paper_reason=reason)
 
     # ------------------------------------------------------------------ #
     async def _tp_poll_loop(self) -> None:
@@ -391,17 +383,11 @@ class RevBreakSellEngine:
             log.info("RevBreak: paper position TP hit",
                      extra={"extra": {"mark": mark}})
             direction = self._current_dir  # capture BEFORE clearing
-            entry_prem = self._entry_premium
             self._entry_premium = self._tp_price = self._current_dir = None
             self._is_paper_trade = False
             if direction is not None:
                 self.strategy.notify_exit(direction, "TP")
-            await self.notifier.notify(
-                NotifyEvent.EXIT, reason="TP (paper)", contract="PAPER",
-                entry_premium=entry_prem, exit_premium=mark,
-                pnl=round(((entry_prem or 0) - mark) * self.settings.option_contracts * 0.001, 2),
-                size=self.settings.option_contracts,
-            )
+            await self.notifier.notify(NotifyEvent.PAPER_EXIT, reason="TP", btc_price=mark)
             return
 
         if self._closing or not self.executor.has_open_position:
@@ -451,16 +437,12 @@ class RevBreakSellEngine:
             log.info("RevBreak: paper position closed",
                      extra={"extra": {"reason": reason, "btc_exit_price": btc_exit_price}})
             direction = self._current_dir  # capture BEFORE clearing
-            entry_prem = self._entry_premium
             self._entry_premium = self._tp_price = self._current_dir = None
             self._is_paper_trade = False
             if direction is not None:
                 self.strategy.notify_exit(direction, reason)
-            await self.notifier.notify(
-                NotifyEvent.EXIT, reason=f"{reason} (paper)", contract="PAPER",
-                entry_premium=entry_prem, exit_premium=None,
-                pnl=0.0, size=self.settings.option_contracts,
-            )
+            await self.notifier.notify(NotifyEvent.PAPER_EXIT, reason=reason,
+                                       btc_price=btc_exit_price)
             return
 
         if self._closing or not self.executor.has_open_position:
@@ -505,7 +487,7 @@ class RevBreakSellEngine:
         )
 
     async def _open_entry(self, signal_dir: int, sl_level: float | None, btc_price: float,
-                          is_paper: bool = False) -> None:
+                          is_paper: bool = False, paper_reason: str = "") -> None:
         """Open a short option for a new RevBreak signal. Callable from both the
         intracandle (ASAP) and closed-candle (fallback) paths; guarded so the two
         can never double-open. ``signal_dir`` is a SignalDir value; bullish sells a
@@ -528,6 +510,16 @@ class RevBreakSellEngine:
                 log.info("RevBreak: paper position opened (out-of-band SL, no real trade)",
                          extra={"extra": {"signal_dir": signal_dir, "entry_prem": self._entry_premium,
                                           "sl_level": sl_level, "btc_price": btc_price}})
+                sl_distance = abs(sl_level - btc_price) if sl_level is not None else None
+                await self.notifier.notify(
+                    NotifyEvent.PAPER_ENTRY,
+                    reason=paper_reason or "SL out of band",
+                    direction="PUT" if is_buy else "CALL",
+                    premium=self._entry_premium,
+                    btc_price=btc_price,
+                    sl_level=sl_level,
+                    sl_distance=round(sl_distance, 1) if sl_distance is not None else "n/a",
+                )
                 return
 
             # Real trades: execute on the exchange.
@@ -711,11 +703,7 @@ class RevBreakSellEngine:
             if direction is not None:
                 self.strategy.notify_exit(direction, "EOD")
             log.info("RevBreak: EOD square-off — paper position cleared")
-            await self.notifier.notify(
-                NotifyEvent.EXIT, reason="EOD (paper)", contract="PAPER",
-                entry_premium=None, exit_premium=None, pnl=0.0,
-                size=self.settings.option_contracts,
-            )
+            await self.notifier.notify(NotifyEvent.PAPER_EXIT, reason="EOD")
             return
         if not self.executor.has_open_position:
             return

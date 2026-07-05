@@ -22,6 +22,8 @@ _EMOJI = {
     NotifyEvent.ENTRY_SHORT: "🔴",
     NotifyEvent.EXIT: "⚪",
     NotifyEvent.SKIPPED: "⏭️",
+    NotifyEvent.PAPER_ENTRY: "📝",
+    NotifyEvent.PAPER_EXIT: "📝",
     NotifyEvent.REVERSAL: "🔁",
     NotifyEvent.API_ERROR: "⚠️",
     NotifyEvent.RESTART: "🚀",
@@ -53,6 +55,21 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
             f"{emoji} <b>ENTRY SKIPPED</b> ({ctx.get('reason')})\n"
             f"BTC: {_num(ctx.get('btc_price'))}\n"
             f"SL distance: {ctx.get('sl_distance')} pts"
+        )
+    if event == NotifyEvent.PAPER_ENTRY:
+        return (
+            f"{emoji} <b>PAPER TRADE OPENED</b> — no real order\n"
+            f"Why: {ctx.get('reason')}\n"
+            f"Would sell {ctx.get('direction')} (notional premium {_num(ctx.get('premium'))})\n"
+            f"BTC: {_num(ctx.get('btc_price'))}  |  BTC stop: {_num(ctx.get('sl_level'))} "
+            f"({ctx.get('sl_distance')} pts)\n"
+            f"Monitoring until SL / EOD"
+        )
+    if event == NotifyEvent.PAPER_EXIT:
+        return (
+            f"{emoji} <b>PAPER TRADE CLOSED</b> ({ctx.get('reason')}) — no real order was open\n"
+            f"BTC exit: {_num(ctx.get('btc_price'))}\n"
+            f"Bot is flat again and watching for the next signal"
         )
     if event == NotifyEvent.REVERSAL:
         return (
