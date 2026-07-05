@@ -1,3 +1,3 @@
-"""Delta Exchange BTC perpetual intraday trend bot (prev-day OHLC + Supertrend + EMA H/L)."""
+"""Delta Exchange BTC options bot — RevBreak-Sell (reversal-breakout option seller)."""
 
 __version__ = "0.1.0"

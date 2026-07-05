@@ -81,10 +81,12 @@ class Settings(BaseSettings):
     option_min_available_balance: float = 0.0  # skip selling if available balance below this (0 = no check)
     option_margin_asset: str | None = None  # wallet asset to check balance for (None = max across wallets)
 
-    # --- Strategy selector ---
-    # "pine"     = PineStrategy (EMA/Supertrend, fixed ITM offset)
-    # "revbreak" = RevBreakSellStrategy, aka "RevBreak-Sell" (prev-day-zone breakout, premium-targeted strike, option TP)
-    strategy: str = "pine"
+    # --- Strategy ---
+    # Only RevBreak-Sell (RevBreakSellStrategy) is implemented: prev-day-zone /
+    # open-gate reversal-breakout that SELLS a premium-targeted option with a
+    # premium-decay TP and BTC-pattern stop. Kept as a field for compatibility
+    # with existing DELTA_STRATEGY=revbreak env config.
+    strategy: str = "revbreak"
 
     # RevBreak-specific settings (ignored when strategy="pine")
     target_premium: float = 900.0       # target option mark price at entry
