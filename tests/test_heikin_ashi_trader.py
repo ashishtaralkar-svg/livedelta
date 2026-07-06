@@ -153,7 +153,7 @@ async def test_forming_candle_asap_trail_closes_immediately() -> None:
     engine._entry_premium = 900.0
     engine.strategy._in_long, engine.strategy._in_short = True, False
     engine.strategy._sl_level = 50000.0  # far away -- SL must not be the cause
-    engine.strategy._ema._value = 59000.0  # trail level fixed as of the last closed bar
+    engine.strategy._trail_sl_level = 59000.0  # simulate an already-armed trail stop
 
     forming = _c(1_700_000_000, 59100.0, 59150.0, 58990.0, 59050.0)  # low drops below trail
     await engine._handle_forming_candle(forming)
@@ -175,7 +175,7 @@ async def test_forming_candle_sl_takes_priority_over_trail() -> None:
     engine._entry_premium = 900.0
     engine.strategy._in_long, engine.strategy._in_short = True, False
     engine.strategy._sl_level = 59000.0
-    engine.strategy._ema._value = 59500.0  # would ALSO fire TRAIL on this bar's low
+    engine.strategy._trail_sl_level = 59500.0  # would ALSO fire TRAIL on this bar's low
 
     forming = _c(1_700_000_000, 59100.0, 59150.0, 58990.0, 59050.0)
     await engine._handle_forming_candle(forming)

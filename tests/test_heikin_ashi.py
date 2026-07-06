@@ -273,59 +273,107 @@ def test_session_open_updates_on_day_start_rollover() -> None:
 
 
 # ---------------------------------------------------------------------- #
-# Trailing SL exit: ASAP, real price crossing the 50 EMA level fixed as of the
-# last CLOSED bar (mirrors the fixed-SL convention) -- fires immediately, not
-# waiting for this bar's HA close to settle.
+# Trailing SL: ARMS (or tightens) at a CLOSED bar whose HA close is beyond the
+# 50 EMA against the position's bias -- level = that bar's HA low/high. Once
+# armed it behaves exactly like the fixed SL: exits ASAP the instant REAL
+# price crosses it (not waiting for the next bar to close).
 # ---------------------------------------------------------------------- #
-def test_trail_closes_long_immediately_when_low_drops_below_last_closed_ema() -> None:
+def test_trail_arms_on_closed_bar_but_does_not_exit_that_same_bar() -> None:
     s = HeikinAshiStrategy()
     s._in_long, s._in_short = True, False
-    s._sl_level = 50.0        # far below this candle's low -- SL must not be the cause
-    s._ema._value = 95.0      # EMA level fixed as of the last closed bar
+    s._sl_level = 10.0        # far below -- SL must not be the cause
+    s._ema._value = 95.0      # ema before this bar
     s._ha_open, s._ha_close = 95.0, 95.0
     s._prev_ha = (95.0, 96.0, 94.0, 95.0)
 
-    # This bar's real low (86) drops below the fixed trail level (95) -- TRAIL
-    # fires ASAP at that level, using real price, regardless of this bar's own
-    # HA close.
+    # ha_open=95, ha_close=(88+94+86+92)/4=90 < ema_after(~94.8) -> ARMS at
+    # this bar's ha_low = min(86, 95, 90) = 86. No exit fires on this same
+    # bar -- the level didn't exist yet when the exit check ran.
     candle = _c(_BASE_TS, 88.0, 94.0, 86.0, 92.0)
+    dec = s.update(candle)
+
+    assert dec is None
+    assert s._trail_sl_level == 86.0
+    assert s.position_state == PositionState.LONG
+
+
+def test_trail_exits_asap_on_real_price_crossing_the_armed_level() -> None:
+    s = HeikinAshiStrategy()
+    s._in_long, s._in_short = True, False
+    s._sl_level = 10.0
+    s._ema._value = 95.0
+    s._ha_open, s._ha_close = 95.0, 95.0
+    s._prev_ha = (95.0, 96.0, 94.0, 95.0)
+    s.update(_c(_BASE_TS, 88.0, 94.0, 86.0, 92.0))  # arms trail_sl_level = 86.0
+    assert s._trail_sl_level == 86.0
+
+    # Next bar's real low (83) crosses the armed level (86) -- exits AT that
+    # level, using real price, regardless of this bar's own HA close.
+    candle = _c(_BASE_TS + 300, 85.0, 87.0, 83.0, 84.0)
     dec = s.update(candle)
 
     assert dec is not None
     assert dec.long_exit and not dec.short_exit
     assert dec.exit_reason == "TRAIL"
-    assert dec.long_exit_price == 95.0   # closes AT the trail level, not this bar's close
+    assert dec.long_exit_price == 86.0
     assert s.position_state == PositionState.FLAT
     assert s.sl_level is None
+    assert s._trail_sl_level is None
 
 
-def test_trail_closes_short_immediately_when_high_rises_above_last_closed_ema() -> None:
-    """Mirror of the long case: short closes the instant real price rises above
-    the fixed trail level."""
+def test_trail_mirrors_for_short() -> None:
     s = HeikinAshiStrategy()
     s._in_long, s._in_short = False, True
-    s._sl_level = 200.0        # far above this candle's high -- SL must not be the cause
-    s._ema._value = 95.0       # EMA level fixed as of the last closed bar
+    s._sl_level = 200.0
+    s._ema._value = 95.0
     s._ha_open, s._ha_close = 95.0, 95.0
     s._prev_ha = (95.0, 96.0, 94.0, 95.0)
 
-    # This bar's real high (106) rises above the fixed trail level (95).
-    candle = _c(_BASE_TS, 102.0, 106.0, 98.0, 104.0)
-    dec = s.update(candle)
+    # ha_close=(102+106+98+104)/4=102.5 > ema_after(~95.3) -> ARMS at this
+    # bar's ha_high = max(106, 95, 102.5) = 106.
+    dec = s.update(_c(_BASE_TS, 102.0, 106.0, 98.0, 104.0))
+    assert dec is None
+    assert s._trail_sl_level == 106.0
 
+    # Next bar's real high (109) crosses the armed level.
+    dec = s.update(_c(_BASE_TS + 300, 107.0, 109.0, 105.0, 106.0))
     assert dec is not None
     assert dec.short_exit and not dec.long_exit
     assert dec.exit_reason == "TRAIL"
-    assert dec.short_exit_price == 95.0
+    assert dec.short_exit_price == 106.0
     assert s.position_state == PositionState.FLAT
-    assert s.sl_level is None
 
 
-def test_check_intracandle_trail_after_long_entry() -> None:
+def test_trail_only_ever_tightens_never_loosens() -> None:
+    """A later qualifying bar with a HIGHER low tightens (moves up) the long
+    trail level; it must never move back down."""
+    s = HeikinAshiStrategy()
+    s._in_long, s._in_short = True, False
+    s._sl_level = 10.0
+    s._ema._value = 95.0
+    s._ha_open, s._ha_close = 95.0, 95.0
+    s._prev_ha = (95.0, 96.0, 94.0, 95.0)
+    s.update(_c(_BASE_TS, 88.0, 94.0, 86.0, 92.0))  # arms trail_sl_level = 86.0
+    assert s._trail_sl_level == 86.0
+
+    # ha_open=(95+90)/2=92.5, ha_close=(90.5+93+90.2+91)/4=91.175 -- still
+    # below the (still-declining) ema, so this ALSO qualifies -- ha_low=90.2
+    # is HIGHER than the current 86.0 -> tightens up to 90.2.
+    dec = s.update(_c(_BASE_TS + 300, 90.5, 93.0, 90.2, 91.0))
+    assert dec is None  # this bar's real low (90.2) doesn't breach the OLD level (86.0)
+    assert s._trail_sl_level == 90.2
+
+
+def test_check_intracandle_trail_only_active_once_armed() -> None:
     s = HeikinAshiStrategy()
     _arm_long(s)
     s.apply_intracandle_pending(_c(1, 60_050, 60_310, 60_020, 60_290))  # now LONG, sl=60_000
-    s._ema._value = 60_100.0   # trail level fixed as of the last closed bar
+    assert s._trail_sl_level is None  # not armed yet -- only a closed bar arms it
+
+    long_trail, short_trail, level = s.check_intracandle_trail(60_050.0)
+    assert not long_trail and not short_trail and level is None
+
+    s._trail_sl_level = 60_100.0  # simulate a previously-armed trail stop
     long_trail, short_trail, level = s.check_intracandle_trail(60_050.0)
     assert long_trail and not short_trail
     assert level == 60_100.0
@@ -334,11 +382,13 @@ def test_check_intracandle_trail_after_long_entry() -> None:
 
 
 def test_fixed_sl_takes_priority_over_trail_on_same_bar() -> None:
-    """If the fixed SL and the trailing-EMA exit would both fire on the same
-    closed bar, the fixed SL wins (matches the SL-before-EOD/trail precedence)."""
+    """If the fixed SL and an ALREADY-ARMED trailing SL would both fire on the
+    same closed bar, the fixed SL wins (matches the SL-before-EOD/trail
+    precedence)."""
     s = HeikinAshiStrategy()
     s._in_long, s._in_short = True, False
     s._sl_level = 91.0         # THIS bar's low (86) breaches it
+    s._trail_sl_level = 90.0   # would ALSO breach on this bar's low (86)
     s._ema._value = 95.0
     s._ha_open, s._ha_close = 95.0, 95.0
     s._prev_ha = (95.0, 96.0, 94.0, 95.0)

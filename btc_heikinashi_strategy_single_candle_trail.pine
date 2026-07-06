@@ -1,0 +1,289 @@
+//@version=5
+// ============================================================================
+// BTC Heikinashi Strategy -- "single-candle + TRAIL" configuration.
+// Entry gate: Supertrend(10,3) direction AND REAL price on the correct side
+// of the session's opening price (day_start, default 17:30 IST). Pattern is
+// a SINGLE HA candle (open==low for BUY, open==high for SELL). Fixed SL
+// protects the trade for its entire life. A separate "trailing SL": while a
+// trade is open, any CLOSED bar whose HA close is beyond the 50 EMA (against
+// the position's bias) arms -- or, if already armed, tightens -- a stop at
+// THAT bar's HA low/high (only ever moves favorably, never loosens). Once
+// armed it behaves exactly like the fixed SL (labeled TRAILING SL HIT): a
+// resting stop that fills the instant REAL price crosses it, not waiting for
+// the next bar to close. Whichever fires first (fixed SL touch, the trailing
+// stop, or EOD) closes the trade. Also force-closes everything at 17:25 IST
+// and blocks new signals through the 17:25-17:30 settlement gap (resumes at
+// 17:30). No profit target.
+//
+// CHART BASIS: synthetic Heikin Ashi candles, fetched via
+//   request.security(ticker.heikinashi(...)) -- this makes the pattern
+//   logic correct regardless of whether your TradingView chart itself is
+//   displayed as regular candles or Heikin Ashi. Pattern LEVELS (trigger,
+//   SL) come from these HA candles, but whether price actually CROSSES
+//   those levels (invalidation, entry fill, stop) is always checked
+//   against REAL price -- that's what a live order actually fills against.
+//
+// BUY signal (single HA candle): Supertrend(10,3) bullish (computed on the HA
+//              candles) AND REAL price currently ABOVE this session's opening
+//              price (captured at day_start, default 17:30 IST) AND a chained
+//              EMA trend filter (HA close > 50 EMA > 200 EMA) AND this HA
+//              candle's open==low -- structurally green/flat, no lower wick.
+//   Trigger = max(this candle's HA high, previous candle's HA high) (enter on
+//             a break above). SL = min(this candle's HA low, previous
+//             candle's HA low). If price goes below SL BEFORE the trigger
+//             ever fires, the setup is invalidated (untraded).
+// SELL signal: mirror -- Supertrend bearish AND REAL price currently BELOW
+//              the session open AND the chained EMA trend filter (HA close <
+//              50 EMA < 200 EMA) AND this HA candle's open==high (no upper
+//              wick).
+//   Trigger = min(this candle's HA low, previous candle's HA low) (enter on a
+//             break below). SL = max(this candle's HA high, previous
+//             candle's HA high). If price goes above SL BEFORE the trigger
+//             ever fires, the setup is invalidated (untraded).
+//
+// The 50 EMA additionally drives the "trailing SL" exit below (arms/tightens
+// on a closed bar beyond the EMA; the derived level then fills like a stop).
+// ============================================================================
+strategy("BTC Heikinashi Strategy - Single-Candle + TRAIL", overlay=true)
+
+// ============================================================
+// Inputs
+// ============================================================
+emaLength    = input.int(50, "EMA Length")
+ema200Length = input.int(200, "EMA 200 Length (trend filter)")
+stPeriod     = input.int(10, "Supertrend ATR Period")
+stMultiplier = input.float(3.0, "Supertrend Multiplier")
+
+grpTime = "Session (IST)"
+sessTZ    = input.string("Asia/Kolkata", "Timezone", group=grpTime)
+sqOffHr   = input.int(17, "Square-Off Hour",   minval=0, maxval=23, group=grpTime)
+sqOffMin  = input.int(25, "Square-Off Minute", minval=0, maxval=59, group=grpTime)
+sessHr    = input.int(17, "Session Start Hour",   minval=0, maxval=23, group=grpTime)
+sessMin   = input.int(30, "Session Start Minute", minval=0, maxval=59, group=grpTime)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC + Supertrend(10,3) computed on the HA series
+// (the entry gate). ta.supertrend's `direction` is -1 for an uptrend and +1
+// for a downtrend (opposite of "positive = bullish") -- handled below.
+// ============================================================
+haData() =>
+    [st, dir] = ta.supertrend(stMultiplier, stPeriod)
+    [open, high, low, close, st, dir]
+
+[haOpen, haHigh, haLow, haClose, stLine, stDir] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// 50 EMA on HA close -- gates entries (chained with 200 EMA below) AND
+// drives the "trailing SL" exit further below.
+// ============================================================
+emaVal = ta.ema(haClose, emaLength)
+ema200 = ta.ema(haClose, ema200Length)
+plot(emaVal, color=color.blue,   title="50 EMA", linewidth=2)
+plot(ema200, color=color.purple, title="200 EMA", linewidth=2)
+plot(stLine, color = stDir < 0 ? color.teal : color.maroon, title="Supertrend(10,3)", linewidth=2)
+
+// ============================================================
+// EMA trend filter: BUY needs a chained bullish stack, haClose > 50 EMA >
+// 200 EMA; SELL needs the mirror (haClose < 50 EMA < 200 EMA).
+// ============================================================
+trendUp   = haClose > emaVal and emaVal > ema200
+trendDown = haClose < emaVal and emaVal < ema200
+
+// ============================================================
+// Time windows: force-close at 17:25, no new signals 17:25-17:30
+// ============================================================
+sqMins   = sqOffHr * 60 + sqOffMin
+sessMins = sessHr * 60 + sessMin
+nowMins  = hour(time, sessTZ) * 60 + minute(time, sessTZ)
+isExitTime   = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+inSettlement = nowMins >= sqMins and nowMins < sessMins   // 17:25-17:30: no new signals
+
+// ============================================================
+// Session-open gate: REAL price at this session's start (day_start, default
+// 17:30 IST). BUY only arms while REAL price is currently ABOVE it; SELL only
+// while BELOW it.
+// ============================================================
+var float sessionOpen = na
+newSession = na(nowMins[1]) or (nowMins >= sessMins and nowMins[1] < sessMins)
+if newSession
+    sessionOpen := open
+bullGate = not na(sessionOpen) and close > sessionOpen
+bearGate = not na(sessionOpen) and close < sessionOpen
+
+// ============================================================
+// Draw the Heikin Ashi candles directly, so the chart always shows exactly
+// what the signals are calculated on -- regardless of whether your
+// TradingView chart itself is set to regular or Heikin Ashi display style.
+// (Hide/replace your own candles via the eye icon on this plot if you'd
+// rather see ONLY this HA overlay.)
+// ============================================================
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// ============================================================
+// Tolerant equality for HA-derived values
+// ============================================================
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+
+// ============================================================
+// BUY / SELL pattern detection
+// ============================================================
+// Single-candle pattern: this HA candle's open==low (buy) / open==high (sell)
+// -- structurally green/red respectively, since haLow/haHigh are already
+// min/max(real, haOpen, haClose). The previous candle's high/low still widen
+// the trigger/SL below for extra margin, even though it's no longer required
+// to be a specific color/shape.
+buySignal  = stDir < 0 and bullGate and trendUp   and eq(haOpen[0], haLow[0])  and not inSettlement  // stDir < 0 = Supertrend uptrend (bullish)
+sellSignal = stDir > 0 and bearGate and trendDown and eq(haOpen[0], haHigh[0]) and not inSettlement  // stDir > 0 = Supertrend downtrend (bearish)
+
+plotshape(buySignal,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar,
+     color=color.green, size=size.small, text="BUY SIGNAL")
+plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar,
+     color=color.red,   size=size.small, text="SELL SIGNAL")
+
+// ============================================================
+// State -- pending (armed, not yet triggered) setups + active SL once open
+// ============================================================
+var float pendTrigBuy  = na   // buy trigger  = pattern high
+var float pendSLBuy    = na   // buy SL       = pattern low
+var float pendTrigSell = na   // sell trigger = pattern low
+var float pendSLSell   = na   // sell SL      = pattern high
+var float longSL       = na   // fixed SL while long -- pattern low, never moves
+var float shortSL      = na   // fixed SL while short -- pattern high, never moves
+var float trailSL      = na   // armed trailing-SL level; na until a closed bar arms it
+var bool  longWasTrailExit  = false  // this trade's exit was the trailing SL, not the fixed SL
+var bool  shortWasTrailExit = false
+var bool  wasEODExit        = false  // this trade's exit was the 17:25 force-close
+
+flatNow    = strategy.position_size == 0
+hasPending = not na(pendTrigBuy) or not na(pendTrigSell)
+
+// ----- 1. Invalidate a pending setup BEFORE the entry trigger, using REAL
+//          price (a touch of the SL level before the breakout kills the
+//          setup untraded). -----
+if flatNow
+    if not na(pendTrigBuy) and low <= pendSLBuy
+        pendTrigBuy := na
+        pendSLBuy   := na
+        strategy.cancel("Long")
+    if not na(pendTrigSell) and high >= pendSLSell
+        pendTrigSell := na
+        pendSLSell   := na
+        strategy.cancel("Short")
+
+// ----- 2. Arm a fresh pattern (flat, nothing already pending) -----
+if flatNow and not hasPending
+    if buySignal
+        pendTrigBuy := math.max(haHigh[0], haHigh[1])
+        pendSLBuy   := math.min(haLow[0],  haLow[1])
+    else if sellSignal
+        pendTrigSell := math.min(haLow[0],  haLow[1])
+        pendSLSell   := math.max(haHigh[0], haHigh[1])
+
+// ----- 3. Resting stop-entry orders (always fill against real price) -----
+if not na(pendTrigBuy) and flatNow
+    strategy.entry("Long", strategy.long, stop=pendTrigBuy)
+if not na(pendTrigSell) and flatNow
+    strategy.entry("Short", strategy.short, stop=pendTrigSell)
+
+// ----- 4. On fill: lock in the fixed SL for this trade, clear the pending trigger -----
+if strategy.position_size > 0 and ta.change(strategy.position_size) > 0
+    longSL := pendSLBuy
+    trailSL := na
+    longWasTrailExit := false
+    wasEODExit := false
+    pendTrigBuy := na
+    pendSLBuy   := na
+if strategy.position_size < 0 and ta.change(strategy.position_size) < 0
+    shortSL := pendSLSell
+    trailSL := na
+    shortWasTrailExit := false
+    wasEODExit := false
+    pendTrigSell := na
+    pendSLSell   := na
+
+// ----- 5. Trailing SL: a CLOSED bar whose HA close is beyond the 50 EMA
+//          (against the position's bias) arms -- or, if already armed,
+//          tightens -- a stop at THAT bar's HA low/high. Once armed it
+//          behaves exactly like the fixed SL below: a resting stop order
+//          that fills the instant REAL price crosses it, not waiting for
+//          the next bar to close. Only ever moves favorably (up for a long,
+//          down for a short), never loosens. -----
+if strategy.position_size > 0 and haClose < emaVal
+    trailSL := na(trailSL) ? haLow : math.max(trailSL, haLow)
+    longWasTrailExit := true
+if strategy.position_size < 0 and haClose > emaVal
+    trailSL := na(trailSL) ? haHigh : math.min(trailSL, haHigh)
+    shortWasTrailExit := true
+
+if strategy.position_size > 0 and not na(trailSL)
+    strategy.exit("Exit Long Trail", "Long", stop=trailSL, comment="Trailing SL")
+if strategy.position_size < 0 and not na(trailSL)
+    strategy.exit("Exit Short Trail", "Short", stop=trailSL, comment="Trailing SL")
+
+// ----- 6. Protective fixed stop-loss (pattern low/high, unchanged for the
+//          life of the trade) -- no profit target yet -----
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Long", stop=longSL)
+if strategy.position_size < 0
+    strategy.exit("Exit Short", "Short", stop=shortSL)
+
+// ----- 7. EOD: force-close everything at 17:25, and cancel any pending
+//          (not-yet-triggered) order through the whole 17:25-17:30 gap so
+//          nothing can fill during the settlement window. New signals
+//          resume at 17:30 (buySignal/sellSignal already require
+//          not inSettlement). -----
+if inSettlement
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pendTrigBuy  := na
+    pendSLBuy    := na
+    pendTrigSell := na
+    pendSLSell   := na
+if isExitTime
+    if strategy.position_size != 0
+        wasEODExit := true
+    strategy.close_all(comment="EOD 17:25")
+
+// ----- Trigger / SL-hit labels -----
+justEnteredLong  = strategy.position_size > 0 and ta.change(strategy.position_size) > 0
+justEnteredShort = strategy.position_size < 0 and ta.change(strategy.position_size) < 0
+posClosed = flatNow and strategy.position_size[1] != 0
+wasLong   = strategy.position_size[1] > 0
+wasShort  = strategy.position_size[1] < 0
+// NOTE: longWasTrailExit/shortWasTrailExit/wasEODExit are only ever mutated
+// while the position is open (guarded by position_size > 0 / < 0, or by
+// isExitTime, above), so on this close-detection bar (flat now) they still
+// correctly hold the value from the trade that just closed -- read
+// unindexed, not [1].
+longSLHit         = posClosed and wasLong  and not longWasTrailExit and not wasEODExit
+longTrailSLHit    = posClosed and wasLong  and longWasTrailExit
+shortSLHit        = posClosed and wasShort and not shortWasTrailExit and not wasEODExit
+shortTrailSLHit   = posClosed and wasShort and shortWasTrailExit
+eodExitHit        = posClosed and wasEODExit
+
+plotshape(justEnteredLong,  title="Buy Triggered",  style=shape.labelup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.normal, text="BUY TRIGGERED", textcolor=color.white)
+plotshape(justEnteredShort, title="Sell Triggered", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.normal, text="SELL TRIGGERED", textcolor=color.white)
+plotshape(longSLHit,  title="Long SL Hit",  style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.normal, text="SL HIT", textcolor=color.white)
+plotshape(shortSLHit, title="Short SL Hit", style=shape.labelup,   location=location.belowbar,
+     color=color.new(color.red, 0), size=size.normal, text="SL HIT", textcolor=color.white)
+plotshape(longTrailSLHit,  title="Long Trailing SL Hit",  style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.maroon, 0), size=size.normal, text="TRAILING SL HIT", textcolor=color.white)
+plotshape(shortTrailSLHit, title="Short Trailing SL Hit", style=shape.labelup,   location=location.belowbar,
+     color=color.new(color.maroon, 0), size=size.normal, text="TRAILING SL HIT", textcolor=color.white)
+plotshape(eodExitHit, title="EOD Exit", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.gray, 0), size=size.normal, text="EOD", textcolor=color.white)
+
+// ----- SL line: pending (dotted) while armed, active (solid) while in a trade -----
+pendingSLLevel = not na(pendTrigBuy) ? pendSLBuy : not na(pendTrigSell) ? pendSLSell : na
+activeSLLevel  = strategy.position_size > 0 ? longSL : strategy.position_size < 0 ? shortSL : na
+plot(pendingSLLevel, title="Pending SL", color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2)
+plot(activeSLLevel,  title="Active SL",  color=color.new(color.red, 0),    style=plot.style_linebr,  linewidth=2)
+
+bgcolor(inSettlement ? color.new(color.gray, 90) : na, title="Settlement window (no new entries)")

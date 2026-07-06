@@ -40,15 +40,18 @@ Rules (one position at a time):
     Checked in that order every bar/tick, so a same-bar sweep of both levels is
     conservative (matches every other strategy in this project).
   * **Fixed SL:** protects the trade for its entire life -- it never moves.
-  * **Trailing SL exit (ASAP, real price):** the 50 EMA computed as of the last
-    CLOSED bar becomes a fixed trail level for the bar now forming -- exactly
-    like the fixed SL and the entry trigger, the LEVEL comes from HA/EMA data
-    but the CROSS is checked against REAL price, and fires the instant it
-    happens rather than waiting for this bar's HA close to settle
-    (``check_intracandle_trail`` for live/tick-level checks; the closed-candle
-    path in :meth:`update` uses this same bar's real high/low as a proxy).
-  * **No profit target.** Exits are exactly: fixed SL, the crossover, or EOD --
-    whichever fires first.
+  * **Trailing SL (arms/tightens on CLOSED bars, exits ASAP on real price):**
+    while long, any CLOSED bar whose HA close is below the 50 EMA arms -- or,
+    if already armed, tightens -- a stop at THAT bar's HA low (mirror for
+    short: HA close above the EMA arms/tightens a stop at that bar's HA high).
+    It only ever moves favorably (up for a long, down for a short), never
+    loosens. Once armed, this trail-SL behaves exactly like the fixed SL:
+    checked against REAL price, firing the instant it is touched -- not
+    waiting for the next bar to close (``check_intracandle_trail`` for
+    live/tick-level checks; the closed-candle path in :meth:`update` uses this
+    bar's real high/low as a proxy).
+  * **No profit target.** Exits are exactly: fixed SL, the trailing SL, or EOD
+    -- whichever fires first.
   * Forced **EOD square-off** at ``square_off_hour:minute`` (default 17:25 IST); no
     new patterns arm during the ``square_off`` -> ``day_start`` settlement gap
     (default 17:25-17:30 IST), and any armed-but-untriggered setup is CANCELLED at
@@ -157,6 +160,9 @@ class HeikinAshiStrategy:
         self._pending_sl: float | None = None
         self._in_long = self._in_short = False
         self._sl_level: float | None = None
+        # Trailing SL: None until a closed bar arms it (see update()); once
+        # set, only ever tightens (up for long, down for short).
+        self._trail_sl_level: float | None = None
 
     @property
     def position_state(self) -> PositionState:
@@ -187,6 +193,7 @@ class HeikinAshiStrategy:
         intact. Used on reconcile when the exchange shows no owned position."""
         self._in_long = self._in_short = False
         self._sl_level = None
+        self._trail_sl_level = None
         self._clear_pending()
 
     def check_intracandle_sl(self, price: float) -> tuple[bool, bool, float | None]:
@@ -198,14 +205,14 @@ class HeikinAshiStrategy:
         return bool(long_sl), bool(short_sl), self._sl_level
 
     def check_intracandle_trail(self, price: float) -> tuple[bool, bool, float | None]:
-        """Has an intracandle REAL price crossed the open position's EMA trail
-        level -> (long_trail, short_trail, level). The level is the 50 EMA as of
-        the last CLOSED bar (fixed for the bar now forming, exactly like the
-        fixed SL); fires ASAP the instant real price crosses it, not waiting for
-        this bar's HA close to settle."""
-        level = self._ema.value
-        long_trail = self._in_long and level is not None and price < level
-        short_trail = self._in_short and level is not None and price > level
+        """Has an intracandle REAL price crossed the ARMED trailing-SL level?
+        -> (long_trail, short_trail, level). Returns all-False/None until a
+        CLOSED bar has armed ``_trail_sl_level`` (see :meth:`update`); once
+        armed it behaves exactly like the fixed SL -- checked against real
+        price, firing the instant it is touched."""
+        level = self._trail_sl_level
+        long_trail = self._in_long and level is not None and price <= level
+        short_trail = self._in_short and level is not None and price >= level
         return bool(long_trail), bool(short_trail), level
 
     def apply_intracandle_pending(self, candle: Candle) -> tuple[bool, bool, float]:
@@ -230,6 +237,7 @@ class HeikinAshiStrategy:
             if candle.open >= trig or candle.high >= trig:
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
+                self._trail_sl_level = None
                 self._clear_pending()
                 return True, False, trig
         elif self._pending_short and self._pending_trigger is not None and self._pending_sl is not None:
@@ -240,6 +248,7 @@ class HeikinAshiStrategy:
             if candle.open <= trig or candle.low <= trig:
                 self._in_short, self._in_long = True, False
                 self._sl_level = sl
+                self._trail_sl_level = None
                 self._clear_pending()
                 return True, False, trig
         return False, False, 0.0
@@ -247,10 +256,12 @@ class HeikinAshiStrategy:
     # ------------------------------------------------------------------ #
     def notify_exit(self, direction: int, reason: str) -> None:
         """Backtest/engine tells us an open trade closed via the intracandle path
-        (fixed SL). Just flattens the in-memory position; no re-entry gate exists
-        for this strategy (unlike RevBreak-Sell's Supertrend-flip TP gate)."""
+        (fixed SL / trailing SL). Just flattens the in-memory position; no
+        re-entry gate exists for this strategy (unlike RevBreak-Sell's
+        Supertrend-flip TP gate)."""
         self._in_long = self._in_short = False
         self._sl_level = None
+        self._trail_sl_level = None
 
     # ------------------------------------------------------------------ #
     def update(self, candle: Candle) -> HeikinAshiDecision | None:
@@ -264,7 +275,6 @@ class HeikinAshiStrategy:
         ha_low = min(candle.low, ha_open, ha_close)
 
         self._st.update(Candle(candle.start_time, ha_open, ha_high, ha_low, ha_close, candle.volume))
-        trail_level = self._ema.value  # EMA level in force for THIS bar (fixed as of the last close)
         ema_val = self._ema.update(ha_close)
         ema200_val = self._ema200.update(ha_close)
         self._warmup_bars += 1
@@ -299,30 +309,42 @@ class HeikinAshiStrategy:
         entry_price = candle.close
         new_sl: float | None = None
 
-        # --- Exits first: fixed SL, then EOD, then TRAIL -- SL-before-EOD matches
-        #     the established precedent in revbreak.py for a same-bar tie; TRAIL is
-        #     the lowest-priority (discretionary) exit. Both SL and TRAIL are
-        #     ASAP/real-price checks; the live engine's intracandle path
-        #     (check_intracandle_sl / check_intracandle_trail) normally fires
+        # --- Exits first: fixed SL, then EOD, then the trailing SL -- SL-before-
+        #     EOD matches the established precedent in revbreak.py for a same-bar
+        #     tie; the trail is the lowest-priority (discretionary) exit. Both SL
+        #     and TRAIL are ASAP/real-price checks; the live engine's intracandle
+        #     path (check_intracandle_sl / check_intracandle_trail) normally fires
         #     first -- here (closed-candle backtest) this bar's real high/low is
-        #     used as a proxy for the same real-price cross. ---
+        #     used as a proxy for the same real-price cross. TRAIL only applies
+        #     once a prior CLOSED bar has armed self._trail_sl_level (below). ---
         if self._in_long:
             if self._sl_level is not None and candle.low <= self._sl_level:
                 long_exit, long_exit_price, exit_reason = True, self._sl_level, "SL"
             elif square_off:
                 long_exit, long_exit_price, exit_reason = True, candle.close, "EOD"
-            elif trail_level is not None and candle.low < trail_level:
-                long_exit, long_exit_price, exit_reason = True, trail_level, "TRAIL"
+            elif self._trail_sl_level is not None and candle.low <= self._trail_sl_level:
+                long_exit, long_exit_price, exit_reason = True, self._trail_sl_level, "TRAIL"
         elif self._in_short:
             if self._sl_level is not None and candle.high >= self._sl_level:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
             elif square_off:
                 short_exit, short_exit_price, exit_reason = True, candle.close, "EOD"
-            elif trail_level is not None and candle.high > trail_level:
-                short_exit, short_exit_price, exit_reason = True, trail_level, "TRAIL"
+            elif self._trail_sl_level is not None and candle.high >= self._trail_sl_level:
+                short_exit, short_exit_price, exit_reason = True, self._trail_sl_level, "TRAIL"
         if long_exit or short_exit:
             self._in_long = self._in_short = False
             self._sl_level = None
+            self._trail_sl_level = None
+
+        # --- Arm/tighten the trailing SL: a CLOSED bar whose HA close is beyond
+        #     the EMA (against the position's bias) arms -- or, if already armed,
+        #     tightens -- a stop at THIS bar's HA low/high. Checked against real
+        #     price from here on (see check_intracandle_trail above). Only ever
+        #     moves favorably (up for a long, down for a short), never loosens. ---
+        if self._in_long and ha_close < ema_val:
+            self._trail_sl_level = ha_low if self._trail_sl_level is None else max(self._trail_sl_level, ha_low)
+        elif self._in_short and ha_close > ema_val:
+            self._trail_sl_level = ha_high if self._trail_sl_level is None else min(self._trail_sl_level, ha_high)
 
         # --- Breakout trigger for an armed setup (closed-bar fallback; the live
         #     engine's intracandle path normally fires first) -- only while flat,
@@ -335,6 +357,7 @@ class HeikinAshiStrategy:
             elif trig is not None and candle.high >= trig:
                 buy_signal, entry_price, new_sl = True, trig, sl
                 self._in_long, self._sl_level = True, sl
+                self._trail_sl_level = None
                 self._clear_pending()
         elif flat and not in_settlement and self._pending_short:
             trig, sl = self._pending_trigger, self._pending_sl
@@ -343,6 +366,7 @@ class HeikinAshiStrategy:
             elif trig is not None and candle.low <= trig:
                 sell_signal, entry_price, new_sl = True, trig, sl
                 self._in_short, self._sl_level = True, sl
+                self._trail_sl_level = None
                 self._clear_pending()
 
         # --- Pattern detection -> arm a new setup (flat, nothing pending, outside
