@@ -86,7 +86,7 @@ class RevBreakSellEngine:
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         mode = "TESTNET" if self.settings.testnet else "LIVE"
-        await self.notifier.notify(NotifyEvent.RESTART, mode=f"{mode} [RevBreak-Sell]")
+        await self.notifier.notify(NotifyEvent.RESTART, mode=mode)
 
         # Warmup strategy with historical 5m candles.
         await self._warmup()

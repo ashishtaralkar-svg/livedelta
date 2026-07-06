@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.revbreak
+.env.heikinashi
 state/
 
 # Python

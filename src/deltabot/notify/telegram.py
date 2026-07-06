@@ -106,6 +106,7 @@ class TelegramNotifier:
         self.enabled = settings.telegram_enabled
         self._token = settings.telegram_token.get_secret_value() if settings.telegram_token else ""
         self._chat_id = settings.telegram_chat_id or ""
+        self._label_prefix = f"[{settings.bot_label}] " if settings.bot_label else ""
         self._queue: asyncio.Queue[tuple[NotifyEvent, dict]] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
         self._client: httpx.AsyncClient | None = None
@@ -141,7 +142,7 @@ class TelegramNotifier:
                     url,
                     json={
                         "chat_id": self._chat_id,
-                        "text": _format(event, ctx),
+                        "text": self._label_prefix + _format(event, ctx),
                         "parse_mode": "HTML",
                         "disable_web_page_preview": True,
                     },

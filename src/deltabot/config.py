@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     leverage: int = 10
     atr_period: int = 10
     st_multiplier: float = 3.0
-    ema_length: int = 50  # 50-EMA of high and of low (entry filters)
+    ema_length: int = 50  # 50-EMA of high and of low (entry filters); also HeikinAshi's trend/trail EMA
+    ema200_length: int = 200  # HeikinAshi's EMA200 trend filter
     use_close: bool = True  # compare bar close (False = high/low) against the levels
     resolution: str = "1m"
     warmup_candles: int = 200
@@ -71,6 +72,10 @@ class Settings(BaseSettings):
     # --- Notifications ---
     telegram_token: SecretStr | None = None
     telegram_chat_id: str | None = None
+    # Prefixes every Telegram message with "[label]" -- lets one chat receive
+    # signals from multiple bots (e.g. RevBreak-Sell + HeikinAshi) without
+    # ambiguity about which strategy sent it. Empty = no prefix (unchanged format).
+    bot_label: str = ""
 
     # --- Options execution mode ---
     options_mode: bool = False  # True = trade C/P (call/put) options instead of futures
@@ -82,10 +87,13 @@ class Settings(BaseSettings):
     option_margin_asset: str | None = None  # wallet asset to check balance for (None = max across wallets)
 
     # --- Strategy ---
-    # Only RevBreak-Sell (RevBreakSellStrategy) is implemented: prev-day-zone /
-    # open-gate reversal-breakout that SELLS a premium-targeted option with a
-    # premium-decay TP and BTC-pattern stop. Kept as a field for compatibility
-    # with existing DELTA_STRATEGY=revbreak env config.
+    # "revbreak" (default, RevBreakSellStrategy): prev-day-zone / open-gate
+    # reversal-breakout that SELLS a premium-targeted option with a
+    # premium-decay TP and BTC-pattern stop.
+    # "heikin_ashi" (HeikinAshiStrategy): Supertrend(10,3) + chained EMA50/200
+    # trend filter + single-HA-candle pattern -> SELLS a premium-targeted
+    # option; ASAP (real-price, not bar-close) fixed-SL / EMA-trail / EOD exits.
+    # No profit target.
     strategy: str = "revbreak"
 
     # RevBreak-specific settings (ignored when strategy="pine")

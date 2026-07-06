@@ -14,3 +14,23 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # NOT YET ACTIVE -- uncomment once .env.heikinashi is filled in with the
+  # Delta SUB-ACCOUNT's own API key/secret (copy .env.heikinashi.example ->
+  # .env.heikinashi first). Runs on separate capital from revbreakbot above,
+  # so the two can never collide on position ownership.
+  # heikinashibot:
+  #   build: .
+  #   image: deltabot:latest
+  #   container_name: heikinashibot
+  #   restart: always
+  #   env_file:
+  #     - .env.heikinashi
+  #   volumes:
+  #     - ./state:/app/state
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "20m"
+  #       max-file: "5"
+  #   stop_grace_period: 30s
