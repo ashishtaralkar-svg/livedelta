@@ -119,6 +119,8 @@ class HeikinAshiStrategy:
         st_multiplier: float = 3.0,
         ema_length: int = 50,
         ema200_length: int = 200,
+        session_gate: bool = True,
+        trail_on_ema200: bool = False,
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 17,
         day_start_minute: int = 30,
@@ -129,6 +131,15 @@ class HeikinAshiStrategy:
         self.st_multiplier = st_multiplier
         self.ema_length = ema_length
         self.ema200_length = ema200_length
+        # When False, the session-open directional gate is ignored (a BUY can arm
+        # regardless of whether real price is above the session open, and mirror
+        # for SELL). Default True keeps the validated live behavior.
+        self.session_gate = session_gate
+        # Which EMA arms/tightens the trailing SL: False = 50 EMA (default,
+        # validated live), True = 200 EMA (arms later/deeper, giving trades more
+        # room). Only affects the TRAIL trigger; the entry chained-EMA filter
+        # (close > ema50 > ema200) is unchanged either way.
+        self.trail_on_ema200 = trail_on_ema200
         self._tz = ZoneInfo(day_tz)
         self._sess_mins = day_start_hour * 60 + day_start_minute
         self._sq_mins = square_off_hour * 60 + square_off_minute
@@ -337,13 +348,16 @@ class HeikinAshiStrategy:
             self._trail_sl_level = None
 
         # --- Arm/tighten the trailing SL: a CLOSED bar whose HA close is beyond
-        #     the EMA (against the position's bias) arms -- or, if already armed,
-        #     tightens -- a stop at THIS bar's HA low/high. Checked against real
-        #     price from here on (see check_intracandle_trail above). Only ever
-        #     moves favorably (up for a long, down for a short), never loosens. ---
-        if self._in_long and ha_close < ema_val:
+        #     the trail EMA (against the position's bias) arms -- or, if already
+        #     armed, tightens -- a stop at THIS bar's HA low/high. Checked against
+        #     real price from here on (see check_intracandle_trail above). Only
+        #     ever moves favorably (up for a long, down for a short), never
+        #     loosens. The trail EMA is the 50 EMA by default, or the 200 EMA
+        #     when trail_on_ema200 is set (arms later/deeper). ---
+        trail_ema = ema200_val if self.trail_on_ema200 else ema_val
+        if self._in_long and ha_close < trail_ema:
             self._trail_sl_level = ha_low if self._trail_sl_level is None else max(self._trail_sl_level, ha_low)
-        elif self._in_short and ha_close > ema_val:
+        elif self._in_short and ha_close > trail_ema:
             self._trail_sl_level = ha_high if self._trail_sl_level is None else min(self._trail_sl_level, ha_high)
 
         # --- Breakout trigger for an armed setup (closed-bar fallback; the live
@@ -378,8 +392,8 @@ class HeikinAshiStrategy:
             scale = candle.close
             st_up = self._st.ready and self._st.direction() == 1
             st_down = self._st.ready and self._st.direction() == -1
-            bull_gate = self._cur_open is not None and candle.close > self._cur_open
-            bear_gate = self._cur_open is not None and candle.close < self._cur_open
+            bull_gate = (not self.session_gate) or (self._cur_open is not None and candle.close > self._cur_open)
+            bear_gate = (not self.session_gate) or (self._cur_open is not None and candle.close < self._cur_open)
             # EMA trend filter: BUY needs a chained bullish stack, HA close >
             # ema50 > ema200; SELL needs the mirror (close < ema50 < ema200).
             trend_up = ha_close > ema_val and ema_val > ema200_val

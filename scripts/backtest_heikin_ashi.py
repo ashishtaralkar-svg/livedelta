@@ -76,6 +76,8 @@ def run(candles: list[Candle], settings, args) -> list[dict]:
     strategy = HeikinAshiStrategy(
         st_period=args.st_period, st_multiplier=args.st_multiplier,
         ema_length=args.ema_length, ema200_length=args.ema200_length,
+        session_gate=not args.no_session_gate,
+        trail_on_ema200=args.trail_ema200,
         day_tz=settings.day_tz,
         day_start_hour=args.day_start_hour, day_start_minute=args.day_start_minute,
         square_off_hour=args.square_off_hour, square_off_minute=args.square_off_minute,
@@ -285,6 +287,10 @@ def main() -> None:
     ap.add_argument("--st-multiplier", type=float, default=2.0, help="Supertrend ATR multiplier (entry gate); 2.0 validated to beat 3.0 on 1mo/4mo")
     ap.add_argument("--ema-length", type=int, default=50, help="EMA length used by both the entry trend filter and the trailing exit threshold")
     ap.add_argument("--ema200-length", type=int, default=200, help="EMA length for the trend filter (entry gate)")
+    ap.add_argument("--no-session-gate", action="store_true",
+                    help="ignore the session-open directional gate (BUY/SELL arm regardless of price vs session open)")
+    ap.add_argument("--trail-ema200", action="store_true",
+                    help="arm/tighten the trailing SL on the 200 EMA instead of the 50 EMA (arms later/deeper)")
     ap.add_argument("--day-start-hour", type=int, default=17)
     ap.add_argument("--day-start-minute", type=int, default=30)
     ap.add_argument("--square-off-hour", type=int, default=17)

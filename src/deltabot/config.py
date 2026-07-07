@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     st_multiplier: float = 2.0
     ema_length: int = 50  # 50-EMA of high and of low (entry filters); also HeikinAshi's trend/trail EMA
     ema200_length: int = 200  # HeikinAshi's EMA200 trend filter
+    # HeikinAshi's session-open directional gate. False validated to beat True
+    # (+34% 1mo, +29% 4mo backtests) -- the Supertrend + chained EMA50>EMA200
+    # filters already enforce trend alignment, making this gate mostly redundant.
+    session_gate: bool = True
     use_close: bool = True  # compare bar close (False = high/low) against the levels
     resolution: str = "1m"
     warmup_candles: int = 200

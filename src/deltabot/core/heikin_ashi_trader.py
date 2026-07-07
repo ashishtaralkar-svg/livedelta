@@ -55,6 +55,7 @@ class HeikinAshiEngine:
             st_multiplier=settings.st_multiplier,
             ema_length=settings.ema_length,
             ema200_length=settings.ema200_length,
+            session_gate=settings.session_gate,
             day_tz=settings.day_tz,
             day_start_hour=settings.day_start_hour,
             day_start_minute=settings.day_start_minute,
