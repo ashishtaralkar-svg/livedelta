@@ -47,7 +47,10 @@ class Settings(BaseSettings):
     contracts: int = 1  # 0.001 BTC == 1 contract (contract_value 0.001)
     leverage: int = 10
     atr_period: int = 10
-    st_multiplier: float = 3.0
+    # Supertrend ATR multiplier. HeikinAshi's validated value is 2.0 (beat 3.0 on
+    # both 1mo +10% and 4mo +18% backtests). RevBreak-Sell pins its own value via
+    # DELTA_ST_MULTIPLIER=3.0 in .env.revbreak so it is unaffected by this default.
+    st_multiplier: float = 2.0
     ema_length: int = 50  # 50-EMA of high and of low (entry filters); also HeikinAshi's trend/trail EMA
     ema200_length: int = 200  # HeikinAshi's EMA200 trend filter
     use_close: bool = True  # compare bar close (False = high/low) against the levels
