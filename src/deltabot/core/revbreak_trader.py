@@ -76,6 +76,7 @@ class RevBreakSellEngine:
         self._current_dir: int | None = None  # SignalDir value of open position
         self._tp_mult = 1.0 - settings.take_profit_pct / 100.0
         self._is_paper_trade: bool = False  # True if current position is paper-only (wide-SL)
+        self._paper_symbol: str | None = None  # real contract a paper trade tracks, for its TP poll
         # Re-entrancy guard so intracandle + closed-candle paths can't double-open.
         self._entry_in_progress = False
         # Shared guard so the TP poller, intracandle SL, and closed-candle exit
@@ -201,11 +202,12 @@ class RevBreakSellEngine:
             return
 
         # 1. Option TP check (before strategy update, mirrors backtest order).
-        if self.executor.has_open_position and self._tp_price is not None:
+        #    Paper trades poll their own tracked (never-ordered) contract too, so
+        #    a paper position can unblock via TP instead of only SL/EOD.
+        tp_symbol = self.executor.tracked_symbol if self.executor.has_open_position else self._paper_symbol
+        if (self.executor.has_open_position or self._is_paper_trade) and self._tp_price is not None and tp_symbol:
             try:
-                mark = await asyncio.to_thread(
-                    self.rest.get_mark_price, self.executor.tracked_symbol or ""
-                )
+                mark = await asyncio.to_thread(self.rest.get_mark_price, tp_symbol)
             except Exception as exc:  # noqa: BLE001
                 log.warning("RevBreak: get_mark_price failed", extra={"extra": {"error": str(exc)}})
                 mark = None
@@ -361,13 +363,13 @@ class RevBreakSellEngine:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
-            if (self._closing or self._tp_price is None
-                    or not self.executor.has_open_position):
+            if self._closing or self._tp_price is None:
+                continue
+            tp_symbol = self.executor.tracked_symbol if self.executor.has_open_position else self._paper_symbol
+            if not (self.executor.has_open_position or self._is_paper_trade) or not tp_symbol:
                 continue
             try:
-                mark = await asyncio.to_thread(
-                    self.rest.get_mark_price, self.executor.tracked_symbol or ""
-                )
+                mark = await asyncio.to_thread(self.rest.get_mark_price, tp_symbol)
             except Exception as exc:  # noqa: BLE001
                 log.warning("RevBreak: TP-poll mark fetch failed", extra={"extra": {"error": str(exc)}})
                 continue
@@ -385,6 +387,7 @@ class RevBreakSellEngine:
             direction = self._current_dir  # capture BEFORE clearing
             self._entry_premium = self._tp_price = self._current_dir = None
             self._is_paper_trade = False
+            self._paper_symbol = None
             if direction is not None:
                 self.strategy.notify_exit(direction, "TP")
             await self.notifier.notify(NotifyEvent.PAPER_EXIT, reason="TP", btc_price=mark)
@@ -439,6 +442,7 @@ class RevBreakSellEngine:
             direction = self._current_dir  # capture BEFORE clearing
             self._entry_premium = self._tp_price = self._current_dir = None
             self._is_paper_trade = False
+            self._paper_symbol = None
             if direction is not None:
                 self.strategy.notify_exit(direction, reason)
             await self.notifier.notify(NotifyEvent.PAPER_EXIT, reason=reason,
@@ -501,14 +505,27 @@ class RevBreakSellEngine:
         try:
             is_buy = signal_dir == SignalDir.LONG.value
 
-            # Paper trades: don't execute, just track internally.
+            # Paper trades: don't execute, but still resolve a real contract (no
+            # order placed) so its mark price can be polled for a would-be TP --
+            # otherwise a paper trade could only ever unblock via SL/EOD, sitting
+            # on the one-trade-at-a-time slot long after its TP would have hit.
             if is_paper:
                 self._is_paper_trade = True
-                self._entry_premium = self.settings.target_premium  # use target as notional entry
+                selected = await self.executor.select_by_premium(signal_dir, self.settings.target_premium)
+                if selected is not None:
+                    self._paper_symbol = selected["symbol"]
+                    self._entry_premium = selected["mark_price"]
+                else:
+                    # Couldn't price a real contract -- fall back to the notional
+                    # target so the paper trade is still tracked (just can't poll
+                    # a TP; it'll unblock via SL/EOD like before).
+                    self._paper_symbol = None
+                    self._entry_premium = self.settings.target_premium
                 self._tp_price = self._entry_premium * self._tp_mult
                 self._current_dir = signal_dir
                 log.info("RevBreak: paper position opened (out-of-band SL, no real trade)",
                          extra={"extra": {"signal_dir": signal_dir, "entry_prem": self._entry_premium,
+                                          "paper_symbol": self._paper_symbol,
                                           "sl_level": sl_level, "btc_price": btc_price}})
                 sl_distance = abs(sl_level - btc_price) if sl_level is not None else None
                 await self.notifier.notify(
@@ -651,6 +668,7 @@ class RevBreakSellEngine:
         self.executor.clear()
         self._entry_premium = self._tp_price = self._current_dir = None
         self._is_paper_trade = False  # never let a stale paper flag survive a reconcile
+        self._paper_symbol = None
         self.strategy.force_flat()
         self._closing = False
         log.info("RevBreak reconcile: no owned position — state FLAT")
@@ -700,6 +718,7 @@ class RevBreakSellEngine:
             direction = self._current_dir  # capture BEFORE clearing
             self._entry_premium = self._tp_price = self._current_dir = None
             self._is_paper_trade = False
+            self._paper_symbol = None
             if direction is not None:
                 self.strategy.notify_exit(direction, "EOD")
             log.info("RevBreak: EOD square-off — paper position cleared")

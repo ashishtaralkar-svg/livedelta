@@ -100,23 +100,17 @@ class OptionsExecutor:
         self._symbol = None
         self._strike = None
 
-    async def open_option_by_premium(
+    async def select_by_premium(
         self, signal_dir: int, target_premium: float
-    ) -> tuple[float | None, str | None]:
-        """Open a short option whose MARK PRICE is closest to ``target_premium``.
+    ) -> dict | None:
+        """Pick the listed contract whose MARK PRICE is closest to ``target_premium``,
+        WITHOUT placing any order. Used both by :meth:`open_option_by_premium` (which
+        then sells it) and by paper-trade tracking (which never sells it, but still
+        needs a real symbol + mark price to poll for a would-be TP).
 
-        Queries the live option chain, picks the nearest-premium listed strike,
-        places a SELL order, and returns ``(fill_price, symbol)``. Returns
-        ``(None, None)`` on failure (chain empty, margin error, etc.) — the caller
-        must handle this gracefully without crashing.
+        Returns the winning chain entry dict (``symbol``, ``mark_price``,
+        ``product_id``, ``strike``, ...) or ``None`` if the chain is empty/unpriced.
         """
-        if self._product_id is not None:
-            log.warning(
-                "open_option_by_premium called while position already tracked — skipping",
-                extra={"extra": {"existing_product_id": self._product_id}},
-            )
-            return None, None
-
         option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
         expiry = self._select_expiry()
         underlying = self.underlying
@@ -126,13 +120,13 @@ class OptionsExecutor:
                 self._rest.get_option_chain, underlying, expiry, option_type
             )
         except Exception as exc:  # noqa: BLE001
-            log.error("get_option_chain failed in open_option_by_premium", extra={"extra": {"error": str(exc)}})
-            return None, None
+            log.error("get_option_chain failed in select_by_premium", extra={"extra": {"error": str(exc)}})
+            return None
 
         candidates = [c for c in chain if c.get("mark_price") is not None]
         if not candidates:
-            log.warning("No option contracts with mark_price — cannot open by premium")
-            return None, None
+            log.warning("No option contracts with mark_price — cannot select by premium")
+            return None
 
         best = min(candidates, key=lambda c: abs(c["mark_price"] - target_premium))
         log.info(
@@ -142,6 +136,28 @@ class OptionsExecutor:
                 "target_premium": target_premium, "strike": best["strike"],
             }},
         )
+        return best
+
+    async def open_option_by_premium(
+        self, signal_dir: int, target_premium: float
+    ) -> tuple[float | None, str | None]:
+        """Open a short option whose MARK PRICE is closest to ``target_premium``.
+
+        Selects via :meth:`select_by_premium`, places a SELL order, and returns
+        ``(fill_price, symbol)``. Returns ``(None, None)`` on failure (chain empty,
+        margin error, etc.) — the caller must handle this gracefully without crashing.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_premium called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None
+
+        best = await self.select_by_premium(signal_dir, target_premium)
+        if best is None:
+            return None, None
+        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
 
         await self._check_balance()
 
