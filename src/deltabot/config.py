@@ -144,9 +144,6 @@ class Settings(BaseSettings):
     dchannel_ema_length: int = 200
     dchannel_ma_length: int = 0        # 0 = price-vs-EMA filter; >0 = EMA-vs-SMA(this) cross
     dchannel_wr_enabled: bool = False  # False (best backtest): no %R gate, hunt on every DC touch
-    # Session-open-line filter: require the confirming candle's REAL close above
-    # the 17:30 session-open (bull) / below it (bear) -- a daily bias gate.
-    dchannel_session_line_filter: bool = False
     dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).

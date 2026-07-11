@@ -26,44 +26,6 @@ def _new_strategy() -> DchannelStrategy:
     return DchannelStrategy(dc_period=5, wr_period=5, ema_length=5)
 
 
-def _ts_ist(h: int, m: int) -> int:
-    return int(datetime(2026, 7, 10, h, m, tzinfo=_IST).timestamp())
-
-
-# --- Session-open-line filter -------------------------------------------- #
-def test_session_line_captured_at_1730_from_real_open() -> None:
-    s = _new_strategy()
-    s.update(_c(_ts_ist(17, 25), 100.0, 101.0, 99.0, 100.0))            # prev_now_mins = 1045
-    s.update(_c(_ts_ist(17, 30), 62500.0, 62600.0, 62400.0, 62550.0))  # crosses 17:30
-    assert s._session_line == 62500.0  # the REAL open, not HA
-
-
-def test_session_filter_off_is_noop() -> None:
-    s = DchannelStrategy(session_line_filter=False)
-    assert s._session_ok(100.0, bull=True) is True
-    assert s._session_ok(100.0, bull=False) is True
-
-
-def test_session_filter_blocks_when_line_unset() -> None:
-    s = DchannelStrategy(session_line_filter=True)
-    assert s._session_line is None
-    assert s._session_ok(100.0, bull=True) is False
-
-
-def test_session_filter_bull_needs_close_above_line() -> None:
-    s = DchannelStrategy(session_line_filter=True)
-    s._session_line = 60000.0
-    assert s._session_ok(60001.0, bull=True) is True
-    assert s._session_ok(59999.0, bull=True) is False
-
-
-def test_session_filter_bear_needs_close_below_line() -> None:
-    s = DchannelStrategy(session_line_filter=True)
-    s._session_line = 60000.0
-    assert s._session_ok(59999.0, bull=False) is True
-    assert s._session_ok(60001.0, bull=False) is False
-
-
 def _make_ready(s: DchannelStrategy, dc_upper: float, dc_lower: float,
                 wr_hh: float, wr_ll: float, ema: float) -> None:
     """Poke the strategy into a fully warmed-up state with fixed indicator
