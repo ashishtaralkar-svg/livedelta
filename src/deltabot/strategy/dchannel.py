@@ -185,6 +185,7 @@ class DchannelStrategy:
         ema_length: int = 1000,
         ma_length: int = 0,
         wr_enabled: bool = True,
+        session_line_filter: bool = False,
         rr_multiple: float = 2.0,
         tp_pct: float | None = None,
         day_tz: str = "Asia/Kolkata",
@@ -204,6 +205,11 @@ class DchannelStrategy:
         # %R condition).
         self.ma_length = ma_length
         self.wr_enabled = wr_enabled
+        # Session-open line: the REAL (non-HA) candle open captured at the 17:30
+        # day-start, held flat until the next 17:30. When session_line_filter is
+        # on, a bull confirm additionally requires the confirming candle's REAL
+        # close ABOVE this line (bear: below) -- a daily directional bias gate.
+        self.session_line_filter = session_line_filter
         self.rr_multiple = rr_multiple  # TP = entry +/- rr_multiple * (entry-to-SL risk), BTC-price-driven
         # If set, TP is a flat +/- pct of the entry BTC price instead of an
         # RR multiple of the entry-to-SL risk (e.g. tp_pct=0.005 -> 0.5%).
@@ -226,6 +232,7 @@ class DchannelStrategy:
         self._ha_close: float | None = None
 
         self._prev_now_mins: int | None = None
+        self._session_line: float | None = None  # REAL candle open at 17:30, held for the day
 
         # Hunt state machine (bull = looking to BUY a CALL, bear = PUT).
         self._hunt_bull = self._hunt_bear = False   # %R-armed
@@ -272,6 +279,16 @@ class DchannelStrategy:
         if self.ma_length > 0:
             return ema_val is not None and ma_val is not None and ema_val < ma_val
         return ema_val is not None and ha_close < ema_val
+
+    def _session_ok(self, real_close: float, bull: bool) -> bool:
+        """Session-open-line filter: bull confirm needs the REAL close above the
+        17:30 line, bear below it. No-op (always True) when the filter is off; if
+        the line is not set yet (no 17:30 seen), the confirm is blocked."""
+        if not self.session_line_filter:
+            return True
+        if self._session_line is None:
+            return False
+        return real_close > self._session_line if bull else real_close < self._session_line
 
     @property
     def has_pending(self) -> bool:
@@ -365,6 +382,12 @@ class DchannelStrategy:
         square_off = (self._prev_now_mins is not None
                       and now_mins >= self._sq_mins and self._prev_now_mins < self._sq_mins)
         in_gap = self._sq_mins <= now_mins < self._sess_mins
+
+        # Capture the session-open line at the 17:30 day-start crossing, from the
+        # REAL candle open (NOT Heikin Ashi). Held flat until the next 17:30.
+        if (self._prev_now_mins is not None
+                and now_mins >= self._sess_mins and self._prev_now_mins < self._sess_mins):
+            self._session_line = candle.open
 
         if square_off or in_gap:
             if self._pending_long or self._pending_short:
@@ -467,7 +490,8 @@ class DchannelStrategy:
                         self._range_hi_bull = max(self._range_hi_bull, ha_high)
                         self._range_lo_bull = min(self._range_lo_bull, ha_low)
                     if (_close_enough(ha_open, ha_low, candle.close)
-                            and self._bull_trend_ok(ha_close, ema_val, ma_val)):
+                            and self._bull_trend_ok(ha_close, ema_val, ma_val)
+                            and self._session_ok(candle.close, bull=True)):
                         self._pending_long = True
                         self._pending_trigger = self._range_hi_bull
                         self._pending_sl = self._range_lo_bull
@@ -493,7 +517,8 @@ class DchannelStrategy:
                         self._range_hi_bear = max(self._range_hi_bear, ha_high)
                         self._range_lo_bear = min(self._range_lo_bear, ha_low)
                     if (_close_enough(ha_open, ha_high, candle.close)
-                            and self._bear_trend_ok(ha_close, ema_val, ma_val)):
+                            and self._bear_trend_ok(ha_close, ema_val, ma_val)
+                            and self._session_ok(candle.close, bull=False)):
                         self._pending_short = True
                         self._pending_trigger = self._range_lo_bear
                         self._pending_sl = self._range_hi_bear

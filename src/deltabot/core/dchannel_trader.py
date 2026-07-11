@@ -71,6 +71,7 @@ class DchannelEngine:
             ema_length=settings.dchannel_ema_length,
             ma_length=settings.dchannel_ma_length,
             wr_enabled=settings.dchannel_wr_enabled,
+            session_line_filter=settings.dchannel_session_line_filter,
             rr_multiple=_INTERNAL_TP_DISABLED,
             tp_pct=None,
             day_tz=settings.day_tz,

@@ -160,6 +160,7 @@ class OptionsExecutor:
         option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
 
         await self._check_balance()
+        await self._maybe_set_leverage(best["product_id"])
 
         size = self._settings.option_contracts
         result = await asyncio.to_thread(
@@ -224,6 +225,7 @@ class OptionsExecutor:
         product_id, strike, symbol = await self._select_contract(
             underlying, expiry, target_strike, option_type
         )
+        await self._maybe_set_leverage(product_id)
 
         size = self._settings.option_contracts
         result = await asyncio.to_thread(
@@ -340,6 +342,22 @@ class OptionsExecutor:
         )
         symbol = f"{option_type.value}-{underlying}-{target_strike}-{expiry.strftime('%d%m%y')}"
         return product_id, float(target_strike), symbol
+
+    async def _maybe_set_leverage(self, product_id: int) -> None:
+        """Best-effort: set the configured leverage on the option product before
+        selling. A failure is logged but NEVER blocks the trade (the order then
+        uses the exchange's current/default margin). No-op when option_leverage<=0."""
+        lev = self._settings.option_leverage
+        if lev <= 0:
+            return
+        try:
+            await asyncio.to_thread(self._rest.set_leverage, product_id, lev)
+            log.info("Set option leverage", extra={"extra": {"product_id": product_id, "leverage": lev}})
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "set_leverage failed — proceeding at exchange default margin",
+                extra={"extra": {"error": str(exc), "product_id": product_id, "leverage": lev}},
+            )
 
     async def _check_balance(self) -> None:
         """Best-effort margin gate: skip the sell if available balance is below the

@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     option_expiry_cutoff_hour: int = 17  # IST hour; if past this, use next-day expiry
     option_min_available_balance: float = 0.0  # skip selling if available balance below this (0 = no check)
     option_margin_asset: str | None = None  # wallet asset to check balance for (None = max across wallets)
+    # If > 0, set this leverage on the option product right before selling (best-
+    # effort; a failure never blocks the trade). 0 = leave the exchange default
+    # untouched. NOTE: leverage is a futures concept -- for options Delta's margin
+    # is risk-engine-based, so this may be a no-op/rejected; verify on the exchange
+    # that margin actually changes. Higher leverage locks less margin but moves the
+    # liquidation price much closer (can liquidate before the strategy SL fires).
+    option_leverage: int = 0
 
     # --- Strategy ---
     # "revbreak" (default, RevBreakSellStrategy): prev-day-zone / open-gate
@@ -137,6 +144,9 @@ class Settings(BaseSettings):
     dchannel_ema_length: int = 200
     dchannel_ma_length: int = 0        # 0 = price-vs-EMA filter; >0 = EMA-vs-SMA(this) cross
     dchannel_wr_enabled: bool = False  # False (best backtest): no %R gate, hunt on every DC touch
+    # Session-open-line filter: require the confirming candle's REAL close above
+    # the 17:30 session-open (bull) / below it (bear) -- a daily bias gate.
+    dchannel_session_line_filter: bool = False
     dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
