@@ -2,6 +2,7 @@
 .env
 .env.revbreak
 .env.heikinashi
+.env.dchannel
 state/
 
 # Python

@@ -127,6 +127,18 @@ class Settings(BaseSettings):
     # +$53 gross). Default OFF so live behavior matches the validated backtest.
     revbreak_intracandle_enabled: bool = False
 
+    # --- Dchannel-specific settings (ignored unless strategy="dchannel") ---
+    # DchannelStrategy on 5m synthetic Heikin Ashi: Williams %R + Donchian-touch
+    # + open==low/high confirm + EMA(200) trend filter. Best backtest (5m, WR OFF,
+    # EMA200, sell 1000 prem, 70% premium-decay TP): +$546 / 6mo at 10 lots.
+    dchannel_dc_period: int = 20
+    dchannel_wr_period: int = 14
+    dchannel_wr_level: float = 80.0
+    dchannel_ema_length: int = 200
+    dchannel_ma_length: int = 0        # 0 = price-vs-EMA filter; >0 = EMA-vs-SMA(this) cross
+    dchannel_wr_enabled: bool = False  # False (best backtest): no %R gate, hunt on every DC touch
+    dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
+
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
     # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).
     state_file: str = ""

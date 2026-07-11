@@ -34,3 +34,25 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Dchannel bot -- runs on its OWN Delta SUB-ACCOUNT, in parallel with
+  # revbreakbot which it NEVER touches (separate capital, separate
+  # DELTA_STATE_FILE=state/dchannel_pos.json). Fill .env.dchannel first
+  # (cp .env.dchannel.example .env.dchannel, add the sub-account API keys).
+  # Bring it up ALONE so the running revbreakbot is not recreated:
+  #   docker compose up -d --build dchannelbot
+  dchannelbot:
+    build: .
+    image: deltabot:latest
+    container_name: dchannelbot
+    restart: always
+    env_file:
+      - .env.dchannel
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
