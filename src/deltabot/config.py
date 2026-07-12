@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     dchannel_ema_length: int = 200
     dchannel_ma_length: int = 0        # 0 = price-vs-EMA filter; >0 = EMA-vs-SMA(this) cross
     dchannel_wr_enabled: bool = False  # False (best backtest): no %R gate, hunt on every DC touch
+    # Signal-range anchor: "ratchet" (legacy) or "highest_touch" (anchor at the
+    # most-extreme DC-band-touching candle, full-span hi/lo, no reset).
+    dchannel_anchor_mode: str = "ratchet"
+    # ASAP intracandle entry: open the option the instant REAL price breaks the
+    # signal-range trigger, instead of waiting for the 5m close (matches the
+    # backtest's trigger-price fill). Entry only; SL/TP still on close/poll.
+    dchannel_intracandle_enabled: bool = False
     dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
 
     # State file for position ownership (prevents reconcile conflict when two bots share one account).

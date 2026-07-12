@@ -185,6 +185,7 @@ class DchannelStrategy:
         ema_length: int = 1000,
         ma_length: int = 0,
         wr_enabled: bool = True,
+        anchor_mode: str = "ratchet",
         rr_multiple: float = 2.0,
         tp_pct: float | None = None,
         day_tz: str = "Asia/Kolkata",
@@ -204,6 +205,12 @@ class DchannelStrategy:
         # %R condition).
         self.ma_length = ma_length
         self.wr_enabled = wr_enabled
+        # anchor_mode = "ratchet" (legacy) OR "highest_touch" (2026-07-12 rewrite):
+        #   the signal range is anchored at the MOST-EXTREME band-touching candle
+        #   (bear: highest high touching the DC upper; bull: lowest low touching
+        #   the DC lower), then spans highest-high/lowest-low through the
+        #   completing candle. No ratchet reset.
+        self.anchor_mode = anchor_mode
         self.rr_multiple = rr_multiple  # TP = entry +/- rr_multiple * (entry-to-SL risk), BTC-price-driven
         # If set, TP is a flat +/- pct of the entry BTC price instead of an
         # RR multiple of the entry-to-SL risk (e.g. tp_pct=0.005 -> 0.5%).
@@ -239,6 +246,11 @@ class DchannelStrategy:
         # better entry trigger than sticking with the original touch candle).
         self._ref_wr_bull: float | None = None
         self._ref_wr_bear: float | None = None
+        # highest_touch anchor: the most-extreme DC-touching HA extreme so far
+        # (bull = lowest ha_low touching the lower band, bear = highest ha_high
+        # touching the upper band). A later, more-extreme touch restarts the range.
+        self._anchor_lo_bull: float | None = None
+        self._anchor_hi_bear: float | None = None
 
         # Pending breakout + open position (shared final stage).
         self._pending_long = self._pending_short = False
@@ -453,19 +465,30 @@ class DchannelStrategy:
                         self._touched_bull = True
                         self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
                         self._ref_wr_bull = wr
+                        self._anchor_lo_bull = ha_low
                 else:
-                    # Ratchet: a LATER candle with a lower high than the current
-                    # reference (and, when %R is enabled, also more oversold)
-                    # RESETS the range to start fresh from it (earlier/lower
-                    # entry trigger than sticking with the original touch candle).
-                    more_oversold = (not self.wr_enabled) or (
-                        wr is not None and self._ref_wr_bull is not None and wr < self._ref_wr_bull)
-                    if more_oversold and ha_high < self._range_hi_bull:
-                        self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
-                        self._ref_wr_bull = wr
+                    if self.anchor_mode == "highest_touch":
+                        # Anchor = the LOWEST band-touching candle: a later candle
+                        # that touches the DC lower band at a NEW low restarts the
+                        # range from it; everything else just widens hi/lo.
+                        if (candle.low <= dc_lower and self._anchor_lo_bull is not None
+                                and ha_low < self._anchor_lo_bull):
+                            self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
+                            self._anchor_lo_bull = ha_low
+                        else:
+                            self._range_hi_bull = max(self._range_hi_bull, ha_high)
+                            self._range_lo_bull = min(self._range_lo_bull, ha_low)
                     else:
-                        self._range_hi_bull = max(self._range_hi_bull, ha_high)
-                        self._range_lo_bull = min(self._range_lo_bull, ha_low)
+                        # Ratchet (legacy): a LATER candle with a lower high (and,
+                        # when %R is on, also more oversold) RESETS the range.
+                        more_oversold = (not self.wr_enabled) or (
+                            wr is not None and self._ref_wr_bull is not None and wr < self._ref_wr_bull)
+                        if more_oversold and ha_high < self._range_hi_bull:
+                            self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
+                            self._ref_wr_bull = wr
+                        else:
+                            self._range_hi_bull = max(self._range_hi_bull, ha_high)
+                            self._range_lo_bull = min(self._range_lo_bull, ha_low)
                     if (_close_enough(ha_open, ha_low, candle.close)
                             and self._bull_trend_ok(ha_close, ema_val, ma_val)):
                         self._pending_long = True
@@ -473,7 +496,7 @@ class DchannelStrategy:
                         self._pending_sl = self._range_lo_bull
                         self._hunt_bull = self._touched_bull = False
                         self._range_hi_bull = self._range_lo_bull = None
-                        self._ref_wr_bull = None
+                        self._ref_wr_bull = self._anchor_lo_bull = None
 
             # Bearish hunt progression (mirror: more OVERBOUGHT -- wr closer to
             # 0 -- AND a HIGHER low than the current reference ratchets it).
@@ -483,15 +506,27 @@ class DchannelStrategy:
                         self._touched_bear = True
                         self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
                         self._ref_wr_bear = wr
+                        self._anchor_hi_bear = ha_high
                 else:
-                    more_overbought = (not self.wr_enabled) or (
-                        wr is not None and self._ref_wr_bear is not None and wr > self._ref_wr_bear)
-                    if more_overbought and ha_low > self._range_lo_bear:
-                        self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
-                        self._ref_wr_bear = wr
+                    if self.anchor_mode == "highest_touch":
+                        # Anchor = the HIGHEST band-touching candle: a later candle
+                        # touching the DC upper band at a NEW high restarts the range.
+                        if (candle.high >= dc_upper and self._anchor_hi_bear is not None
+                                and ha_high > self._anchor_hi_bear):
+                            self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
+                            self._anchor_hi_bear = ha_high
+                        else:
+                            self._range_hi_bear = max(self._range_hi_bear, ha_high)
+                            self._range_lo_bear = min(self._range_lo_bear, ha_low)
                     else:
-                        self._range_hi_bear = max(self._range_hi_bear, ha_high)
-                        self._range_lo_bear = min(self._range_lo_bear, ha_low)
+                        more_overbought = (not self.wr_enabled) or (
+                            wr is not None and self._ref_wr_bear is not None and wr > self._ref_wr_bear)
+                        if more_overbought and ha_low > self._range_lo_bear:
+                            self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
+                            self._ref_wr_bear = wr
+                        else:
+                            self._range_hi_bear = max(self._range_hi_bear, ha_high)
+                            self._range_lo_bear = min(self._range_lo_bear, ha_low)
                     if (_close_enough(ha_open, ha_high, candle.close)
                             and self._bear_trend_ok(ha_close, ema_val, ma_val)):
                         self._pending_short = True
@@ -499,7 +534,7 @@ class DchannelStrategy:
                         self._pending_sl = self._range_hi_bear
                         self._hunt_bear = self._touched_bear = False
                         self._range_hi_bear = self._range_lo_bear = None
-                        self._ref_wr_bear = None
+                        self._ref_wr_bear = self._anchor_hi_bear = None
 
         self._dc.push(ha_high, ha_low)
         self._prev_now_mins = now_mins
@@ -524,3 +559,4 @@ class DchannelStrategy:
         self._range_hi_bull = self._range_lo_bull = None
         self._range_hi_bear = self._range_lo_bear = None
         self._ref_wr_bull = self._ref_wr_bear = None
+        self._anchor_lo_bull = self._anchor_hi_bear = None

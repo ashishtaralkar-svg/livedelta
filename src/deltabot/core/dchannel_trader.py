@@ -71,6 +71,7 @@ class DchannelEngine:
             ema_length=settings.dchannel_ema_length,
             ma_length=settings.dchannel_ma_length,
             wr_enabled=settings.dchannel_wr_enabled,
+            anchor_mode=settings.dchannel_anchor_mode,
             rr_multiple=_INTERNAL_TP_DISABLED,
             tp_pct=None,
             day_tz=settings.day_tz,
@@ -195,9 +196,34 @@ class DchannelEngine:
 
     # ------------------------------------------------------------------ #
     def _on_forming_candle(self, candle: Candle) -> None:
-        # Intracandle disabled: Dchannel evaluates only at closed 5m boundaries,
-        # matching the validated backtest. Nothing to do mid-bar.
-        return
+        if not self.settings.dchannel_intracandle_enabled:
+            return  # closed-bar only
+        task = asyncio.create_task(self._handle_forming_candle(candle))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _handle_forming_candle(self, candle: Candle) -> None:
+        """ASAP entry: the instant REAL price breaks the signal-range trigger
+        (mid-bar, not waiting for the 5m close), open the option. This matches
+        the backtest, which fills at the trigger price the moment a bar crosses
+        it. Entry only -- SL/TP still resolve on the closed bar / TP poll."""
+        if not self.strategy.ready:
+            return
+        if self.executor.has_open_position or self._entry_in_progress:
+            return
+        if not self.strategy.has_pending or self._entries_blocked():
+            return
+        confirmed, invalidated, entry_price = self.strategy.apply_intracandle_pending(candle)
+        if invalidated:
+            log.info("Dchannel: setup invalidated intracandle (opposite extreme hit first)")
+            return
+        if confirmed:
+            signal_dir = (SignalDir.LONG.value
+                          if self.strategy.position_state == PositionState.LONG
+                          else SignalDir.SHORT.value)
+            log.info("Dchannel: intracandle breakout — entering ASAP",
+                     extra={"extra": {"trigger": entry_price}})
+            await self._open_entry(signal_dir, self.strategy.sl_level, entry_price)
 
     def _on_closed_candle(self, candle: Candle) -> None:
         task = asyncio.create_task(self._handle_closed_candle(candle))

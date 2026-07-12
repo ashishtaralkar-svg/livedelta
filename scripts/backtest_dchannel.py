@@ -120,6 +120,7 @@ def run(candles, settings, args) -> list[dict]:
     strategy = DchannelStrategy(
         dc_period=args.dc_period, wr_period=args.wr_period, wr_level=args.wr_level,
         ema_length=args.ema_length, ma_length=args.ma_length, wr_enabled=(args.wr == "on"),
+        anchor_mode=args.anchor_mode,
         rr_multiple=rr, tp_pct=tp_pct, day_tz=settings.day_tz,
         day_start_hour=args.day_start_hour, day_start_minute=args.day_start_minute,
         square_off_hour=args.square_off_hour, square_off_minute=args.square_off_minute,
@@ -278,6 +279,9 @@ def main() -> None:
     ap.add_argument("--wr", choices=["on", "off"], default="on",
                     help="on (default) = Williams %%R oversold/overbought gate arms the hunt; "
                          "off = no %%R gate, both directions hunt continuously on DC touch")
+    ap.add_argument("--anchor-mode", choices=["ratchet", "highest_touch"], default="ratchet",
+                    help="ratchet (default, legacy) vs highest_touch (2026-07-12): anchor the signal "
+                         "range at the most-extreme DC-band-touching candle, span its full hi/lo, no reset")
     ap.add_argument("--day-start-hour", type=int, default=17)
     ap.add_argument("--day-start-minute", type=int, default=30)
     ap.add_argument("--square-off-hour", type=int, default=17)
