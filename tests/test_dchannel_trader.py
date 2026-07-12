@@ -202,3 +202,65 @@ async def test_eod_square_off_closes_and_flattens() -> None:
     assert engine._entry_premium is None
     exits = _exit_calls(engine.notifier)
     assert exits and exits[-1].kwargs["reason"] == "EOD"
+
+
+# ---------------------------------------------------------------------- #
+# Self-heal: position closed OUTSIDE the bot
+# ---------------------------------------------------------------------- #
+class VerifyRest(FakeRest):
+    """get_option_positions returns whatever we set; can also raise."""
+    def __init__(self, positions=None, raises=False):
+        super().__init__(positions=positions)
+        self.raises = raises
+        self.calls = 0
+
+    def get_option_positions(self, underlying):
+        self.calls += 1
+        if self.raises:
+            raise RuntimeError("flaky api")
+        return self._positions
+
+
+async def _open_and_arm(engine):
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0)
+    engine.executor.tracked_product_id = 123
+    engine._last_verify = 0.0
+
+
+async def test_selfheal_flattens_when_position_gone_after_two_misses() -> None:
+    engine = _make_engine(position_verify_seconds=0.0001)
+    await _open_and_arm(engine)
+    engine.rest = VerifyRest(positions=[])          # exchange shows NOTHING
+
+    await engine._maybe_verify_position()           # 1st miss -> only warns
+    assert engine.executor.has_open_position        # still tracked, not dropped yet
+
+    engine._last_verify = 0.0
+    await engine._maybe_verify_position()           # 2nd miss -> self-heal
+    assert not engine.executor.has_open_position
+    assert engine._entry_premium is None and engine._tp_price is None
+    assert engine.strategy.position_state == PositionState.FLAT
+
+
+async def test_selfheal_does_not_drop_position_still_on_exchange() -> None:
+    engine = _make_engine(position_verify_seconds=0.0001)
+    await _open_and_arm(engine)
+    engine.rest = VerifyRest(positions=[{"symbol": "P-BTC-60000-070726", "product_id": 123, "size": -1}])
+
+    for _ in range(3):
+        engine._last_verify = 0.0
+        await engine._maybe_verify_position()
+    assert engine.executor.has_open_position        # never dropped
+    assert engine._verify_misses == 0
+
+
+async def test_selfheal_never_drops_position_on_fetch_error() -> None:
+    engine = _make_engine(position_verify_seconds=0.0001)
+    await _open_and_arm(engine)
+    engine.rest = VerifyRest(raises=True)           # API keeps failing
+
+    for _ in range(5):
+        engine._last_verify = 0.0
+        await engine._maybe_verify_position()
+    assert engine.executor.has_open_position        # a flaky API must NEVER flatten us
+    assert engine._verify_misses == 0

@@ -87,6 +87,24 @@ def premium_at(candles: dict[int, Candle], ts: int, step: int) -> float | None:
     return max(earlier, key=lambda c: c.start_time).close if earlier else None
 
 
+def intrinsic_value(symbol: str, underlying_px: float) -> float:
+    """Intrinsic value of an option = its MINIMUM possible price (an option can
+    never trade below what it's worth if exercised). ``symbol`` like
+    ``P-BTC-65200-120726`` / ``C-BTC-63000-...``. CALL: max(0, px-strike);
+    PUT: max(0, strike-px). Used to floor illiquid-ITM historical candle prices,
+    which frequently print BELOW intrinsic (impossible) and inflate backtests."""
+    try:
+        parts = symbol.split("-")
+        otype, strike = parts[0], float(parts[-2])
+    except (IndexError, ValueError, TypeError, AttributeError):
+        return 0.0
+    if otype == "C":
+        return max(0.0, underlying_px - strike)
+    if otype == "P":
+        return max(0.0, strike - underlying_px)
+    return 0.0
+
+
 def resolve_contract(
     client: httpx.Client, underlying: str, option_type: OptionType, target_strike: int,
     expiry: datetime, interval: int, entry_ts: int, exit_ts: int,

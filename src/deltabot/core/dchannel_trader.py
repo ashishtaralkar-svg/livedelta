@@ -99,6 +99,10 @@ class DchannelEngine:
         # Guards so the poll and closed-candle paths can't double open/close.
         self._entry_in_progress = False
         self._closing = False
+        # Self-heal: detect a position closed OUTSIDE the bot (manual close,
+        # settlement). Two consecutive empty checks are required before acting.
+        self._verify_misses = 0
+        self._last_verify = 0.0
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -282,6 +286,7 @@ class DchannelEngine:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
+            await self._maybe_verify_position()
             if self._closing or self._tp_price is None or not self.executor.has_open_position:
                 continue
             symbol = self.executor.tracked_symbol
@@ -296,6 +301,57 @@ class DchannelEngine:
                 log.info("Dchannel: premium-decay TP hit (poll)",
                          extra={"extra": {"mark": mark, "tp": self._tp_price}})
                 await self._close_tp(mark)
+
+    # ------------------------------------------------------------------ #
+    async def _maybe_verify_position(self) -> None:
+        """Self-heal: confirm the tracked short still exists on the exchange.
+
+        If it vanished (closed manually in the UI, settled at expiry, any exit the
+        bot did not make), the engine would otherwise poll a dead position forever
+        and never trade again. Two CONSECUTIVE empty fetches are required before
+        acting, and a fetch error is never treated as "gone", so a flaky API call
+        can never drop a live position.
+        """
+        iv = self.settings.position_verify_seconds
+        if iv <= 0 or self._closing or self._entry_in_progress or not self.executor.has_open_position:
+            self._verify_misses = 0
+            return
+        now = time.time()
+        if now - self._last_verify < iv:
+            return
+        self._last_verify = now
+        tracked = self.executor.tracked_product_id
+        try:
+            positions = await asyncio.to_thread(
+                self.rest.get_option_positions, self.executor.underlying
+            )
+        except Exception as exc:  # noqa: BLE001 — transient: conclude nothing
+            log.warning("Dchannel: position-verify fetch failed",
+                        extra={"extra": {"error": str(exc)}})
+            return
+        if any(p["size"] < 0 and p.get("product_id") == tracked for p in positions):
+            self._verify_misses = 0
+            return
+
+        self._verify_misses += 1
+        if self._verify_misses < 2:
+            log.warning("Dchannel: tracked position not on exchange (1st miss) — rechecking",
+                        extra={"extra": {"contract": self.executor.tracked_symbol}})
+            return
+
+        contract = self.executor.tracked_symbol
+        log.warning("Dchannel: position closed OUTSIDE the bot — self-healing to FLAT",
+                    extra={"extra": {"contract": contract}})
+        self.executor.clear()
+        if self.settings.state_file:
+            position_state.clear(self.settings.state_file)
+        self._entry_premium = self._tp_price = self._current_dir = None
+        self._verify_misses = 0
+        self.strategy.force_flat()
+        await self.notifier.notify(
+            NotifyEvent.EXIT, reason="closed outside the bot (self-healed)",
+            contract=contract or "?", size=self.settings.option_contracts,
+        )
 
     # ------------------------------------------------------------------ #
     async def _close_tp(self, mark: float) -> None:

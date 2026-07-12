@@ -153,6 +153,13 @@ class Settings(BaseSettings):
     dchannel_intracandle_enabled: bool = False
     dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
 
+    # Self-heal: how often (seconds) to verify the tracked position still exists on
+    # the exchange. If it vanished (closed manually / settled / any external exit),
+    # the bot force-flattens and resumes hunting instead of polling a dead position
+    # forever and silently refusing to trade. 0 = disabled. Requires two consecutive
+    # empty checks so a single flaky fetch can never drop a live position.
+    position_verify_seconds: float = 60.0
+
     # State file for position ownership (prevents reconcile conflict when two bots share one account).
     # Each bot should have a DIFFERENT path. Empty = no state persistence (adopt any short on restart).
     state_file: str = ""

@@ -15,6 +15,7 @@ Run:  python scripts/backtest_dchannel.py --days 7
 from __future__ import annotations
 
 import argparse
+import bisect
 import time
 from datetime import datetime
 from pathlib import Path
@@ -137,9 +138,18 @@ def run(candles, settings, args) -> list[dict]:
     trips: list[dict] = []
     pos: dict | None = None
 
+    # BTC spot at/just-before a timestamp (for intrinsic-value flooring at exit).
+    _spot_ts = sorted(cc.start_time for cc in candles)
+    _spot = {cc.start_time: cc.close for cc in candles}
+    def btc_at(t: int) -> float | None:
+        i = bisect.bisect_right(_spot_ts, t) - 1
+        return _spot[_spot_ts[i]] if i >= 0 else None
+
     def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float):
         nonlocal pos
         assert pos is not None
+        if args.intrinsic_floor:
+            exit_prem = max(exit_prem, op.intrinsic_value(pos["sym"], exit_btc))
         if args.side == "sell":
             entry_fill = pos["entry_prem"] * (1 - es)   # SELLING: receive less on entry
             exit_fill = exit_prem * (1 + xs)              # SELLING: pay more to buy back
@@ -162,6 +172,7 @@ def run(candles, settings, args) -> list[dict]:
             "exit_time_ist": _ist(exit_time), "exit_reason": reason,
             "btc_entry": round(pos["entry_btc"], 1), "btc_exit": round(exit_btc, 1),
             "sl_level": round(pos["sl_level"], 1) if pos.get("sl_level") else None,
+            "sl_pct": round(pos.get("sl_pct", 0.0), 3), "is_paper": pos.get("is_paper", False),
             "btc_favorable": round(btc_fav, 1),
             "btc_high": round(pos["btc_high"], 1), "btc_low": round(pos["btc_low"], 1),
             "opt_in": round(entry_fill, 1), "opt_out": round(exit_fill, 1),
@@ -196,10 +207,16 @@ def run(candles, settings, args) -> list[dict]:
             #     --side sell -> decay target (bucket LOW), always external
             #     since the strategy's internal TP is BTC-price/buy-shaped.
             if pos is not None and args.side == "sell" and args.tp_mode == "premium" and not args.no_target:
-                t_tp = _first_decay_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"], step)
+                # A deep-ITM option can't decay to tp_price while its intrinsic
+                # exceeds it -- with the floor on, only look for the decay TP when
+                # the option is OTM enough (intrinsic <= tp_price).
+                can_decay = (not args.intrinsic_floor
+                             or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"])
+                t_tp = (_first_decay_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"], step)
+                        if can_decay else None)
                 if t_tp is not None:
                     strategy.notify_exit("TP")
-                    close("TP", pos["tp_price"], t_tp, pos["entry_btc"])
+                    close("TP", pos["tp_price"], t_tp, btc_at(t_tp) or pos["entry_btc"])
                 else:
                     pos["last_check"] = c.start_time
             elif pos is not None and args.side == "buy" and args.tp_mode == "premium":
@@ -240,10 +257,17 @@ def run(candles, settings, args) -> list[dict]:
                 if entry_prem is None:
                     strategy.notify_exit("SL")
                     continue
+                if args.intrinsic_floor:
+                    entry_prem = max(entry_prem, op.intrinsic_value(sym, c.close))
+                # SL distance as a % of BTC price. When --paper-trade-wide-sl is
+                # set, setups wider than --max-sl-pct are PAPER (tracked, but not
+                # counted in the real NET) -- keeps real risk to tight-SL trades.
+                sl_pct = abs(c.close - dec.sl_level) / c.close * 100.0 if dec.sl_level else 0.0
+                is_paper = args.paper_trade_wide_sl and args.max_sl_pct > 0 and sl_pct > args.max_sl_pct
                 pos = {
                     "is_buy": is_buy, "sym": sym, "candles": ocandles, "entry_time": c.start_time,
                     "entry_btc": c.close, "entry_prem": entry_prem,
-                    "sl_level": dec.sl_level,
+                    "sl_level": dec.sl_level, "sl_pct": sl_pct, "is_paper": is_paper,
                     "btc_high": c.high, "btc_low": c.low,
                 }
                 if args.side == "sell" and args.tp_mode == "premium" and not args.no_target:
@@ -282,6 +306,14 @@ def main() -> None:
     ap.add_argument("--anchor-mode", choices=["ratchet", "highest_touch"], default="ratchet",
                     help="ratchet (default, legacy) vs highest_touch (2026-07-12): anchor the signal "
                          "range at the most-extreme DC-band-touching candle, span its full hi/lo, no reset")
+    ap.add_argument("--max-sl-pct", type=float, default=0.0,
+                    help="SL-band ceiling in %% of BTC price. With --paper-trade-wide-sl, setups whose "
+                         "SL distance exceeds this are PAPER-traded, not real (0 = off)")
+    ap.add_argument("--paper-trade-wide-sl", action="store_true",
+                    help="paper-trade (track, exclude from real NET) any setup whose SL > --max-sl-pct")
+    ap.add_argument("--intrinsic-floor", action="store_true",
+                    help="floor every option premium to its intrinsic value (fixes illiquid-ITM "
+                         "candles that print BELOW intrinsic and inflate the backtest)")
     ap.add_argument("--day-start-hour", type=int, default=17)
     ap.add_argument("--day-start-minute", type=int, default=30)
     ap.add_argument("--square-off-hour", type=int, default=17)
@@ -368,9 +400,11 @@ def main() -> None:
     print(f"{'Entry(IST)':<15}{'Exit(IST)':<15}{'Action':<10}{'Contract':<22}{'Why':<5}"
           f"{'SL':>9}{fav_hdr:>11}{'PremIn':>8}{'PremOut':>8}{'Net$':>9}")
     print("-" * 118)
+    real = [t for t in trips if not t.get("is_paper")]
+    paper = [t for t in trips if t.get("is_paper")]
     net = fees = gross = 0.0
     wins = 0
-    for t in trips:
+    for t in real:
         sl_s = f"{t['sl_level']:.0f}" if t['sl_level'] is not None else "-"
         print(f"{t['entry_time_ist'][5:14]:<15}{t['exit_time_ist'][5:14]:<15}{t['action']:<10}"
               f"{t['contract']:<22}{t['exit_reason']:<5}{sl_s:>9}{t['btc_favorable']:>11.0f}"
@@ -378,12 +412,21 @@ def main() -> None:
         net += t["net_usd"]; fees += t["fee_usd"]; gross += t["gross_usd"]
         wins += 1 if t["net_usd"] > 0 else 0
     print("=" * 118)
-    n = len(trips)
+    n = len(real)
     wr = (wins / n * 100.0) if n else 0.0
-    reasons = {r: sum(1 for t in trips if t["exit_reason"] == r) for r in ("TP", "SL", "EOD")}
-    print(f"Trades {n}  Wins/Losses {wins}/{n - wins}  Win rate {wr:.1f}%  "
+    reasons = {r: sum(1 for t in real if t["exit_reason"] == r) for r in ("TP", "SL", "EOD")}
+    label = f"REAL (SL <= {args.max_sl_pct:g}%)" if args.paper_trade_wide_sl and args.max_sl_pct > 0 else "Trades"
+    print(f"{label} {n}  Wins/Losses {wins}/{n - wins}  Win rate {wr:.1f}%  "
           f"exits: TP={reasons['TP']} SL={reasons['SL']} EOD={reasons['EOD']}")
     print(f"Gross {gross:,.2f}  -  brokerage {fees:,.2f}  =  NET {net:,.2f} USD")
+    if args.paper_trade_wide_sl and args.max_sl_pct > 0:
+        p_net = sum(t["net_usd"] for t in paper)
+        p_wins = sum(1 for t in paper if t["net_usd"] > 0)
+        p_reasons = {r: sum(1 for t in paper if t["exit_reason"] == r) for r in ("TP", "SL", "EOD")}
+        print(f"\nPAPER (SL > {args.max_sl_pct:g}%, NOT in real NET): {len(paper)}  "
+              f"Wins/Losses {p_wins}/{len(paper) - p_wins}  "
+              f"exits: TP={p_reasons['TP']} SL={p_reasons['SL']} EOD={p_reasons['EOD']}  "
+              f"would-be NET {p_net:,.2f} USD")
 
     summary = [
         {"metric": "window_IST", "value": f"{_ist(win_start)} -> {_ist(now)}"},
