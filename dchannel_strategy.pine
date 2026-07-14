@@ -10,14 +10,28 @@
 //   EOD square-off 17:25 IST, target premium ~1000, -70% option TP, weekend
 //   (Sat+Sun) new-entry block.
 //
-// 2026-07-14 UPDATE (this script): the confirming candle NO LONGER needs its
-//   own HA close above/below EMA(200). That single-EMA close check is REPLACED
-//   by a persistent trend gate: BUY needs EMA(50) > EMA(200); SELL needs
-//   EMA(50) < EMA(200) (both EMAs on HA close). Backtested (--intrinsic-floor,
-//   honest pricing, 1 month, 5m, live sizing): this variant NET -$9.18 vs the
-//   currently-DEPLOYED single-EMA-close version's NET +$31.89 -- i.e. this
-//   config is NOT what's live and backtested WORSE. This script is a faithful
-//   port of the change as requested, not a recommendation to deploy it.
+// 2026-07-14 UPDATE #1 (confirm filter): the confirming candle NO LONGER needs
+//   its own HA close above/below EMA(200). That single-EMA close check is
+//   REPLACED by a persistent trend gate: BUY needs EMA(50) > EMA(200); SELL
+//   needs EMA(50) < EMA(200) (both EMAs on HA close).
+//
+// 2026-07-14 UPDATE #2 (exit): there is NO take-profit at all anymore -- the
+//   -70% option-premium TP is REMOVED, not even the earlier optional
+//   BTC-%-price placeholder. The position's ONLY profit-taking-equivalent
+//   exit is now the EMA(50)/EMA(200) TREND-FLIP: a long exits the instant
+//   EMA(50) is no longer above EMA(200); a short exits the instant EMA(50) is
+//   no longer below EMA(200). SL and EOD square-off are UNCHANGED and still
+//   take priority (checked in this order: SL, then EMA-cross, then EOD).
+//
+// HONESTY CHECK: the closest backtest available for this shape (Python
+// strategy, --intrinsic-floor, 1 month, 5m, live sizing) is the EMA-cross-exit
+// variant WITH an added same-direction EOD rollover (which this Pine script
+// does NOT include): NET -$33.71 (no weekend skip) / -$20.14 (Sat+Sun
+// skipped) -- both worse than the currently-DEPLOYED decay-TP config's
+// +$31.89. This simpler no-rollover combination hasn't been separately
+// backtested, but every EMA-cross-exit variant tried this session has
+// underperformed the deployed baseline. This script is a faithful port of
+// the change as requested, not a recommendation to deploy it live.
 //
 // What the live bot does (and what this script mirrors):
 //   * CHART BASIS: synthetic Heikin Ashi, fetched via
@@ -58,11 +72,9 @@
 //   CALL. A sold PUT profits when BTC rises; a sold CALL profits when BTC
 //   falls -- so on the BTC price chart the directional P&L is equivalent to
 //   LONG (bullish) / SHORT (bearish), which is how this strategy maps them.
-//   The bot's real take-profit is a -70% drop in the OPTION premium, which
-//   cannot be computed from BTC price alone. This script exits ONLY on the
-//   BTC stop-loss or EOD (the "worst case" path, no TP) unless you enable the
-//   optional experimental BTC % TP below. Live results differ from this
-//   script because the -70% premium TP closes many trades early.
+//   The bot's REAL take-profit is normally a -70% drop in the OPTION premium
+//   -- this script REPLACES that entirely with the EMA(50)/EMA(200)
+//   trend-flip exit described above (per request). There is no other TP.
 //
 // LIMITATION — weekend block: live, a signal that completes on a blocked day
 //   (Sat/Sun) still occupies the strategy's "in position" bookkeeping
@@ -111,11 +123,6 @@ sqOffMin    = input.int(25, "Square-Off Minute", minval=0, maxval=59, group=grpD
 grpFilter = "Day-of-Week Filter (matches live DELTA_SKIP_WEEKDAYS)"
 skipSat = input.bool(true, "Block new entries on Saturday (IST)", group=grpFilter)
 skipSun = input.bool(true, "Block new entries on Sunday (IST)",   group=grpFilter)
-
-grpTP = "Optional price TP (NOT the real -70% option TP)"
-useBtcTP = input.bool(false, "Enable a BTC % take-profit", group=grpTP,
-     tooltip="For experimentation only. The live bot's TP is -70% of OPTION premium, which cannot be modeled from BTC price alone.")
-btcTPpct = input.float(1.0, "BTC move % for TP", step=0.1, minval=0.1, group=grpTP)
 
 // ============================================================
 // Synthetic Heikin Ashi OHLC (built-in TradingView HA ticker -- matches the
@@ -212,19 +219,24 @@ if squareOff or inGap
     anchorLoBull := na
     anchorHiBear := na
 
-// ----- 1. EOD square-off (fires before the per-position stop refresh below) -----
-if squareOff
-    strategy.close_all(comment="EOD")
-
-// ----- 2. Protective stop-loss (BTC signal-range extreme; fixed at entry) --
-//          Uses strategy.exit's stop= so the fill lands exactly at the SL
-//          level when crossed, matching revbreak_strategy.pine's pattern. -----
+// ----- 1/2. Exits, in PRIORITY order (mirrors dchannel.py exactly): fixed SL
+//            (BTC signal-range extreme) first, then the EMA(50)/EMA(200)
+//            trend-flip exit (the ONLY profit-taking-equivalent exit -- there
+//            is no TP), then EOD square-off as the final fallback. -----
 if strategy.position_size > 0
-    strategy.exit("Long X",  from_entry="Long",  stop=longStop,
-         limit = useBtcTP ? strategy.position_avg_price * (1 + btcTPpct / 100) : na)
+    if low <= longStop
+        strategy.close("Long", comment="SL")
+    else if not (emaTrend > emaLong)
+        strategy.close("Long", comment="EMA_CROSS")
+    else if squareOff
+        strategy.close("Long", comment="EOD")
 if strategy.position_size < 0
-    strategy.exit("Short X", from_entry="Short", stop=shortStop,
-         limit = useBtcTP ? strategy.position_avg_price * (1 - btcTPpct / 100) : na)
+    if high >= shortStop
+        strategy.close("Short", comment="SL")
+    else if not (emaTrend < emaLong)
+        strategy.close("Short", comment="EMA_CROSS")
+    else if squareOff
+        strategy.close("Short", comment="EOD")
 
 // ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
 //          Weekend block ONLY gates the real order here -- matches the live
