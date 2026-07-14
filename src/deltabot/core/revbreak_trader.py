@@ -736,6 +736,8 @@ class RevBreakSellEngine:
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
         now = datetime.now(_IST)
+        if now.weekday() in self.settings.skip_weekday_ints:
+            return True  # e.g. DELTA_SKIP_WEEKDAYS=Sat,Sun -- exits still run, only new entries blocked
         if self._sq_off_date != now.date():
             return False
         resume = now.replace(

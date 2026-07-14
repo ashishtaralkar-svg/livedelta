@@ -72,6 +72,7 @@ class DchannelEngine:
             ma_length=settings.dchannel_ma_length,
             wr_enabled=settings.dchannel_wr_enabled,
             anchor_mode=settings.dchannel_anchor_mode,
+            touch_ema_filter=settings.dchannel_touch_ema_filter,
             rr_multiple=_INTERNAL_TP_DISABLED,
             tp_pct=None,
             day_tz=settings.day_tz,
@@ -542,6 +543,8 @@ class DchannelEngine:
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
         now = datetime.now(_IST)
+        if now.weekday() in self.settings.skip_weekday_ints:
+            return True  # e.g. DELTA_SKIP_WEEKDAYS=Sat,Sun -- exits still run, only new entries blocked
         if self._sq_off_date != now.date():
             return False
         resume = now.replace(hour=self.settings.entry_resume_hour,

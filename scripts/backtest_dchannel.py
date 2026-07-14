@@ -121,7 +121,9 @@ def run(candles, settings, args) -> list[dict]:
     strategy = DchannelStrategy(
         dc_period=args.dc_period, wr_period=args.wr_period, wr_level=args.wr_level,
         ema_length=args.ema_length, ma_length=args.ma_length, wr_enabled=(args.wr == "on"),
-        anchor_mode=args.anchor_mode,
+        anchor_mode=args.anchor_mode, touch_ema_filter=args.touch_ema_filter,
+        trend_ema_length=args.trend_ema_length, ema_cross_exit=args.ema_cross_exit,
+        reenter_same_direction_eod=args.reenter_same_direction_eod,
         rr_multiple=rr, tp_pct=tp_pct, day_tz=settings.day_tz,
         day_start_hour=args.day_start_hour, day_start_minute=args.day_start_minute,
         square_off_hour=args.square_off_hour, square_off_minute=args.square_off_minute,
@@ -137,6 +139,9 @@ def run(candles, settings, args) -> list[dict]:
     cache: dict = {}
     trips: list[dict] = []
     pos: dict | None = None
+    _DOW = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+    _skip_days = {_DOW[t.strip().lower()[:3]] for t in (args.skip_weekdays or "").split(",")
+                  if t.strip().lower()[:3] in _DOW}
 
     # BTC spot at/just-before a timestamp (for intrinsic-value flooring at exit).
     _spot_ts = sorted(cc.start_time for cc in candles)
@@ -233,6 +238,9 @@ def run(candles, settings, args) -> list[dict]:
             #    ENTRY timestamps are actually taken (the underlying signal-
             #    hunt still runs continuously; this only gates execution).
             if pos is None and dec is not None and dec.has_entry:
+                if _skip_days and datetime.fromtimestamp(c.start_time, tz=_IST).weekday() in _skip_days:
+                    strategy.notify_exit("SL")
+                    continue
                 entry_mins = _ist_mins(c.start_time)
                 if args.trade_window and not (args.window_start_mins <= entry_mins < args.window_end_mins):
                     strategy.notify_exit("SL")  # signal fired outside the window -- skip it
@@ -311,6 +319,22 @@ def main() -> None:
                          "SL distance exceeds this are PAPER-traded, not real (0 = off)")
     ap.add_argument("--paper-trade-wide-sl", action="store_true",
                     help="paper-trade (track, exclude from real NET) any setup whose SL > --max-sl-pct")
+    ap.add_argument("--touch-ema-filter", action="store_true",
+                    help="the DC-band-touching (anchor) candle must also close on the right side of "
+                         "the EMA: DC-upper touch closes BELOW the EMA (bear), DC-lower touch ABOVE (bull)")
+    ap.add_argument("--skip-weekdays", default="",
+                    help="comma-separated IST days whose NEW entries are blocked, e.g. 'Sat,Sun'")
+    ap.add_argument("--trend-ema-length", type=int, default=0,
+                    help="add a 2nd EMA of this length and gate signals to trend: bull needs "
+                         "EMA(this) > EMA(--ema-length), bear needs < (0 = off)")
+    ap.add_argument("--ema-cross-exit", action="store_true",
+                    help="replace the premium-decay TP: exit a position the moment "
+                         "EMA(--trend-ema-length) crosses back over EMA(--ema-length) against it "
+                         "(requires --trend-ema-length > 0)")
+    ap.add_argument("--reenter-same-direction-eod", action="store_true",
+                    help="if a position was closed by the EOD square-off (not SL/EMA-cross), "
+                         "immediately reopen the SAME direction at the next session's first bar, "
+                         "no new pattern required")
     ap.add_argument("--intrinsic-floor", action="store_true",
                     help="floor every option premium to its intrinsic value (fixes illiquid-ITM "
                          "candles that print BELOW intrinsic and inflate the backtest)")
@@ -414,10 +438,12 @@ def main() -> None:
     print("=" * 118)
     n = len(real)
     wr = (wins / n * 100.0) if n else 0.0
-    reasons = {r: sum(1 for t in real if t["exit_reason"] == r) for r in ("TP", "SL", "EOD")}
+    _reason_kinds = ("TP", "SL", "EOD", "EMA_CROSS")
+    reasons = {r: sum(1 for t in real if t["exit_reason"] == r) for r in _reason_kinds}
     label = f"REAL (SL <= {args.max_sl_pct:g}%)" if args.paper_trade_wide_sl and args.max_sl_pct > 0 else "Trades"
     print(f"{label} {n}  Wins/Losses {wins}/{n - wins}  Win rate {wr:.1f}%  "
-          f"exits: TP={reasons['TP']} SL={reasons['SL']} EOD={reasons['EOD']}")
+          f"exits: TP={reasons['TP']} SL={reasons['SL']} EOD={reasons['EOD']} "
+          f"EMA_CROSS={reasons['EMA_CROSS']}")
     print(f"Gross {gross:,.2f}  -  brokerage {fees:,.2f}  =  NET {net:,.2f} USD")
     if args.paper_trade_wide_sl and args.max_sl_pct > 0:
         p_net = sum(t["net_usd"] for t in paper)
@@ -438,7 +464,8 @@ def main() -> None:
         {"metric": "lots", "value": args.lots},
         {"metric": "trades", "value": n},
         {"metric": "win_rate_pct", "value": round(wr, 1)},
-        {"metric": "exits_TP/SL/EOD", "value": f"{reasons['TP']}/{reasons['SL']}/{reasons['EOD']}"},
+        {"metric": "exits_TP/SL/EOD/EMA_CROSS",
+         "value": f"{reasons['TP']}/{reasons['SL']}/{reasons['EOD']}/{reasons['EMA_CROSS']}"},
         {"metric": "gross_usd", "value": round(gross, 2)},
         {"metric": "brokerage_usd", "value": round(fees, 2)},
         {"metric": "net_usd", "value": round(net, 2)},

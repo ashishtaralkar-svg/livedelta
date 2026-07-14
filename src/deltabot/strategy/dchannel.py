@@ -186,6 +186,10 @@ class DchannelStrategy:
         ma_length: int = 0,
         wr_enabled: bool = True,
         anchor_mode: str = "ratchet",
+        touch_ema_filter: bool = False,
+        trend_ema_length: int = 0,
+        ema_cross_exit: bool = False,
+        reenter_same_direction_eod: bool = False,
         rr_multiple: float = 2.0,
         tp_pct: float | None = None,
         day_tz: str = "Asia/Kolkata",
@@ -211,6 +215,26 @@ class DchannelStrategy:
         #   the DC lower), then spans highest-high/lowest-low through the
         #   completing candle. No ratchet reset.
         self.anchor_mode = anchor_mode
+        # touch_ema_filter: the candle that TOUCHES the Donchian band must itself
+        # be on the right side of the EMA -- a DC-upper touch must close BELOW the
+        # EMA (bear), a DC-lower touch must close ABOVE it (bull). Applies to the
+        # anchor candle (and any highest_touch re-anchor), on top of the existing
+        # EMA check on the confirming candle.
+        self.touch_ema_filter = touch_ema_filter
+        # trend_ema_length > 0 adds a second EMA and gates each signal to trend
+        # alignment: bull needs EMA(trend) > EMA(ema_length), bear needs <.
+        self.trend_ema_length = trend_ema_length
+        # ema_cross_exit (2026-07-14): replaces the premium-decay TP entirely --
+        # while in a position, exit the moment EMA(trend) crosses back over
+        # EMA(ema_length) against the position (requires trend_ema_length > 0).
+        # Only SL, this cross, and EOD square-off can close the trade.
+        self.ema_cross_exit = ema_cross_exit
+        # reenter_same_direction_eod: if the position was closed by the EOD
+        # square-off specifically (not SL, not the EMA cross), immediately
+        # re-open a position in the SAME direction at the next session's first
+        # bar (no new pattern required), preserving the same entry-to-SL risk
+        # distance from the trade that just rolled off.
+        self.reenter_same_direction_eod = reenter_same_direction_eod
         self.rr_multiple = rr_multiple  # TP = entry +/- rr_multiple * (entry-to-SL risk), BTC-price-driven
         # If set, TP is a flat +/- pct of the entry BTC price instead of an
         # RR multiple of the entry-to-SL risk (e.g. tp_pct=0.005 -> 0.5%).
@@ -226,6 +250,7 @@ class DchannelStrategy:
         self._wr = _WrWindow(self.wr_period)
         self._ema = _Ema(self.ema_length)
         self._ma = _Sma(self.ma_length) if self.ma_length > 0 else None
+        self._ema_trend = _Ema(self.trend_ema_length) if self.trend_ema_length > 0 else None
         self._warmup_bars = 0
 
         # Running Heikin Ashi state.
@@ -259,6 +284,8 @@ class DchannelStrategy:
         self._in_long = self._in_short = False
         self._sl_level: float | None = None
         self._tp_level: float | None = None  # entry +/- rr_multiple * risk, BTC-price-driven
+        self._entry_level: float | None = None  # entry price of the current position (for reentry risk sizing)
+        self._pending_reenter: tuple[str, float] | None = None  # (direction, risk) after an EOD roll-off
 
     @property
     def position_state(self) -> PositionState:
@@ -272,7 +299,7 @@ class DchannelStrategy:
     def ready(self) -> bool:
         return (self._dc.ready
                 and (self._wr.ready or not self.wr_enabled)
-                and self._warmup_bars >= self.ema_length
+                and self._warmup_bars >= max(self.ema_length, self.trend_ema_length)
                 and (self._ma is None or self._ma.ready))
 
     def _bull_trend_ok(self, ha_close: float, ema_val: float | None, ma_val: float | None) -> bool:
@@ -284,6 +311,25 @@ class DchannelStrategy:
         if self.ma_length > 0:
             return ema_val is not None and ma_val is not None and ema_val < ma_val
         return ema_val is not None and ha_close < ema_val
+
+    def _trend_ema_ok(self, ema_trend_val: float | None, ema_val: float | None, bull: bool) -> bool:
+        """EMA(trend) vs EMA(ema_length) directional gate: bull needs the shorter
+        EMA above the longer, bear below. No-op when trend_ema_length is 0."""
+        if self.trend_ema_length <= 0:
+            return True
+        if ema_trend_val is None or ema_val is None:
+            return False
+        return ema_trend_val > ema_val if bull else ema_trend_val < ema_val
+
+    def _touch_ok(self, ha_close: float, ema_val: float | None, ma_val: float | None,
+                  bull: bool) -> bool:
+        """The band-touching (anchor) candle must sit on the right side of the EMA
+        when ``touch_ema_filter`` is on: a DC-lower touch closes ABOVE the EMA
+        (bull), a DC-upper touch closes BELOW it (bear). No-op when off."""
+        if not self.touch_ema_filter:
+            return True
+        return (self._bull_trend_ok(ha_close, ema_val, ma_val) if bull
+                else self._bear_trend_ok(ha_close, ema_val, ma_val))
 
     @property
     def has_pending(self) -> bool:
@@ -297,6 +343,8 @@ class DchannelStrategy:
         self._in_long = self._in_short = False
         self._sl_level = None
         self._tp_level = None
+        self._entry_level = None
+        self._pending_reenter = None
         self._clear_pending()
         self._clear_hunts()
 
@@ -308,6 +356,7 @@ class DchannelStrategy:
         self._in_long = self._in_short = False
         self._sl_level = None
         self._tp_level = None
+        self._entry_level = None
 
     def _compute_tp(self, trig: float, sl: float, is_long: bool) -> float:
         """TP level in BTC price: a flat +/- ``tp_pct`` of the entry when set,
@@ -337,7 +386,8 @@ class DchannelStrategy:
             if candle.open >= trig or candle.high >= trig:
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
-                self._tp_level = self._compute_tp(trig, sl, True)
+                self._entry_level = trig
+                self._tp_level = None if self.ema_cross_exit else self._compute_tp(trig, sl, True)
                 self._clear_pending()
                 return True, False, trig
         elif self._pending_short and self._pending_trigger is not None and self._pending_sl is not None:
@@ -348,7 +398,8 @@ class DchannelStrategy:
             if candle.open <= trig or candle.low <= trig:
                 self._in_short, self._in_long = True, False
                 self._sl_level = sl
-                self._tp_level = self._compute_tp(trig, sl, False)
+                self._entry_level = trig
+                self._tp_level = None if self.ema_cross_exit else self._compute_tp(trig, sl, False)
                 self._clear_pending()
                 return True, False, trig
         return False, False, 0.0
@@ -369,6 +420,7 @@ class DchannelStrategy:
         wr = (wr_hh - ha_close) / (wr_hh - wr_ll) * -100.0 if wr_hh != wr_ll and self._wr.ready else None
         ema_val = self._ema.update(ha_close)
         ma_val = self._ma.update(ha_close) if self._ma is not None else None
+        ema_trend_val = self._ema_trend.update(ha_close) if self._ema_trend is not None else None
         dc_upper, dc_lower = self._dc.upper, self._dc.lower
         self._warmup_bars += 1
 
@@ -390,12 +442,16 @@ class DchannelStrategy:
         entry_price = candle.close
         new_sl: float | None = None
 
-        # --- Exits: fixed SL (REAL price), then TP (1:2 RR, REAL price), then EOD ---
+        # --- Exits: fixed SL (REAL price), then TP (1:2 RR, REAL price), then
+        #     EMA-cross (if enabled, replaces the premium TP entirely), then EOD ---
         if self._in_long:
             if self._sl_level is not None and candle.low <= self._sl_level:
                 long_exit, long_exit_price, exit_reason = True, self._sl_level, "SL"
             elif self._tp_level is not None and candle.high >= self._tp_level:
                 long_exit, long_exit_price, exit_reason = True, self._tp_level, "TP"
+            elif (self.ema_cross_exit and ema_trend_val is not None and ema_val is not None
+                    and not (ema_trend_val > ema_val)):
+                long_exit, long_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
             elif square_off:
                 long_exit, long_exit_price, exit_reason = True, candle.close, "EOD"
         elif self._in_short:
@@ -403,11 +459,37 @@ class DchannelStrategy:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
             elif self._tp_level is not None and candle.low <= self._tp_level:
                 short_exit, short_exit_price, exit_reason = True, self._tp_level, "TP"
+            elif (self.ema_cross_exit and ema_trend_val is not None and ema_val is not None
+                    and not (ema_trend_val < ema_val)):
+                short_exit, short_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
             elif square_off:
                 short_exit, short_exit_price, exit_reason = True, candle.close, "EOD"
         if long_exit or short_exit:
+            if (self.reenter_same_direction_eod and exit_reason == "EOD"
+                    and self._entry_level is not None and self._sl_level is not None):
+                risk = abs(self._entry_level - self._sl_level)
+                self._pending_reenter = ("long" if long_exit else "short", risk)
             self._in_long = self._in_short = False
             self._sl_level = None
+            self._tp_level = None
+            self._entry_level = None
+
+        # --- Same-direction rollover: a position that was closed by the EOD
+        #     square-off (not SL, not EMA-cross) reopens immediately in the SAME
+        #     direction at the next session's first live bar, no new pattern
+        #     needed -- the trend hasn't flipped, only settlement forced the exit.
+        if (self.reenter_same_direction_eod and self._pending_reenter is not None
+                and not self._in_long and not self._in_short and not square_off and not in_gap):
+            direction, risk = self._pending_reenter
+            self._pending_reenter = None
+            entry_price = self._entry_level = candle.close
+            if direction == "long":
+                buy_signal = True
+                self._in_long, self._sl_level = True, candle.close - risk
+            else:
+                sell_signal = True
+                self._in_short, self._sl_level = True, candle.close + risk
+            new_sl = self._sl_level
             self._tp_level = None
 
         # --- Breakout trigger for a PRIOR-armed pending setup (closed-bar
@@ -418,7 +500,8 @@ class DchannelStrategy:
             if trig is not None and candle.high >= trig:
                 buy_signal, entry_price, new_sl = True, trig, sl
                 self._in_long, self._sl_level = True, sl
-                self._tp_level = self._compute_tp(trig, sl, True)
+                self._entry_level = trig
+                self._tp_level = None if self.ema_cross_exit else self._compute_tp(trig, sl, True)
                 self._clear_pending()
             elif sl is not None and candle.low <= sl:
                 self._clear_pending()
@@ -427,7 +510,8 @@ class DchannelStrategy:
             if trig is not None and candle.low <= trig:
                 sell_signal, entry_price, new_sl = True, trig, sl
                 self._in_short, self._sl_level = True, sl
-                self._tp_level = self._compute_tp(trig, sl, False)
+                self._entry_level = trig
+                self._tp_level = None if self.ema_cross_exit else self._compute_tp(trig, sl, False)
                 self._clear_pending()
             elif sl is not None and candle.high >= sl:
                 self._clear_pending()
@@ -461,7 +545,7 @@ class DchannelStrategy:
             # Bullish hunt progression.
             if self._hunt_bull and dc_lower is not None:
                 if not self._touched_bull:
-                    if candle.low <= dc_lower:
+                    if candle.low <= dc_lower and self._touch_ok(ha_close, ema_val, ma_val, True):
                         self._touched_bull = True
                         self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
                         self._ref_wr_bull = wr
@@ -471,7 +555,8 @@ class DchannelStrategy:
                         # Anchor = the LOWEST band-touching candle: a later candle
                         # that touches the DC lower band at a NEW low restarts the
                         # range from it; everything else just widens hi/lo.
-                        if (candle.low <= dc_lower and self._anchor_lo_bull is not None
+                        if (candle.low <= dc_lower and self._touch_ok(ha_close, ema_val, ma_val, True)
+                                and self._anchor_lo_bull is not None
                                 and ha_low < self._anchor_lo_bull):
                             self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
                             self._anchor_lo_bull = ha_low
@@ -489,8 +574,12 @@ class DchannelStrategy:
                         else:
                             self._range_hi_bull = max(self._range_hi_bull, ha_high)
                             self._range_lo_bull = min(self._range_lo_bull, ha_low)
-                    if (_close_enough(ha_open, ha_low, candle.close)
-                            and self._bull_trend_ok(ha_close, ema_val, ma_val)):
+                    # When the EMA50/EMA200 crossover gate is active, it REPLACES
+                    # the candle-close-vs-EMA200 check (not stacked with it) -- the
+                    # confirm candle only needs its open==low shape.
+                    close_ok = (self._trend_ema_ok(ema_trend_val, ema_val, True) if self.trend_ema_length > 0
+                                else self._bull_trend_ok(ha_close, ema_val, ma_val))
+                    if _close_enough(ha_open, ha_low, candle.close) and close_ok:
                         self._pending_long = True
                         self._pending_trigger = self._range_hi_bull
                         self._pending_sl = self._range_lo_bull
@@ -502,7 +591,7 @@ class DchannelStrategy:
             # 0 -- AND a HIGHER low than the current reference ratchets it).
             if self._hunt_bear and dc_upper is not None:
                 if not self._touched_bear:
-                    if candle.high >= dc_upper:
+                    if candle.high >= dc_upper and self._touch_ok(ha_close, ema_val, ma_val, False):
                         self._touched_bear = True
                         self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
                         self._ref_wr_bear = wr
@@ -511,7 +600,8 @@ class DchannelStrategy:
                     if self.anchor_mode == "highest_touch":
                         # Anchor = the HIGHEST band-touching candle: a later candle
                         # touching the DC upper band at a NEW high restarts the range.
-                        if (candle.high >= dc_upper and self._anchor_hi_bear is not None
+                        if (candle.high >= dc_upper and self._touch_ok(ha_close, ema_val, ma_val, False)
+                                and self._anchor_hi_bear is not None
                                 and ha_high > self._anchor_hi_bear):
                             self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
                             self._anchor_hi_bear = ha_high
@@ -527,8 +617,9 @@ class DchannelStrategy:
                         else:
                             self._range_hi_bear = max(self._range_hi_bear, ha_high)
                             self._range_lo_bear = min(self._range_lo_bear, ha_low)
-                    if (_close_enough(ha_open, ha_high, candle.close)
-                            and self._bear_trend_ok(ha_close, ema_val, ma_val)):
+                    close_ok = (self._trend_ema_ok(ema_trend_val, ema_val, False) if self.trend_ema_length > 0
+                                else self._bear_trend_ok(ha_close, ema_val, ma_val))
+                    if _close_enough(ha_open, ha_high, candle.close) and close_ok:
                         self._pending_short = True
                         self._pending_trigger = self._range_lo_bear
                         self._pending_sl = self._range_hi_bear

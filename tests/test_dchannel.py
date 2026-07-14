@@ -296,3 +296,92 @@ def test_force_flat_clears_everything() -> None:
     assert s.position_state == PositionState.FLAT
     assert not s.has_pending
     assert not s._hunt_bear and not s._touched_bear
+
+
+# ---------------------------------------------------------------------- #
+# 2026-07-14: ema_cross_exit (replaces premium-decay TP) + same-direction
+# EOD rollover
+# ---------------------------------------------------------------------- #
+def _ist_ts(hour: int, minute: int, day: int = 10) -> int:
+    return int(datetime(2026, 7, day, hour, minute, tzinfo=_IST).timestamp())
+
+
+def test_ema_cross_exit_closes_long_when_trend_flips_against_it() -> None:
+    s = DchannelStrategy(dc_period=5, wr_period=5, ema_length=100,
+                         trend_ema_length=100, ema_cross_exit=True)
+    s._in_long = True
+    s._sl_level = 100.0        # far away -- must not be what fires
+    s._entry_level = 200.0
+    s._ema._value = 200.0
+    s._ema_trend._value = 190.0  # EMA(trend) below EMA(length) -> not bull-aligned
+    dec = s.update(_c(_BASE_TS, 205.0, 206.0, 204.0, 205.0))
+    assert dec is not None and dec.long_exit
+    assert dec.exit_reason == "EMA_CROSS"
+    assert s.position_state == PositionState.FLAT
+
+
+def test_ema_cross_exit_closes_short_when_trend_flips_against_it() -> None:
+    s = DchannelStrategy(dc_period=5, wr_period=5, ema_length=100,
+                         trend_ema_length=100, ema_cross_exit=True)
+    s._in_short = True
+    s._sl_level = 300.0
+    s._entry_level = 200.0
+    s._ema._value = 200.0
+    s._ema_trend._value = 210.0  # EMA(trend) above EMA(length) -> not bear-aligned
+    dec = s.update(_c(_BASE_TS, 195.0, 196.0, 194.0, 195.0))
+    assert dec is not None and dec.short_exit
+    assert dec.exit_reason == "EMA_CROSS"
+    assert s.position_state == PositionState.FLAT
+
+
+def test_ema_cross_exit_mode_disables_premium_tp_on_entry() -> None:
+    s = DchannelStrategy(dc_period=5, wr_period=5, ema_length=100,
+                         trend_ema_length=100, ema_cross_exit=True)
+    s._pending_long = True
+    s._pending_trigger = 100.0
+    s._pending_sl = 90.0
+    dec = s.update(_c(_BASE_TS, 99.0, 101.0, 98.0, 100.0))
+    assert dec is not None and dec.buy_signal
+    assert s._tp_level is None       # no premium/RR target -- only SL/EMA_CROSS/EOD can exit
+    assert s._entry_level == 100.0
+
+
+def test_eod_reentry_reopens_same_direction_at_next_session() -> None:
+    s = DchannelStrategy(dc_period=5, wr_period=5, ema_length=100, trend_ema_length=100,
+                         ema_cross_exit=True, reenter_same_direction_eod=True)
+    s._in_long = True
+    s._entry_level = 200.0
+    s._sl_level = 190.0          # risk = 10
+    s._ema._value = 200.0
+    s._ema_trend._value = 210.0  # bull-aligned -- EMA cross must NOT fire here
+    s.update(_c(_ist_ts(17, 24), 199.0, 200.0, 198.0, 199.0))  # seed prev_now_mins
+
+    dec = s.update(_c(_ist_ts(17, 25), 199.0, 200.0, 198.0, 199.0))  # square-off edge
+    assert dec is not None and dec.long_exit and dec.exit_reason == "EOD"
+    assert s.position_state == PositionState.FLAT
+    assert s._pending_reenter == ("long", 10.0)
+
+    dec_gap = s.update(_c(_ist_ts(17, 27), 199.0, 200.0, 198.0, 199.0))  # inside settlement gap
+    assert (dec_gap is None or not dec_gap.has_entry)
+    assert s.position_state == PositionState.FLAT
+    assert s._pending_reenter == ("long", 10.0)  # still armed, not fired yet
+
+    dec2 = s.update(_c(_ist_ts(17, 30), 205.0, 206.0, 204.0, 205.0))  # new session opens
+    assert dec2 is not None and dec2.buy_signal
+    assert s.position_state == PositionState.LONG
+    assert s._sl_level == 195.0  # candle.close(205) - risk(10)
+    assert s._pending_reenter is None
+
+
+def test_no_reentry_after_sl_exit_even_with_flag_on() -> None:
+    """Rollover only follows an EOD close -- an SL exit must not schedule one."""
+    s = DchannelStrategy(dc_period=5, wr_period=5, ema_length=100, trend_ema_length=100,
+                         ema_cross_exit=True, reenter_same_direction_eod=True)
+    s._in_long = True
+    s._entry_level = 200.0
+    s._sl_level = 190.0
+    s._ema._value = 200.0
+    s._ema_trend._value = 210.0
+    dec = s.update(_c(_BASE_TS, 191.0, 192.0, 189.0, 190.5))  # low <= sl -> SL exit
+    assert dec is not None and dec.exit_reason == "SL"
+    assert s._pending_reenter is None

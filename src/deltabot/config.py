@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     # Signal-range anchor: "ratchet" (legacy) or "highest_touch" (anchor at the
     # most-extreme DC-band-touching candle, full-span hi/lo, no reset).
     dchannel_anchor_mode: str = "ratchet"
+    # The DC-band-touching (anchor) candle must itself close on the right side of
+    # the EMA: DC-upper touch closes BELOW (bear), DC-lower touch ABOVE (bull).
+    dchannel_touch_ema_filter: bool = False
     # ASAP intracandle entry: open the option the instant REAL price breaks the
     # signal-range trigger, instead of waiting for the 5m close (matches the
     # backtest's trigger-price fill). Entry only; SL/TP still on close/poll.

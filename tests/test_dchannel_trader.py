@@ -7,7 +7,9 @@ logic (not OptionsExecutor's REST internals).
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -15,6 +17,8 @@ from deltabot.config import Settings
 from deltabot.core.dchannel_trader import DchannelEngine
 from deltabot.enums import NotifyEvent, PositionState, SignalDir
 from deltabot.models import Candle
+
+_dch_ist = ZoneInfo("Asia/Kolkata")
 
 
 class FakeExecutor:
@@ -264,3 +268,34 @@ async def test_selfheal_never_drops_position_on_fetch_error() -> None:
         await engine._maybe_verify_position()
     assert engine.executor.has_open_position        # a flaky API must NEVER flatten us
     assert engine._verify_misses == 0
+
+
+# ---------------------------------------------------------------------- #
+# 2026-07-14: DELTA_SKIP_WEEKDAYS now actually blocks new entries
+# ---------------------------------------------------------------------- #
+def test_entries_blocked_on_skip_weekday(monkeypatch) -> None:
+    engine = _make_engine(skip_weekdays="Sat,Sun")
+    saturday = datetime(2026, 7, 11, 12, 0, tzinfo=_dch_ist)  # 2026-07-11 is a Saturday
+
+    class _FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return saturday
+
+    import deltabot.core.dchannel_trader as mod
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)
+    assert engine._entries_blocked() is True
+
+
+def test_entries_not_blocked_on_non_skip_weekday(monkeypatch) -> None:
+    engine = _make_engine(skip_weekdays="Sat,Sun")
+    wednesday = datetime(2026, 7, 8, 12, 0, tzinfo=_dch_ist)  # 2026-07-08 is a Wednesday
+
+    class _FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wednesday
+
+    import deltabot.core.dchannel_trader as mod
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)
+    assert engine._entries_blocked() is False

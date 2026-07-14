@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -108,6 +108,16 @@ def run(candles, settings, args):
     win_start = int(time.time()) - args.days * 86400
     cache: dict = {}
     trips: list[dict] = []
+    # Trading "day" = the 17:30 IST session boundary. Shifting back by the day-start
+    # offset makes every candle in one session share a date key.
+    _ds_h = args.day_start_hour if args.day_start_hour is not None else settings.day_start_hour
+    _ds_m = args.day_start_minute if args.day_start_minute is not None else settings.day_start_minute
+    def day_key(ts: int):
+        return (datetime.fromtimestamp(ts, tz=_IST) - timedelta(hours=_ds_h, minutes=_ds_m)).date()
+    tp_day = None  # session in which a REAL take-profit already fired
+    _DOW = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+    _skip_days = {_DOW[t.strip().lower()[:3]] for t in (args.skip_weekdays or "").split(",")
+                  if t.strip().lower()[:3] in _DOW}
     paper_trips: list[dict] = []
     pos: dict | None = None
 
@@ -208,6 +218,7 @@ def run(candles, settings, args):
                         pos = None
                     else:
                         close("TP", pos["tp_price"], t_tp, btc_at(t_tp) or pos["entry_btc"])
+                        tp_day = day_key(c.start_time)   # target hit for this session
                 else:
                     pos["last_check"] = c.start_time
 
@@ -215,6 +226,15 @@ def run(candles, settings, args):
             #   BUY side : buy CALL on a buy signal / PUT on a sell signal.
             #   SELL side: sell PUT on a buy signal / CALL on a sell signal (same bias, sold).
             if pos is None and dec is not None and dec.has_entry:
+                if _skip_days and datetime.fromtimestamp(c.start_time, tz=_IST).weekday() in _skip_days:
+                    strategy.notify_exit(
+                        SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value, "SL")
+                    continue
+                if args.stop_after_daily_tp and tp_day == day_key(c.start_time):
+                    # Target already completed this session -> no further trades until 17:30.
+                    strategy.notify_exit(
+                        SignalDir.LONG.value if dec.buy_signal else SignalDir.SHORT.value, "SL")
+                    continue
                 # SL-band filter: percentage band (if set) takes precedence over
                 # the legacy fixed --max-sl-distance -- exactly like live.
                 out_of_band, sl_dist, band_reason = _sl_out_of_band(
@@ -301,6 +321,12 @@ def main() -> None:
     # inflated/wrong NET$ numbers. Run bare (just --days) to reproduce live;
     # override any flag explicitly for a deliberate comparison study.
     # ---------------------------------------------------------------- #
+    ap.add_argument("--skip-weekdays", default="",
+                    help="comma-separated IST days whose NEW entries are blocked (exits still run), "
+                         "e.g. 'Sat,Sun'")
+    ap.add_argument("--stop-after-daily-tp", action="store_true",
+                    help="once a take-profit fires, take NO further trades for the rest of that "
+                         "session (resumes at the next 17:30 day boundary)")
     ap.add_argument("--intrinsic-floor", action="store_true",
                     help="floor every option premium to intrinsic value (fixes illiquid-ITM candles "
                          "that print BELOW intrinsic and inflate the backtest -- 2026-07-12)")
