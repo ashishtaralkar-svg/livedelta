@@ -15,23 +15,25 @@
 //   REPLACED by a persistent trend gate: BUY needs EMA(50) > EMA(200); SELL
 //   needs EMA(50) < EMA(200) (both EMAs on HA close).
 //
-// 2026-07-14 UPDATE #2 (exit): there is NO take-profit at all anymore -- the
-//   -70% option-premium TP is REMOVED, not even the earlier optional
-//   BTC-%-price placeholder. The position's ONLY profit-taking-equivalent
-//   exit is now the EMA(50)/EMA(200) TREND-FLIP: a long exits the instant
-//   EMA(50) is no longer above EMA(200); a short exits the instant EMA(50) is
-//   no longer below EMA(200). SL and EOD square-off are UNCHANGED and still
-//   take priority (checked in this order: SL, then EMA-cross, then EOD).
+// 2026-07-14 UPDATE #2 (trailing SL, replaces the option TP): there is NO
+//   take-profit at all -- the -70% option-premium TP is REMOVED. Instead the
+//   fixed SL (signal range low/high) becomes a TRAILING stop once the EMA
+//   relationship agrees with the position (the SAME condition required to
+//   enter): each bar, while EMA(50) stays above EMA(200) for a long, SL :=
+//   max(current SL, EMA(200)) -- ratchets UP toward EMA(200), never loosens.
+//   Mirror for a short: while EMA(50) stays below EMA(200), SL :=
+//   min(current SL, EMA(200)) -- ratchets DOWN, never loosens. If the EMA
+//   relationship flips against the position, the SL simply stops advancing
+//   (holds at its best level reached so far) rather than reversing -- the
+//   trade then exits naturally once price actually touches that trailed
+//   level, not on the cross itself. This mirrors the SAME arm/tighten
+//   pattern already used by this codebase's HeikinAshi bot (max(existing,
+//   trail level), only ever tightens). EOD square-off is unchanged.
 //
-// HONESTY CHECK: the closest backtest available for this shape (Python
-// strategy, --intrinsic-floor, 1 month, 5m, live sizing) is the EMA-cross-exit
-// variant WITH an added same-direction EOD rollover (which this Pine script
-// does NOT include): NET -$33.71 (no weekend skip) / -$20.14 (Sat+Sun
-// skipped) -- both worse than the currently-DEPLOYED decay-TP config's
-// +$31.89. This simpler no-rollover combination hasn't been separately
-// backtested, but every EMA-cross-exit variant tried this session has
-// underperformed the deployed baseline. This script is a faithful port of
-// the change as requested, not a recommendation to deploy it live.
+// HONESTY CHECK: this exact trailing-SL design has NOT been backtested (the
+// earlier note about a "-$33.71 EMA-cross-exit" variant referred to a
+// DIFFERENT, hard-exit-on-cross mechanism that this version no longer uses --
+// disregard that number). Treat this script as unvalidated until backtested.
 //
 // What the live bot does (and what this script mirrors):
 //   * CHART BASIS: synthetic Heikin Ashi, fetched via
@@ -73,8 +75,9 @@
 //   falls -- so on the BTC price chart the directional P&L is equivalent to
 //   LONG (bullish) / SHORT (bearish), which is how this strategy maps them.
 //   The bot's REAL take-profit is normally a -70% drop in the OPTION premium
-//   -- this script REPLACES that entirely with the EMA(50)/EMA(200)
-//   trend-flip exit described above (per request). There is no other TP.
+//   -- this script REPLACES that entirely with the EMA(50)/EMA(200) trailing
+//   SL described above (per request). There is no separate TP; the trade
+//   exits when REAL price touches the (possibly-trailed) SL, or at EOD.
 //
 // LIMITATION — weekend block: live, a signal that completes on a blocked day
 //   (Sat/Sun) still occupies the strategy's "in position" bookkeeping
@@ -219,24 +222,26 @@ if squareOff or inGap
     anchorLoBull := na
     anchorHiBear := na
 
-// ----- 1/2. Exits, in PRIORITY order (mirrors dchannel.py exactly): fixed SL
-//            (BTC signal-range extreme) first, then the EMA(50)/EMA(200)
-//            trend-flip exit (the ONLY profit-taking-equivalent exit -- there
-//            is no TP), then EOD square-off as the final fallback. -----
+// ----- 1/2. Exits: check the EXISTING (pre-this-bar) SL first -- if not hit,
+//            tighten it for FUTURE bars using this bar's EMA(200) (trailing,
+//            arm/tighten style, matches the HeikinAshi bot's existing
+//            pattern), then EOD square-off. No separate TP. -----
 if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
-    else if not (emaTrend > emaLong)
-        strategy.close("Long", comment="EMA_CROSS")
-    else if squareOff
-        strategy.close("Long", comment="EOD")
+    else
+        if emaTrend > emaLong
+            longStop := math.max(longStop, emaLong)   // ratchets UP only
+        if squareOff
+            strategy.close("Long", comment="EOD")
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
-    else if not (emaTrend < emaLong)
-        strategy.close("Short", comment="EMA_CROSS")
-    else if squareOff
-        strategy.close("Short", comment="EOD")
+    else
+        if emaTrend < emaLong
+            shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
+        if squareOff
+            strategy.close("Short", comment="EOD")
 
 // ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
 //          Weekend block ONLY gates the real order here -- matches the live
