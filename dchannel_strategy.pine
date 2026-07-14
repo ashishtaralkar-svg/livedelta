@@ -247,12 +247,15 @@ if strategy.position_size < 0
 //          Weekend block ONLY gates the real order here -- matches the live
 //          engine, where the hunt/confirm machinery below is NOT weekday-aware,
 //          only the final strategy.entry() placement is. -----
+buyFired = false   // resets to false every bar; set true exactly when a BUY (Long) fires
+sellFired = false  // resets to false every bar; set true exactly when a SELL (Short) fires
 flatNow = strategy.position_size == 0
 if flatNow and not squareOff and not inGap and pendingLong
     if high >= pendingTrigger
         if not dayBlocked
             strategy.entry("Long", strategy.long, stop=pendingTrigger)
             longStop := pendingSL
+            buyFired := true
         pendingLong := false
     else if low <= pendingSL
         pendingLong := false   // invalidated before the trigger ever fired
@@ -263,6 +266,7 @@ else if flatNow and not squareOff and not inGap and pendingShort
         if not dayBlocked
             strategy.entry("Short", strategy.short, stop=pendingTrigger)
             shortStop := pendingSL
+            sellFired := true
         pendingShort := false
     else if high >= pendingSL
         pendingShort := false
@@ -352,8 +356,15 @@ if flatForHunt and (not useWR or not na(wr))
 // ============================================================
 // Plotting / markers
 // ============================================================
+// Small markers when a setup ARMS (signal range confirmed, waiting for the trigger break).
 plotshape(pendingLong  and pendingLong[1]  != pendingLong,  "Armed Bullish (sell PUT)",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
 plotshape(pendingShort and pendingShort[1] != pendingShort, "Armed Bearish (sell CALL)", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
+
+// Prominent labeled markers exactly when a trade FIRES (both directions).
+plotshape(buyFired,  title="BUY SIGNAL (sell PUT)",   style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellFired, title="SELL SIGNAL (sell CALL)", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.small, text="SELL")
 bgcolor(inGap ? color.new(color.gray, 90) : na, title="Settlement gap")
 bgcolor(dayBlocked ? color.new(color.blue, 92) : na, title="Weekend block")
 
