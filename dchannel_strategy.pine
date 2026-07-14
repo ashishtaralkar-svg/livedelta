@@ -1,0 +1,350 @@
+//@version=5
+// ============================================================================
+// DchannelBot — TradingView port of the LIVE strategy
+//   Source of truth: src/deltabot/strategy/dchannel.py + dchannel_trader.py,
+//   cross-checked against scripts/backtest_dchannel.py.
+//   DEPLOYED config (dchannelbot, since 2026-07-12): 5-minute chart, Donchian(20)
+//   + open==high/low confirm on synthetic Heikin Ashi, Williams %R gate OFF
+//   (hunts on every DC touch), "highest_touch" anchor (re-anchors to the MOST
+//   extreme band-touching candle, no ratchet-reset), day boundary 17:30 IST,
+//   EOD square-off 17:25 IST, target premium ~1000, -70% option TP, weekend
+//   (Sat+Sun) new-entry block.
+//
+// 2026-07-14 UPDATE (this script): the confirming candle NO LONGER needs its
+//   own HA close above/below EMA(200). That single-EMA close check is REPLACED
+//   by a persistent trend gate: BUY needs EMA(50) > EMA(200); SELL needs
+//   EMA(50) < EMA(200) (both EMAs on HA close). Backtested (--intrinsic-floor,
+//   honest pricing, 1 month, 5m, live sizing): this variant NET -$9.18 vs the
+//   currently-DEPLOYED single-EMA-close version's NET +$31.89 -- i.e. this
+//   config is NOT what's live and backtested WORSE. This script is a faithful
+//   port of the change as requested, not a recommendation to deploy it.
+//
+// What the live bot does (and what this script mirrors):
+//   * CHART BASIS: synthetic Heikin Ashi, fetched via
+//     request.security(ticker.heikinashi(...)) so the pattern is correct
+//     regardless of your chart's own candle style. Pattern LEVELS (trigger,
+//     SL, EMAs) come from HA; whether price actually CROSSES those levels
+//     (entry fill, invalidation, SL) is always checked against REAL price.
+//   * DONCHIAN(20) on HA, PRIOR 20 closed bars (current bar excluded).
+//   * ANCHOR ("highest_touch"): a candle whose HA extreme touches the DC band
+//     starts a signal range. A LATER, MORE-extreme touch (lower high for bull,
+//     higher low... i.e. bull re-anchors on a lower low, bear on a higher
+//     high) RESETS the range to start fresh from it; anything else just widens
+//     the existing range's high/low. No ratchet-by-%R (that legacy mode isn't
+//     live).
+//   * CONFIRM: a candle with HA open == HA extreme (bull: open==low, no lower
+//     wick; bear: open==high, no upper wick) AND the EMA(50) vs EMA(200) trend
+//     gate satisfied. The signal range's final hi/lo includes this candle.
+//   * ENTRY: ASAP the instant REAL price breaks the signal range's far edge
+//     (above the high for bull, below the low for bear).
+//   * PRE-ENTRY INVALIDATION: if REAL price hits the range's near edge (the
+//     stop side) before the trigger, the setup is discarded untraded.
+//   * STOP-LOSS: REAL price touching the signal range's opposite extreme,
+//     fixed for the life of the trade.
+//   * WILLIAMS %R(14) gate: OFF by default (matches live) -- both directions
+//     hunt on every Donchian touch. Toggle on to require %R oversold/
+//     overbought before a hunt arms (this codebase's %R convention ranges
+//     0..-100, never positive).
+//   * WEEKEND BLOCK: new REAL entries are suppressed on Sat/Sun (matches the
+//     live DELTA_SKIP_WEEKDAYS fix, 2026-07-14). The hunt/pending state
+//     machine keeps running underneath -- exactly like the live engine, only
+//     the final strategy.entry() is gated, so a setup armed on a blocked day
+//     can still fire once an unblocked day arrives.
+//   * EOD square-off 17:25 IST; 17:25-17:30 settlement gap blocks new entries
+//     and cancels any pending (untriggered) setup outright.
+//
+// IMPORTANT — how the bot trades vs what this chart shows:
+//   The bot SELLS options: bullish signal -> SELL a PUT, bearish -> SELL a
+//   CALL. A sold PUT profits when BTC rises; a sold CALL profits when BTC
+//   falls -- so on the BTC price chart the directional P&L is equivalent to
+//   LONG (bullish) / SHORT (bearish), which is how this strategy maps them.
+//   The bot's real take-profit is a -70% drop in the OPTION premium, which
+//   cannot be computed from BTC price alone. This script exits ONLY on the
+//   BTC stop-loss or EOD (the "worst case" path, no TP) unless you enable the
+//   optional experimental BTC % TP below. Live results differ from this
+//   script because the -70% premium TP closes many trades early.
+//
+// LIMITATION — weekend block: live, a signal that completes on a blocked day
+//   (Sat/Sun) still occupies the strategy's "in position" bookkeeping
+//   internally (tracked against its own SL/EOD) even though no real order was
+//   placed, which pauses new hunting until that phantom trade's SL/EOD would
+//   have fired. This script does NOT replicate that pause -- it simply resumes
+//   hunting immediately on the next bar. Only matters for setups that
+//   specifically trigger ON a blocked day; does not affect weekday behavior.
+// ============================================================================
+strategy("DchannelBot — Bot-faithful Strategy (EMA50/200 gate variant)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpDC = "Donchian / Heikin Ashi"
+dcPeriod = input.int(20, "Donchian Period", minval=2, group=grpDC)
+
+grpEMA = "EMA Trend Gate (2026-07-14 update)"
+emaTrendLen = input.int(50,  "EMA(50) length",  minval=1, group=grpEMA,
+     tooltip="BUY needs EMA(this) > EMA(Long length); SELL needs EMA(this) < EMA(Long length). Replaces the old single close-vs-EMA(200) check.")
+emaLongLen  = input.int(200, "EMA(200) length", minval=1, group=grpEMA)
+
+grpWR = "Williams %R Gate (OFF matches live)"
+useWR    = input.bool(false, "Require Williams %R oversold/overbought to arm a hunt", group=grpWR)
+wrPeriod = input.int(14, "Williams %R Period", minval=1, group=grpWR)
+wrLevel  = input.float(80.0, "Williams %R Level (arms bull below -level, bear above -(100-level))", group=grpWR)
+
+grpDay = "Day Boundary / Square-Off (IST)"
+dayTZ       = input.string("Asia/Kolkata", "Timezone", group=grpDay)
+dayStartHr  = input.int(17, "New Day Start Hour",   minval=0, maxval=23, group=grpDay)
+dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpDay)
+sqOffHr     = input.int(17, "Square-Off Hour",   minval=0, maxval=23, group=grpDay)
+sqOffMin    = input.int(25, "Square-Off Minute", minval=0, maxval=59, group=grpDay)
+
+grpFilter = "Day-of-Week Filter (matches live DELTA_SKIP_WEEKDAYS)"
+skipSat = input.bool(true, "Block new entries on Saturday (IST)", group=grpFilter)
+skipSun = input.bool(true, "Block new entries on Sunday (IST)",   group=grpFilter)
+
+grpTP = "Optional price TP (NOT the real -70% option TP)"
+useBtcTP = input.bool(false, "Enable a BTC % take-profit", group=grpTP,
+     tooltip="For experimentation only. The live bot's TP is -70% of OPTION premium, which cannot be modeled from BTC price alone.")
+btcTPpct = input.float(1.0, "BTC move % for TP", step=0.1, minval=0.1, group=grpTP)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (built-in TradingView HA ticker -- matches the
+// Python formula exactly: ha_close=(o+h+l+c)/4, ha_open=(prevO+prevC)/2
+// seeded (o+c)/2, ha_high/low = max/min(real, haOpen, haClose)).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// Tolerant equality for HA-derived open==extreme checks (matches the
+// codebase's convention used in btc_heikinashi_strategy.pine).
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+
+// ============================================================
+// Donchian(20) on HA, PRIOR closed bars only (current bar excluded via [1]).
+// ============================================================
+dcUpper = ta.highest(haHigh[1], dcPeriod)
+dcLower = ta.lowest(haLow[1], dcPeriod)
+plot(dcUpper, "Donchian Upper (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+plot(dcLower, "Donchian Lower (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+
+// ============================================================
+// EMA trend gate (replaces the old close-vs-EMA200 confirm check)
+// ============================================================
+emaTrend = ta.ema(haClose, emaTrendLen)
+emaLong  = ta.ema(haClose, emaLongLen)
+plot(emaTrend, "EMA(trend/50)", color=color.new(color.aqua, 0),   linewidth=2)
+plot(emaLong,  "EMA(long/200)", color=color.new(color.orange, 0), linewidth=2)
+
+// ============================================================
+// Williams %R(14) on HA -- this codebase's convention: 0 = most overbought,
+// -100 = most oversold (NEVER positive). Push-then-read (current bar included).
+// ============================================================
+wrHH = ta.highest(haHigh, wrPeriod)
+wrLL = ta.lowest(haLow, wrPeriod)
+wr   = wrHH != wrLL ? (wrHH - haClose) / (wrHH - wrLL) * -100.0 : na
+
+// ============================================================
+// Time windows: square-off 17:25, settlement gap 17:25-17:30, day-of-week
+// ============================================================
+sqMins   = sqOffHr * 60 + sqOffMin
+sessMins = dayStartHr * 60 + dayStartMin
+nowMins  = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOff = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+inGap     = nowMins >= sqMins and nowMins < sessMins
+
+dow = dayofweek(time, dayTZ)
+dayBlocked = (skipSat and dow == dayofweek.saturday) or (skipSun and dow == dayofweek.sunday)
+
+// ============================================================
+// State machine — mirrors dchannel.py (hunt / touch / anchor / pending / SL)
+// ============================================================
+var bool  huntBull = false
+var bool  huntBear = false
+var bool  touchedBull = false
+var bool  touchedBear = false
+var float rangeHiBull = na
+var float rangeLoBull = na
+var float rangeHiBear = na
+var float rangeLoBear = na
+var float anchorLoBull = na
+var float anchorHiBear = na
+
+var bool  pendingLong = false
+var bool  pendingShort = false
+var float pendingTrigger = na
+var float pendingSL = na
+var float longStop = na
+var float shortStop = na
+
+// ----- 0. Settlement gap: cancel pending + clear hunts -----
+if squareOff or inGap
+    if pendingLong or pendingShort
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+    pendingLong := false
+    pendingShort := false
+    huntBull := false
+    huntBear := false
+    touchedBull := false
+    touchedBear := false
+    rangeHiBull := na
+    rangeLoBull := na
+    rangeHiBear := na
+    rangeLoBear := na
+    anchorLoBull := na
+    anchorHiBear := na
+
+// ----- 1. EOD square-off (fires before the per-position stop refresh below) -----
+if squareOff
+    strategy.close_all(comment="EOD")
+
+// ----- 2. Protective stop-loss (BTC signal-range extreme; fixed at entry) --
+//          Uses strategy.exit's stop= so the fill lands exactly at the SL
+//          level when crossed, matching revbreak_strategy.pine's pattern. -----
+if strategy.position_size > 0
+    strategy.exit("Long X",  from_entry="Long",  stop=longStop,
+         limit = useBtcTP ? strategy.position_avg_price * (1 + btcTPpct / 100) : na)
+if strategy.position_size < 0
+    strategy.exit("Short X", from_entry="Short", stop=shortStop,
+         limit = useBtcTP ? strategy.position_avg_price * (1 - btcTPpct / 100) : na)
+
+// ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
+//          Weekend block ONLY gates the real order here -- matches the live
+//          engine, where the hunt/confirm machinery below is NOT weekday-aware,
+//          only the final strategy.entry() placement is. -----
+flatNow = strategy.position_size == 0
+if flatNow and not squareOff and not inGap and pendingLong
+    if high >= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Long", strategy.long, stop=pendingTrigger)
+            longStop := pendingSL
+        pendingLong := false
+    else if low <= pendingSL
+        pendingLong := false   // invalidated before the trigger ever fired
+    else if not dayBlocked
+        strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
+else if flatNow and not squareOff and not inGap and pendingShort
+    if low <= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Short", strategy.short, stop=pendingTrigger)
+            shortStop := pendingSL
+        pendingShort := false
+    else if high >= pendingSL
+        pendingShort := false
+    else if not dayBlocked
+        strategy.entry("Short", strategy.short, stop=pendingTrigger)
+
+// ----- 4. Hunt state machine (HA-based), only while flat/no pending/gates ok -----
+flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap
+if flatForHunt and (not useWR or not na(wr))
+    if useWR
+        // %R crossing arms (or switches) a hunt. Convention: 0=overbought, -100=oversold.
+        crossedBull = wr < -wrLevel
+        crossedBear = wr > -(100.0 - wrLevel)
+        if crossedBull and not huntBull
+            huntBull := true
+            huntBear := false
+            touchedBear := false
+            rangeHiBear := na
+            rangeLoBear := na
+        else if crossedBear and not huntBear
+            huntBear := true
+            huntBull := false
+            touchedBull := false
+            rangeHiBull := na
+            rangeLoBull := na
+    else
+        huntBull := true
+        huntBear := true
+
+    // Bullish hunt progression.
+    if huntBull and not na(dcLower)
+        if not touchedBull
+            if low <= dcLower
+                touchedBull := true
+                rangeHiBull := haHigh
+                rangeLoBull := haLow
+                anchorLoBull := haLow
+        else
+            reanchorBull = low <= dcLower and haLow < anchorLoBull
+            if reanchorBull
+                rangeHiBull := haHigh
+                rangeLoBull := haLow
+                anchorLoBull := haLow
+            else
+                rangeHiBull := math.max(rangeHiBull, haHigh)
+                rangeLoBull := math.min(rangeLoBull, haLow)
+            // CONFIRM (2026-07-14 update): open==low shape only; the old
+            // "HA close above EMA(200)" check is REPLACED by the EMA50>EMA200
+            // trend gate (no dependency on this candle's own close vs EMA).
+            if eq(haOpen, haLow) and emaTrend > emaLong
+                pendingLong := true
+                pendingTrigger := rangeHiBull
+                pendingSL := rangeLoBull
+                huntBull := false
+                touchedBull := false
+                rangeHiBull := na
+                rangeLoBull := na
+                anchorLoBull := na
+
+    // Bearish hunt progression (mirror).
+    if huntBear and not na(dcUpper)
+        if not touchedBear
+            if high >= dcUpper
+                touchedBear := true
+                rangeHiBear := haHigh
+                rangeLoBear := haLow
+                anchorHiBear := haHigh
+        else
+            reanchorBear = high >= dcUpper and haHigh > anchorHiBear
+            if reanchorBear
+                rangeHiBear := haHigh
+                rangeLoBear := haLow
+                anchorHiBear := haHigh
+            else
+                rangeHiBear := math.max(rangeHiBear, haHigh)
+                rangeLoBear := math.min(rangeLoBear, haLow)
+            if eq(haOpen, haHigh) and emaTrend < emaLong
+                pendingShort := true
+                pendingTrigger := rangeLoBear
+                pendingSL := rangeHiBear
+                huntBear := false
+                touchedBear := false
+                rangeHiBear := na
+                rangeLoBear := na
+                anchorHiBear := na
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(pendingLong  and pendingLong[1]  != pendingLong,  "Armed Bullish (sell PUT)",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(pendingShort and pendingShort[1] != pendingShort, "Armed Bearish (sell CALL)", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
+bgcolor(inGap ? color.new(color.gray, 90) : na, title="Settlement gap")
+bgcolor(dayBlocked ? color.new(color.blue, 92) : na, title="Weekend block")
+
+inPos    = strategy.position_size != 0
+activeSL = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+armed = (pendingLong or pendingShort) and not inPos
+plot(armed ? pendingTrigger : na, "Pending Trigger", color=color.new(color.aqua, 0),   style=plot.style_circles, linewidth=2)
+plot(armed ? pendingSL      : na, "Pending SL",      color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2)
