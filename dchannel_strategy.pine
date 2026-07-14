@@ -226,9 +226,11 @@ if squareOff or inGap
 //            tighten it for FUTURE bars using this bar's EMA(200) (trailing,
 //            arm/tighten style, matches the HeikinAshi bot's existing
 //            pattern), then EOD square-off. No separate TP. -----
+justClosedSL = false   // resets false every bar; true only on the exact bar an SL fires
 if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
+        justClosedSL := true
     else
         if emaTrend > emaLong
             longStop := math.max(longStop, emaLong)   // ratchets UP only
@@ -237,6 +239,7 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
+        justClosedSL := true
     else
         if emaTrend < emaLong
             shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
@@ -274,7 +277,11 @@ else if flatNow and not squareOff and not inGap and pendingShort
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
 
 // ----- 4. Hunt state machine (HA-based), only while flat/no pending/gates ok -----
-flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap
+// justClosedSL: after an SL, hunting is skipped for THIS bar so a fresh DC
+// touch is required starting the NEXT bar (the SL-firing bar itself can never
+// double as the re-touch) -- "if SL hit, wait for a candle to touch DC
+// low/high again" per request.
+flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap and not justClosedSL
 if flatForHunt and (not useWR or not na(wr))
     if useWR
         // %R crossing arms (or switches) a hunt. Convention: 0=overbought, -100=oversold.
