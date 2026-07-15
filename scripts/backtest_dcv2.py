@@ -88,6 +88,13 @@ def _ist_mins(ts: int) -> int:
     return d.hour * 60 + d.minute
 
 
+def _first_decay_time(candles: dict, after: int, upto: int, tp_price: float) -> int | None:
+    """Earliest option-candle start_time in (after, upto] whose LOW decayed
+    DOWN to tp_price -- the sell-side decay take-profit."""
+    hit = [t for t, c in candles.items() if after < t <= upto and c.low <= tp_price]
+    return min(hit) if hit else None
+
+
 def _make_strategy(args) -> DCv2Strategy:
     return DCv2Strategy(
         dc_period=args.dc_period,
@@ -192,6 +199,7 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
     es = args.entry_slippage_pct / 100.0
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
+    tp_decay = args.tp_decay_pct / 100.0   # 0 = off; 0.70 -> buy back at 30% of entry
     sq_mins = args.square_off_hour * 60 + args.square_off_minute
     sess_mins = args.day_start_hour * 60 + args.day_start_minute
     cache: dict = {}
@@ -217,7 +225,9 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
         if floor:
             entry_prem = max(entry_prem, op.intrinsic_value(sym, btc_px))
         pos = {"is_buy": is_buy, "sym": sym, "candles": ocandles, "entry_time": ts,
-               "entry_btc": btc_px, "entry_prem": entry_prem, "sl_level": sl_level, "tag": tag}
+               "entry_btc": btc_px, "entry_prem": entry_prem, "sl_level": sl_level, "tag": tag,
+               "tp_price": entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None,
+               "last_check": ts}
         return True
 
     def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float) -> None:
@@ -256,6 +266,22 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
                 eprice = dec.long_exit_price if dec.long_exit else dec.short_exit_price
                 close(dec.exit_reason, buyback_prem(c.start_time, eprice), c.start_time, eprice)
 
+            # 1b. Decay take-profit (only if no strategy exit this bar, matching
+            #     the conservative "strategy exit first" convention): buy the
+            #     option back once its premium has decayed to tp_price. Booking
+            #     the profit ENDS the trade -- flatten the strategy so it hunts
+            #     a fresh signal instead of rolling the position over. The
+            #     intrinsic floor blocks an impossible decay below intrinsic.
+            if pos is not None and tp_decay > 0 and pos["tp_price"] is not None:
+                can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
+                t_tp = (_first_decay_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"])
+                        if can_decay else None)
+                if t_tp is not None:
+                    close("TP", pos["tp_price"], t_tp, c.close)
+                    strategy.force_flat()
+                else:
+                    pos["last_check"] = c.start_time
+
             # 2. 17:25 EOD square-off: close the option (the directional trade
             #    itself keeps running inside the strategy across the gap).
             if pos is not None and square_off:
@@ -285,8 +311,9 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
 
 def report_option(trades: list[dict], args) -> None:
     print(f"\n{'=' * 122}")
+    tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no TP"
     print(f"DCv2 [OPTION SELL, 17:25 square-off + 17:30 rollover] -- {args.days}d, {args.resolution}, "
-          f"premium ~{args.target_premium:.0f}, {args.lots} lots, "
+          f"premium ~{args.target_premium:.0f}, {args.lots} lots, {tp_txt}, "
           f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}, "
           f"weekends {'TRADED' if args.no_skip_weekends else 'blocked'}")
     print(f"{'=' * 122}")
@@ -306,7 +333,7 @@ def report_option(trades: list[dict], args) -> None:
           + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "EMA_CROSS", "TRAIL", "EOD", "OPEN_AT_END"):
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -341,6 +368,9 @@ def main() -> None:
     p.add_argument("--exit-slippage-pct", type=float, default=0.0)
     p.add_argument("--no-intrinsic-floor", action="store_true",
                    help="[option mode] disable intrinsic-value flooring (NOT recommended)")
+    p.add_argument("--tp-decay-pct", type=float, default=0.0,
+                   help="[option mode] book profit when the sold option decays this %% "
+                        "(e.g. 70 -> buy back at 30%% of entry premium; 0 = off)")
     args = p.parse_args()
 
     setup_logging("WARNING")
