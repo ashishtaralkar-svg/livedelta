@@ -29,7 +29,7 @@
 //   moves at all. This mirrors this codebase's HeikinAshi bot's arm/tighten
 //   pattern (max(existing, trail level), only ever tightens), but the ARMING
 //   trigger here is specifically the adverse crossover event, not "while
-//   favorable". EOD square-off is unchanged.
+//   favorable". (EOD square-off has since been removed -- see UPDATE #4.)
 //
 // 2026-07-15 UPDATE #3 (hunt trigger, supersedes part of UPDATE #1): a new
 //   signal search no longer runs continuously in both directions. It ARMS
@@ -42,6 +42,14 @@
 //   DC band, then a candle with HA open == that extreme. Evaluated every bar
 //   (not just while flat) so a cross that happens mid-trade still arms the
 //   next hunt the instant the position goes flat.
+//
+// 2026-07-15 UPDATE #4 (no EOD close): the 17:25 daily square-off no longer
+//   closes an open position. Once a trade is triggered it exits ONLY when
+//   real price touches its SL (the fixed signal-range extreme, or the
+//   trailed level once EMA(50) has crossed EMA(200) against it, whichever is
+//   more favorable). The 17:25-17:30 settlement window still blocks NEW
+//   entries and cancels any un-triggered pending setup -- it just never
+//   force-closes a live trade anymore.
 //
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
@@ -79,8 +87,9 @@
 //     machine keeps running underneath -- exactly like the live engine, only
 //     the final strategy.entry() is gated, so a setup armed on a blocked day
 //     can still fire once an unblocked day arrives.
-//   * EOD square-off 17:25 IST; 17:25-17:30 settlement gap blocks new entries
-//     and cancels any pending (untriggered) setup outright.
+//   * NO EOD square-off (UPDATE #4): the 17:25-17:30 settlement gap blocks
+//     new entries and cancels any pending (untriggered) setup, but does NOT
+//     close a live position -- an open trade exits only on its SL.
 //
 // IMPORTANT — how the bot trades vs what this chart shows:
 //   The bot SELLS options: bullish signal -> SELL a PUT, bearish -> SELL a
@@ -89,13 +98,14 @@
 //   LONG (bullish) / SHORT (bearish), which is how this strategy maps them.
 //   The bot's REAL take-profit is normally a -70% drop in the OPTION premium
 //   -- this script REPLACES that entirely with the EMA(50)/EMA(200) trailing
-//   SL described above (per request). There is no separate TP; the trade
-//   exits when REAL price touches the (possibly-trailed) SL, or at EOD.
+//   SL described above (per request). There is no separate TP and no EOD
+//   close; the trade exits ONLY when REAL price touches the (possibly-
+//   trailed) SL.
 //
 // LIMITATION — weekend block: live, a signal that completes on a blocked day
 //   (Sat/Sun) still occupies the strategy's "in position" bookkeeping
 //   internally (tracked against its own SL/EOD) even though no real order was
-//   placed, which pauses new hunting until that phantom trade's SL/EOD would
+//   placed, which pauses new hunting until that phantom trade's SL would
 //   have fired. This script does NOT replicate that pause -- it simply resumes
 //   hunting immediately on the next bar. Only matters for setups that
 //   specifically trigger ON a blocked day; does not affect weekday behavior.
@@ -293,8 +303,8 @@ if strategy.position_size > 0
             trailArmedLong := true
         if trailArmedLong
             longStop := math.max(longStop, emaLong)   // ratchets UP only
-        if squareOff
-            strategy.close("Long", comment="EOD")
+        // No EOD/time-based close (2026-07-15): the trade exits ONLY when
+        // real price touches the (possibly-trailed) SL.
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
@@ -304,8 +314,7 @@ if strategy.position_size < 0
             trailArmedShort := true
         if trailArmedShort
             shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
-        if squareOff
-            strategy.close("Short", comment="EOD")
+        // No EOD/time-based close (2026-07-15): exits ONLY on the SL.
 
 // ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
 //          Weekend block ONLY gates the real order here -- matches the live
