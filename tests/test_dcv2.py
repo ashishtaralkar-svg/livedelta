@@ -118,9 +118,10 @@ def test_weekend_block_consumes_trigger_without_trade() -> None:
     assert not s.has_pending and s.position_state == PositionState.FLAT
 
 
-def test_buy_below_both_emas_disables_ema_exit_sl_only() -> None:
-    """2026-07-15 update: a BUY whose trigger sits BELOW both EMAs keeps only
-    the fixed range-low SL -- the EMA-reversal exit is off for that trade."""
+def test_buy_below_both_emas_uses_trail_mode_sl_until_armed() -> None:
+    """A BUY triggering BELOW both EMAs enters "trail" mode: only the fixed
+    range-low SL is live until the trail arms, and the EMA relationship
+    flipping does NOT close it."""
     s = _strategy()
     for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):        # bull warmup, EMAs ~101-103
         s.update(_c(_ts(10, 0) + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
@@ -128,19 +129,35 @@ def test_buy_below_both_emas_disables_ema_exit_sl_only() -> None:
 
     d = s.update(_c(_ts(10, 20), 94.0, 96.0, 93.0, 95.0))        # triggers at 95, below both EMAs
     assert d is not None and d.buy_signal and d.entry_price == 95.0
-    assert s._ema_exit_enabled is False
+    assert s._exit_mode == "trail" and s._trail_armed is False
 
-    # EMA2 is now below EMA4 (relationship against the long) -- must NOT close.
+    # Close below both EMAs while NOT armed: neither EMA_CROSS nor TRAIL fires.
     d = s.update(_c(_ts(10, 25), 95.0, 96.0, 94.0, 95.0))
     assert d is None and s.position_state == PositionState.LONG
 
     d = s.update(_c(_ts(10, 30), 95.0, 95.5, 89.0, 89.5))        # SL still live at 90
     assert d is not None and d.long_exit and d.exit_reason == "SL"
     assert d.long_exit_price == pytest.approx(90.0)
-    assert s._ema_exit_enabled is True                            # reset for the next trade
+    assert s._exit_mode == "cross"                                # reset for the next trade
 
 
-def test_sell_above_both_emas_disables_ema_exit_sl_only() -> None:
+def test_buy_trail_arms_above_both_emas_then_close_below_exits() -> None:
+    s = _strategy()
+    for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):
+        s.update(_c(_ts(10, 0) + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
+    s._pending_long, s._pending_trigger, s._pending_sl = True, 95.0, 90.0
+    s.update(_c(_ts(10, 20), 94.0, 96.0, 93.0, 95.0))            # entry at 95 (trail mode)
+
+    d = s.update(_c(_ts(10, 25), 110.0, 122.0, 109.0, 120.0))    # closes far above both EMAs
+    assert d is None and s._trail_armed is True                   # armed, trade stays open
+
+    d = s.update(_c(_ts(10, 30), 96.0, 97.0, 94.0, 95.0))        # closes below both, low > SL 90
+    assert d is not None and d.long_exit and d.exit_reason == "TRAIL"
+    assert d.long_exit_price == pytest.approx(95.0)               # exits at the close
+    assert s.position_state == PositionState.FLAT
+
+
+def test_sell_above_both_emas_uses_trail_mode() -> None:
     s = _strategy()
     for i, cl in enumerate((103.0, 102.0, 101.0, 100.0)):        # bear warmup, EMAs ~100-102
         s.update(_c(_ts(10, 0) + i * 300, cl + 0.5, cl + 1.0, cl - 0.5, cl))
@@ -148,9 +165,9 @@ def test_sell_above_both_emas_disables_ema_exit_sl_only() -> None:
 
     d = s.update(_c(_ts(10, 20), 111.0, 112.0, 109.0, 110.5))    # triggers at 110, above both EMAs
     assert d is not None and d.sell_signal and d.entry_price == 110.0
-    assert s._ema_exit_enabled is False
+    assert s._exit_mode == "trail" and s._trail_armed is False
 
-    # Rising closes flip EMA2 above EMA4 (against the short) -- must NOT close.
+    # Closes above both EMAs (against the short) while NOT armed: no exit.
     d = None
     for i, cl in enumerate((111.0, 112.0, 113.0)):
         d = s.update(_c(_ts(10, 25 + 5 * i), cl - 0.5, cl + 0.5, cl - 1.0, cl))
@@ -160,6 +177,22 @@ def test_sell_above_both_emas_disables_ema_exit_sl_only() -> None:
     d = s.update(_c(_ts(10, 45), 114.0, 116.0, 113.5, 115.5))    # SL still live at 115
     assert d is not None and d.short_exit and d.exit_reason == "SL"
     assert d.short_exit_price == pytest.approx(115.0)
+
+
+def test_sell_trail_arms_below_both_emas_then_close_above_exits() -> None:
+    s = _strategy()
+    for i, cl in enumerate((103.0, 102.0, 101.0, 100.0)):
+        s.update(_c(_ts(10, 0) + i * 300, cl + 0.5, cl + 1.0, cl - 0.5, cl))
+    s._pending_short, s._pending_trigger, s._pending_sl = True, 110.0, 115.0
+    s.update(_c(_ts(10, 20), 111.0, 112.0, 109.0, 110.5))        # entry at 110 (trail mode)
+
+    d = s.update(_c(_ts(10, 25), 90.0, 91.0, 78.0, 80.0))        # closes far below both EMAs
+    assert d is None and s._trail_armed is True
+
+    d = s.update(_c(_ts(10, 30), 104.0, 106.0, 103.0, 105.0))    # closes above both, high < SL 115
+    assert d is not None and d.short_exit and d.exit_reason == "TRAIL"
+    assert d.short_exit_price == pytest.approx(105.0)
+    assert s.position_state == PositionState.FLAT
 
 
 def test_gap_cancels_pending_and_rearms_after() -> None:

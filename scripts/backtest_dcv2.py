@@ -149,7 +149,7 @@ def report(trades: list[dict], args) -> None:
           + (f" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "EMA_CROSS", "OPEN_AT_END"):
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} pnl ${sum(t['pnl'] for t in rs):>10.2f}")
