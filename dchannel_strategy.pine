@@ -31,6 +31,18 @@
 //   trigger here is specifically the adverse crossover event, not "while
 //   favorable". EOD square-off is unchanged.
 //
+// 2026-07-15 UPDATE #3 (hunt trigger, supersedes part of UPDATE #1): a new
+//   signal search no longer runs continuously in both directions. It ARMS
+//   only on the discrete event EMA(50) crosses EMA(200) -- crossing ABOVE
+//   arms a BUY hunt (cancels any bear hunt in progress), crossing BELOW arms
+//   a SELL hunt (cancels any bull hunt). From there the touch + open==extreme
+//   confirm pattern proceeds exactly as before, but the confirm candle no
+//   longer re-checks the EMA relationship on its own (the arming cross
+//   already established it) -- CONFIRM is now pure price-action: touch the
+//   DC band, then a candle with HA open == that extreme. Evaluated every bar
+//   (not just while flat) so a cross that happens mid-trade still arms the
+//   next hunt the instant the position goes flat.
+//
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
 //
@@ -48,18 +60,20 @@
 //     the existing range's high/low. No ratchet-by-%R (that legacy mode isn't
 //     live).
 //   * CONFIRM: a candle with HA open == HA extreme (bull: open==low, no lower
-//     wick; bear: open==high, no upper wick) AND the EMA(50) vs EMA(200) trend
-//     gate satisfied. The signal range's final hi/lo includes this candle.
+//     wick; bear: open==high, no upper wick). Direction was already decided
+//     by the EMA crossover that armed the hunt (see UPDATE #3) -- no
+//     per-candle EMA re-check. The signal range's final hi/lo includes this
+//     candle.
 //   * ENTRY: ASAP the instant REAL price breaks the signal range's far edge
 //     (above the high for bull, below the low for bear).
 //   * PRE-ENTRY INVALIDATION: if REAL price hits the range's near edge (the
 //     stop side) before the trigger, the setup is discarded untraded.
 //   * STOP-LOSS: REAL price touching the signal range's opposite extreme,
 //     fixed for the life of the trade.
-//   * WILLIAMS %R(14) gate: OFF by default (matches live) -- both directions
-//     hunt on every Donchian touch. Toggle on to require %R oversold/
-//     overbought before a hunt arms (this codebase's %R convention ranges
-//     0..-100, never positive).
+//   * WILLIAMS %R(14) gate: OFF by default. When on, it's an ADDITIONAL
+//     requirement at the moment of the EMA-cross arm (oversold for a BUY
+//     arm, overbought for a SELL arm) -- it does not replace the crossover
+//     trigger (this codebase's %R convention ranges 0..-100, never positive).
 //   * WEEKEND BLOCK: new REAL entries are suppressed on Sat/Sun (matches the
 //     live DELTA_SKIP_WEEKDAYS fix, 2026-07-14). The hunt/pending state
 //     machine keeps running underneath -- exactly like the live engine, only
@@ -162,6 +176,12 @@ emaLong  = ta.ema(haClose, emaLongLen)
 plot(emaTrend, "EMA(trend/50)", color=color.new(color.aqua, 0),   linewidth=2)
 plot(emaLong,  "EMA(long/200)", color=color.new(color.orange, 0), linewidth=2)
 
+// Discrete cross events -- computed once, unconditionally, every bar. Reused
+// both to ARM a fresh hunt (section 0.5) and to ARM the trailing SL on an
+// open position (section 1/2).
+crossedBull = ta.crossover(emaTrend, emaLong)    // EMA50 crosses ABOVE EMA200
+crossedBear = ta.crossunder(emaTrend, emaLong)   // EMA50 crosses BELOW EMA200
+
 // ============================================================
 // Williams %R(14) on HA -- this codebase's convention: 0 = most overbought,
 // -100 = most oversold (NEVER positive). Push-then-read (current bar included).
@@ -223,6 +243,37 @@ if squareOff or inGap
     anchorLoBull := na
     anchorHiBear := na
 
+// ----- 0.5. Hunt arming (2026-07-15): a NEW signal search starts ONLY on the
+//            EMA(50)/EMA(200) crossover event -- crossing up arms a BUY hunt,
+//            crossing down arms a SELL hunt, cancelling+resetting whichever
+//            hunt/touch/range state was running for the other direction.
+//            Runs every bar (not gated on being flat) so a cross mid-trade
+//            still arms the next hunt. Williams %R (if enabled) is an extra
+//            condition required alongside the cross, not a replacement for it.
+if not squareOff and not inGap
+    if crossedBull and (not useWR or wr < -wrLevel)
+        huntBull := true
+        huntBear := false
+        touchedBull := false
+        touchedBear := false
+        rangeHiBull := na
+        rangeLoBull := na
+        rangeHiBear := na
+        rangeLoBear := na
+        anchorLoBull := na
+        anchorHiBear := na
+    if crossedBear and (not useWR or wr > -(100.0 - wrLevel))
+        huntBear := true
+        huntBull := false
+        touchedBull := false
+        touchedBear := false
+        rangeHiBull := na
+        rangeLoBull := na
+        rangeHiBear := na
+        rangeLoBear := na
+        anchorLoBull := na
+        anchorHiBear := na
+
 // ----- 1/2. Exits: check the EXISTING (pre-this-bar) SL first -- if not hit,
 //            arm/tighten it for FUTURE bars, then EOD square-off. No separate
 //            TP. TRAILING (2026-07-14 correction): the SL starts FIXED at the
@@ -238,7 +289,7 @@ if strategy.position_size > 0
         strategy.close("Long", comment="SL")
         justClosedSL := true
     else
-        if ta.crossunder(emaTrend, emaLong)   // EMA50 crosses BELOW EMA200: reversal AGAINST the long
+        if crossedBear   // EMA50 crosses BELOW EMA200: reversal AGAINST the long
             trailArmedLong := true
         if trailArmedLong
             longStop := math.max(longStop, emaLong)   // ratchets UP only
@@ -249,7 +300,7 @@ if strategy.position_size < 0
         strategy.close("Short", comment="SL")
         justClosedSL := true
     else
-        if ta.crossover(emaTrend, emaLong)    // EMA50 crosses ABOVE EMA200: reversal AGAINST the short
+        if crossedBull    // EMA50 crosses ABOVE EMA200: reversal AGAINST the short
             trailArmedShort := true
         if trailArmedShort
             shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
@@ -293,28 +344,10 @@ else if flatNow and not squareOff and not inGap and pendingShort
 // touch is required starting the NEXT bar (the SL-firing bar itself can never
 // double as the re-touch) -- "if SL hit, wait for a candle to touch DC
 // low/high again" per request.
+// Hunt ARMING now happens in section 0.5 above (on the EMA crossover event);
+// this section only progresses an already-armed hunt through touch -> confirm.
 flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap and not justClosedSL
-if flatForHunt and (not useWR or not na(wr))
-    if useWR
-        // %R crossing arms (or switches) a hunt. Convention: 0=overbought, -100=oversold.
-        crossedBull = wr < -wrLevel
-        crossedBear = wr > -(100.0 - wrLevel)
-        if crossedBull and not huntBull
-            huntBull := true
-            huntBear := false
-            touchedBear := false
-            rangeHiBear := na
-            rangeLoBear := na
-        else if crossedBear and not huntBear
-            huntBear := true
-            huntBull := false
-            touchedBull := false
-            rangeHiBull := na
-            rangeLoBull := na
-    else
-        huntBull := true
-        huntBear := true
-
+if flatForHunt
     // Bullish hunt progression.
     if huntBull and not na(dcLower)
         if not touchedBull
@@ -332,10 +365,10 @@ if flatForHunt and (not useWR or not na(wr))
             else
                 rangeHiBull := math.max(rangeHiBull, haHigh)
                 rangeLoBull := math.min(rangeLoBull, haLow)
-            // CONFIRM (2026-07-14 update): open==low shape only; the old
-            // "HA close above EMA(200)" check is REPLACED by the EMA50>EMA200
-            // trend gate (no dependency on this candle's own close vs EMA).
-            if eq(haOpen, haLow) and emaTrend > emaLong
+            // CONFIRM (2026-07-15 update): open==low shape only -- direction
+            // was already decided by the EMA crossover that armed this hunt,
+            // so no per-candle EMA re-check here.
+            if eq(haOpen, haLow)
                 pendingLong := true
                 pendingTrigger := rangeHiBull
                 pendingSL := rangeLoBull
@@ -362,7 +395,8 @@ if flatForHunt and (not useWR or not na(wr))
             else
                 rangeHiBear := math.max(rangeHiBear, haHigh)
                 rangeLoBear := math.min(rangeLoBear, haLow)
-            if eq(haOpen, haHigh) and emaTrend < emaLong
+            // CONFIRM: open==high shape only -- see bull-side comment above.
+            if eq(haOpen, haHigh)
                 pendingShort := true
                 pendingTrigger := rangeLoBear
                 pendingSL := rangeHiBear
@@ -376,13 +410,13 @@ if flatForHunt and (not useWR or not na(wr))
 // Plotting / markers
 // ============================================================
 // Small markers when a setup ARMS (signal range confirmed, waiting for the trigger break).
-plotshape(pendingLong  and pendingLong[1]  != pendingLong,  "Armed Bullish (sell PUT)",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
-plotshape(pendingShort and pendingShort[1] != pendingShort, "Armed Bearish (sell CALL)", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
+plotshape(pendingLong  and pendingLong[1]  != pendingLong,  "Armed Buy",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(pendingShort and pendingShort[1] != pendingShort, "Armed Sell", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
 
 // Prominent labeled markers exactly when a trade FIRES (both directions).
-plotshape(buyFired,  title="BUY SIGNAL (sell PUT)",   style=shape.triangleup,   location=location.belowbar,
+plotshape(buyFired,  title="BUY SIGNAL",  style=shape.triangleup,   location=location.belowbar,
      color=color.new(color.green, 0), size=size.small, text="BUY")
-plotshape(sellFired, title="SELL SIGNAL (sell CALL)", style=shape.triangledown, location=location.abovebar,
+plotshape(sellFired, title="SELL SIGNAL", style=shape.triangledown, location=location.abovebar,
      color=color.new(color.red, 0),   size=size.small, text="SELL")
 bgcolor(inGap ? color.new(color.gray, 90) : na, title="Settlement gap")
 bgcolor(dayBlocked ? color.new(color.blue, 92) : na, title="Weekend block")
