@@ -1,0 +1,364 @@
+//@version=5
+// ============================================================================
+// DCv2 — TradingView port of src/deltabot/strategy/dcv2.py (2026-07-15)
+//   Directional BTC strategy (plain BUY/SELL). Cross-checked against
+//   scripts/backtest_dcv2.py. Supersedes dchannel_strategy.pine's variant.
+//
+// RULES (buy side; sell side is the exact mirror):
+//   * CHART BASIS: synthetic Heikin Ashi via request.security(ticker.heikinashi)
+//     -- pattern LEVELS (trigger, SL, EMAs) come from HA; whether price CROSSES
+//     a level (entry fill, invalidation, SL, trail closes) uses REAL price.
+//   * HUNTING is STATE-based: while EMA(50) > EMA(200) (both on HA close) the
+//     BUY hunt is armed; while EMA(50) < EMA(200) the SELL hunt is armed. The
+//     transition resets range state; staying in-state never wipes a range.
+//   * TOUCH: a candle whose REAL low touches the Donchian(20) LOWER band
+//     (prior 20 closed HA bars) anchors the signal range (HA high/low).
+//   * HIGHEST-TOUCH RE-ANCHOR: a later band-touch at a lower HA low restarts
+//     the range; any other candle just widens it (max HA high / min HA low).
+//   * CONFIRM: HA open == HA low (no lower wick) completes the range -- pure
+//     price action, no per-candle EMA re-check. Range includes this candle.
+//   * ENTRY: ASAP when REAL price breaks ABOVE the range high. PRE-ENTRY
+//     INVALIDATION: REAL price touching the range low first kills the setup
+//     untraded (hunting is state-armed, so the invalidation candle itself can
+//     anchor the next range on the same bar).
+//   * EXITS (no TP, no EOD close):
+//       (a) SL: REAL price touching the signal-range low. FIXED for the whole
+//           trade, live from the moment the range confirms.
+//       (b) Exit mode, decided ONCE at entry from where the trigger sits
+//           relative to BOTH EMAs:
+//           - normal ("cross"): trigger NOT below both EMAs -> close at market
+//             whenever EMA(50) is on the unfavorable side of EMA(200)
+//             (relationship, evaluated every bar).
+//           - two-stage TRAIL: trigger BELOW both EMAs (price broke out from
+//             under them) -> only the fixed SL is live at first; once a REAL
+//             close is ABOVE both EMAs the trail ARMS; after arming, a REAL
+//             close back BELOW both EMAs exits at that close ("TRAIL").
+//           Mirror for a SELL triggering above both EMAs (arms on a close
+//           below both, exits on a close back above both).
+//   * AFTER AN SL EXIT: the SL bar itself never counts as the re-touch -- a
+//     FRESH band touch from the next bar onward starts the new range.
+//   * SETTLEMENT GAP (17:25-17:30 IST): cancels pending setups + clears hunt
+//     state, blocks entries -- but NEVER closes an open position.
+//   * WEEKEND BLOCK (Sat/Sun IST, on by default): a trigger hit on a blocked
+//     day consumes the pending setup without placing a trade.
+//
+// HONESTY CHECK: backtested (scripts/backtest_dcv2.py, 30d, 5m, 1 BTC):
+//   -$87 total; 49 closed trades, 24.5% win rate; SL -$10,873 / EMA_CROSS
+//   +$7,787 / TRAIL +$284, plus one still-open long +$2,715. NOT profitable
+//   on closed trades in that window -- treat accordingly.
+// ============================================================================
+strategy("DCv2 — Donchian + EMA50/200 state hunt (bot-faithful)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpDC = "Donchian / Heikin Ashi"
+dcPeriod = input.int(20, "Donchian Period", minval=2, group=grpDC)
+
+grpEMA = "EMA Gate"
+emaTrendLen = input.int(50,  "EMA trend length (50)",  minval=1, group=grpEMA)
+emaLongLen  = input.int(200, "EMA long length (200)", minval=1, group=grpEMA)
+
+grpDay = "Session (IST)"
+dayTZ       = input.string("Asia/Kolkata", "Timezone", group=grpDay)
+dayStartHr  = input.int(17, "New Day Start Hour",   minval=0, maxval=23, group=grpDay)
+dayStartMin = input.int(30, "New Day Start Minute", minval=0, maxval=59, group=grpDay)
+sqOffHr     = input.int(17, "Settlement Gap Start Hour",   minval=0, maxval=23, group=grpDay)
+sqOffMin    = input.int(25, "Settlement Gap Start Minute", minval=0, maxval=59, group=grpDay)
+
+grpFilter = "Day-of-Week Filter"
+skipSat = input.bool(true, "Block new entries on Saturday (IST)", group=grpFilter)
+skipSun = input.bool(true, "Block new entries on Sunday (IST)",   group=grpFilter)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (matches the Python formula exactly).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// Tolerant equality for HA open==extreme checks.
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+
+// ============================================================
+// Donchian(20) on HA, PRIOR closed bars only (current bar excluded via [1]).
+// ============================================================
+dcUpper = ta.highest(haHigh[1], dcPeriod)
+dcLower = ta.lowest(haLow[1], dcPeriod)
+plot(dcUpper, "Donchian Upper (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+plot(dcLower, "Donchian Lower (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+
+// ============================================================
+// EMAs on HA close
+// ============================================================
+emaTrend = ta.ema(haClose, emaTrendLen)
+emaLong  = ta.ema(haClose, emaLongLen)
+plot(emaTrend, "EMA(trend/50)", color=color.new(color.aqua, 0),   linewidth=2)
+plot(emaLong,  "EMA(long/200)", color=color.new(color.orange, 0), linewidth=2)
+
+// ============================================================
+// Time windows: settlement gap 17:25-17:30, day-of-week
+// ============================================================
+sqMins   = sqOffHr * 60 + sqOffMin
+sessMins = dayStartHr * 60 + dayStartMin
+nowMins  = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOff = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+inGap     = nowMins >= sqMins and nowMins < sessMins
+
+dow = dayofweek(time, dayTZ)
+dayBlocked = (skipSat and dow == dayofweek.saturday) or (skipSun and dow == dayofweek.sunday)
+
+// ============================================================
+// State machine — mirrors dcv2.py (hunt / touch / anchor / pending / SL / exit mode)
+// ============================================================
+var bool  huntBull = false
+var bool  huntBear = false
+var bool  touchedBull = false
+var bool  touchedBear = false
+var float rangeHiBull = na
+var float rangeLoBull = na
+var float rangeHiBear = na
+var float rangeLoBear = na
+var float anchorLoBull = na
+var float anchorHiBear = na
+
+var bool  pendingLong = false
+var bool  pendingShort = false
+var float pendingTrigger = na
+var float pendingSL = na
+var float longStop = na
+var float shortStop = na
+// Exit mode, decided ONCE at entry: trailMode=false -> "cross" (close when the
+// EMA relationship is against the position); trailMode=true -> two-stage trail
+// (trade triggered from the wrong side of BOTH EMAs).
+var bool  trailModeLong = false
+var bool  trailModeShort = false
+var bool  trailArmedLong = false
+var bool  trailArmedShort = false
+
+// ----- 0. Settlement gap: cancel pending + clear hunts (never closes a position) -----
+if squareOff or inGap
+    if pendingLong or pendingShort
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+    pendingLong := false
+    pendingShort := false
+    huntBull := false
+    huntBear := false
+    touchedBull := false
+    touchedBear := false
+    rangeHiBull := na
+    rangeLoBull := na
+    rangeHiBear := na
+    rangeLoBear := na
+    anchorLoBull := na
+    anchorHiBear := na
+
+// ----- 0.5. Hunt arming: STATE-based on the EMA(50)/EMA(200) relationship.
+//            The "not huntX" guard fires the reset only on the transition,
+//            so an in-progress range is never wiped mid-hunt. -----
+if not squareOff and not inGap
+    if emaTrend > emaLong and not huntBull
+        huntBull := true
+        huntBear := false
+        touchedBull := false
+        touchedBear := false
+        rangeHiBull := na
+        rangeLoBull := na
+        rangeHiBear := na
+        rangeLoBear := na
+        anchorLoBull := na
+        anchorHiBear := na
+    if emaTrend < emaLong and not huntBear
+        huntBear := true
+        huntBull := false
+        touchedBull := false
+        touchedBear := false
+        rangeHiBull := na
+        rangeLoBull := na
+        rangeHiBear := na
+        rangeLoBear := na
+        anchorLoBull := na
+        anchorHiBear := na
+
+// ----- 1/2. Exits: fixed SL first, then the per-trade exit mode.
+//            "cross": EMA(50) on the unfavorable side of EMA(200) -> close at
+//            market. "trail" (entered from the wrong side of both EMAs): a
+//            REAL close beyond BOTH EMAs arms it; once armed, a REAL close
+//            back on the entry side of BOTH EMAs exits at that close. A bar
+//            cannot arm and fire together, so if/elif is safe. No TP, no EOD. -----
+justClosedSL = false   // true only on the exact bar an SL fires
+if strategy.position_size > 0
+    if low <= longStop
+        strategy.close("Long", comment="SL")
+        justClosedSL := true
+    else if not trailModeLong and emaTrend < emaLong
+        strategy.close("Long", comment="EMA cross")
+    else if trailModeLong
+        if not trailArmedLong and close > emaTrend and close > emaLong
+            trailArmedLong := true
+        else if trailArmedLong and close < emaTrend and close < emaLong
+            strategy.close("Long", comment="TRAIL")
+if strategy.position_size < 0
+    if high >= shortStop
+        strategy.close("Short", comment="SL")
+        justClosedSL := true
+    else if not trailModeShort and emaTrend > emaLong
+        strategy.close("Short", comment="EMA cross")
+    else if trailModeShort
+        if not trailArmedShort and close < emaTrend and close < emaLong
+            trailArmedShort := true
+        else if trailArmedShort and close > emaTrend and close > emaLong
+            strategy.close("Short", comment="TRAIL")
+
+// ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
+//          Weekend block gates only the real order. Invalidation clears the
+//          pending; hunting is already state-armed and section 4 runs after
+//          this on the SAME bar, so the invalidation candle can anchor the
+//          next range. -----
+buyFired = false
+sellFired = false
+flatNow = strategy.position_size == 0
+if flatNow and not squareOff and not inGap and pendingLong
+    if low <= pendingSL
+        strategy.cancel("Long")   // SL side hit first: dead setup (conservative order)
+        pendingLong := false
+    else if high >= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Long", strategy.long, stop=pendingTrigger)
+            longStop := pendingSL
+            trailModeLong := emaTrend > pendingTrigger and emaLong > pendingTrigger
+            trailArmedLong := false
+            buyFired := true
+        pendingLong := false
+    else if not dayBlocked
+        strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
+else if flatNow and not squareOff and not inGap and pendingShort
+    if high >= pendingSL
+        strategy.cancel("Short")
+        pendingShort := false
+    else if low <= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Short", strategy.short, stop=pendingTrigger)
+            shortStop := pendingSL
+            trailModeShort := emaTrend < pendingTrigger and emaLong < pendingTrigger
+            trailArmedShort := false
+            sellFired := true
+        pendingShort := false
+    else if not dayBlocked
+        strategy.entry("Short", strategy.short, stop=pendingTrigger)
+
+// ----- 4. Hunt progression (HA-based), only while flat/no pending/gates ok.
+//          justClosedSL: the SL bar itself never counts as the re-touch. -----
+flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap and not justClosedSL
+if flatForHunt
+    // Bullish hunt progression.
+    if huntBull and not na(dcLower)
+        if not touchedBull
+            if low <= dcLower
+                touchedBull := true
+                rangeHiBull := haHigh
+                rangeLoBull := haLow
+                anchorLoBull := haLow
+        else
+            reanchorBull = low <= dcLower and haLow < anchorLoBull
+            if reanchorBull
+                rangeHiBull := haHigh
+                rangeLoBull := haLow
+                anchorLoBull := haLow
+            else
+                rangeHiBull := math.max(rangeHiBull, haHigh)
+                rangeLoBull := math.min(rangeLoBull, haLow)
+            // CONFIRM: open==low shape only (direction came from the state gate).
+            if eq(haOpen, haLow)
+                pendingLong := true
+                pendingTrigger := rangeHiBull
+                pendingSL := rangeLoBull
+                longStop := rangeLoBull   // pin the SL NOW: the exit block runs
+                                          // before section 3, so a fill via the
+                                          // resting order must already see THIS
+                                          // range's low, never a stale one.
+                trailModeLong := emaTrend > rangeHiBull and emaLong > rangeHiBull
+                trailArmedLong := false
+                huntBull := false
+                touchedBull := false
+                rangeHiBull := na
+                rangeLoBull := na
+                anchorLoBull := na
+
+    // Bearish hunt progression (mirror).
+    if huntBear and not na(dcUpper)
+        if not touchedBear
+            if high >= dcUpper
+                touchedBear := true
+                rangeHiBear := haHigh
+                rangeLoBear := haLow
+                anchorHiBear := haHigh
+        else
+            reanchorBear = high >= dcUpper and haHigh > anchorHiBear
+            if reanchorBear
+                rangeHiBear := haHigh
+                rangeLoBear := haLow
+                anchorHiBear := haHigh
+            else
+                rangeHiBear := math.max(rangeHiBear, haHigh)
+                rangeLoBear := math.min(rangeLoBear, haLow)
+            // CONFIRM: open==high shape only.
+            if eq(haOpen, haHigh)
+                pendingShort := true
+                pendingTrigger := rangeLoBear
+                pendingSL := rangeHiBear
+                shortStop := rangeHiBear   // pin the SL NOW (see bull-side note)
+                trailModeShort := emaTrend < rangeLoBear and emaLong < rangeLoBear
+                trailArmedShort := false
+                huntBear := false
+                touchedBear := false
+                rangeHiBear := na
+                rangeLoBear := na
+                anchorHiBear := na
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(pendingLong  and pendingLong[1]  != pendingLong,  "Armed Buy",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(pendingShort and pendingShort[1] != pendingShort, "Armed Sell", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.tiny)
+
+plotshape(buyFired,  title="BUY SIGNAL",  style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellFired, title="SELL SIGNAL", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.small, text="SELL")
+bgcolor(inGap ? color.new(color.gray, 90) : na, title="Settlement gap")
+bgcolor(dayBlocked ? color.new(color.blue, 92) : na, title="Weekend block")
+
+inPos    = strategy.position_size != 0
+activeSL = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+// The trail's arm state, visible on the chart: yellow background while an
+// armed trail is live (exit will fire on a close back through both EMAs).
+trailLive = (strategy.position_size > 0 and trailModeLong and trailArmedLong)
+     or (strategy.position_size < 0 and trailModeShort and trailArmedShort)
+bgcolor(trailLive ? color.new(color.yellow, 90) : na, title="Trail armed")
+
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+armed = (pendingLong or pendingShort) and not inPos
+plot(armed ? pendingTrigger : na, "Pending Trigger", color=color.new(color.aqua, 0),   style=plot.style_circles, linewidth=2)
+plot(armed ? pendingSL      : na, "Pending SL",      color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2)
