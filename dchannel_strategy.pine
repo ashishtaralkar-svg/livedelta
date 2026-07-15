@@ -29,7 +29,8 @@
 //   moves at all. This mirrors this codebase's HeikinAshi bot's arm/tighten
 //   pattern (max(existing, trail level), only ever tightens), but the ARMING
 //   trigger here is specifically the adverse crossover event, not "while
-//   favorable". (EOD square-off has since been removed -- see UPDATE #4.)
+//   favorable". (SUPERSEDED: the trailing SL was later replaced by a hard
+//   close on the reversal cross -- see UPDATE #5. EOD removed -- see #4.)
 //
 // 2026-07-15 UPDATE #3 (hunt trigger, supersedes part of UPDATE #1): a new
 //   signal search no longer runs continuously in both directions. It ARMS
@@ -44,12 +45,18 @@
 //   next hunt the instant the position goes flat.
 //
 // 2026-07-15 UPDATE #4 (no EOD close): the 17:25 daily square-off no longer
-//   closes an open position. Once a trade is triggered it exits ONLY when
-//   real price touches its SL (the fixed signal-range extreme, or the
-//   trailed level once EMA(50) has crossed EMA(200) against it, whichever is
-//   more favorable). The 17:25-17:30 settlement window still blocks NEW
-//   entries and cancels any un-triggered pending setup -- it just never
+//   closes an open position. The 17:25-17:30 settlement window still blocks
+//   NEW entries and cancels any un-triggered pending setup -- it just never
 //   force-closes a live trade anymore.
+//
+// 2026-07-15 UPDATE #5 (exit = SL or EMA reversal cross, supersedes the
+//   UPDATE #2 trailing SL): the arm-once trailing stop is REMOVED. A trade
+//   now exits in exactly two ways -- (a) the FIXED signal-range SL (range low
+//   for a long, range high for a short, never moves), or (b) a hard close at
+//   MARKET the instant EMA(50) crosses to the unfavorable side of EMA(200)
+//   (below for a long, above for a short), in profit or loss. This guarantees
+//   a trade always closes on the trend reversal instead of running open
+//   indefinitely while price never returns to a far SL.
 //
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
@@ -76,8 +83,10 @@
 //     (above the high for bull, below the low for bear).
 //   * PRE-ENTRY INVALIDATION: if REAL price hits the range's near edge (the
 //     stop side) before the trigger, the setup is discarded untraded.
-//   * STOP-LOSS: REAL price touching the signal range's opposite extreme,
-//     fixed for the life of the trade.
+//   * EXIT: (a) STOP-LOSS -- REAL price touching the signal range's opposite
+//     extreme, FIXED for the life of the trade; or (b) EMA REVERSAL CROSS --
+//     a hard close at market the instant EMA(50) crosses to the unfavorable
+//     side of EMA(200) (see UPDATE #5). No TP, no EOD, no trailing.
 //   * WILLIAMS %R(14) gate: OFF by default. When on, it's an ADDITIONAL
 //     requirement at the moment of the EMA-cross arm (oversold for a BUY
 //     arm, overbought for a SELL arm) -- it does not replace the crossover
@@ -97,10 +106,9 @@
 //   falls -- so on the BTC price chart the directional P&L is equivalent to
 //   LONG (bullish) / SHORT (bearish), which is how this strategy maps them.
 //   The bot's REAL take-profit is normally a -70% drop in the OPTION premium
-//   -- this script REPLACES that entirely with the EMA(50)/EMA(200) trailing
-//   SL described above (per request). There is no separate TP and no EOD
-//   close; the trade exits ONLY when REAL price touches the (possibly-
-//   trailed) SL.
+//   -- this script REPLACES that entirely (per request) with two exits only:
+//   the FIXED signal-range SL, or a hard close on the EMA(50)/EMA(200)
+//   reversal cross (UPDATE #5). No separate TP, no EOD close, no trailing.
 //
 // LIMITATION — weekend block: live, a signal that completes on a blocked day
 //   (Sat/Sun) still occupies the strategy's "in position" bookkeeping
@@ -232,8 +240,6 @@ var float pendingTrigger = na
 var float pendingSL = na
 var float longStop = na
 var float shortStop = na
-var bool  trailArmedLong = false   // arms ONCE per trade, on the reversal cross; stays armed
-var bool  trailArmedShort = false
 
 // ----- 0. Settlement gap: cancel pending + clear hunts -----
 if squareOff or inGap
@@ -284,37 +290,28 @@ if not squareOff and not inGap
         anchorLoBull := na
         anchorHiBear := na
 
-// ----- 1/2. Exits: check the EXISTING (pre-this-bar) SL first -- if not hit,
-//            arm/tighten it for FUTURE bars, then EOD square-off. No separate
-//            TP. TRAILING (2026-07-14 correction): the SL starts FIXED at the
-//            signal range extreme and stays fixed while the EMA relationship
-//            remains favorable. It arms ONCE -- on the bar EMA(50) actually
-//            CROSSES to the unfavorable side of EMA(200) (a reversal event,
-//            not a continuous condition) -- and from that bar onward ratchets
-//            toward EMA(200) every bar (max() for a long, min() for a short),
-//            for the rest of the trade even if the EMA flips back. -----
+// ----- 1/2. Exits (2026-07-15 UPDATE #5): exactly TWO ways out, no TP, no EOD.
+//            (a) SL: real price touches the FIXED signal-range extreme
+//                (range low for a long, range high for a short) -- never
+//                moves for the life of the trade.
+//            (b) EMA reversal cross: the instant EMA(50) crosses to the side
+//                of EMA(200) that is against the position (crosses BELOW for
+//                a long, ABOVE for a short), close at market -- whether in
+//                profit or loss. No trailing, no waiting for price to come
+//                back. This supersedes the old arm-once trailing SL. -----
 justClosedSL = false   // resets false every bar; true only on the exact bar an SL fires
 if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
         justClosedSL := true
-    else
-        if crossedBear   // EMA50 crosses BELOW EMA200: reversal AGAINST the long
-            trailArmedLong := true
-        if trailArmedLong
-            longStop := math.max(longStop, emaLong)   // ratchets UP only
-        // No EOD/time-based close (2026-07-15): the trade exits ONLY when
-        // real price touches the (possibly-trailed) SL.
+    else if crossedBear   // EMA50 crosses BELOW EMA200: reversal against the long -> exit at market
+        strategy.close("Long", comment="EMA cross")
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
         justClosedSL := true
-    else
-        if crossedBull    // EMA50 crosses ABOVE EMA200: reversal AGAINST the short
-            trailArmedShort := true
-        if trailArmedShort
-            shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
-        // No EOD/time-based close (2026-07-15): exits ONLY on the SL.
+    else if crossedBull   // EMA50 crosses ABOVE EMA200: reversal against the short -> exit at market
+        strategy.close("Short", comment="EMA cross")
 
 // ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
 //          Weekend block ONLY gates the real order here -- matches the live
@@ -328,7 +325,6 @@ if flatNow and not squareOff and not inGap and pendingLong
         if not dayBlocked
             strategy.entry("Long", strategy.long, stop=pendingTrigger)
             longStop := pendingSL
-            trailArmedLong := false   // fresh trade: trailing not armed until a reversal cross
             buyFired := true
         pendingLong := false
     else if low <= pendingSL
@@ -340,7 +336,6 @@ else if flatNow and not squareOff and not inGap and pendingShort
         if not dayBlocked
             strategy.entry("Short", strategy.short, stop=pendingTrigger)
             shortStop := pendingSL
-            trailArmedShort := false  // fresh trade: trailing not armed until a reversal cross
             sellFired := true
         pendingShort := false
     else if high >= pendingSL
