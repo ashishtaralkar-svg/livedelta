@@ -202,6 +202,24 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
     tp_decay = args.tp_decay_pct / 100.0   # 0 = off; 0.70 -> buy back at 30% of entry
     sq_mins = args.square_off_hour * 60 + args.square_off_minute
     sess_mins = args.day_start_hour * 60 + args.day_start_minute
+    # Weekend blackout: no position held or opened from Fri --weekend-fri-hour
+    # to Mon --weekend-mon-hour:min IST. Disabled by --no-skip-weekends.
+    fri_start = args.weekend_fri_hour * 60
+    mon_end = args.weekend_mon_hour * 60 + args.weekend_mon_minute
+
+    def in_blackout(ts: int) -> bool:
+        if args.no_skip_weekends:
+            return False
+        d = datetime.fromtimestamp(ts, tz=_IST)
+        wd, mins = d.weekday(), d.hour * 60 + d.minute
+        if wd == 4:            # Friday from the blackout hour
+            return mins >= fri_start
+        if wd in (5, 6):       # Sat/Sun all day
+            return True
+        if wd == 0:            # Monday before the resume time
+            return mins < mon_end
+        return False
+
     cache: dict = {}
     trades: list[dict] = []
     pos: dict | None = None
@@ -261,6 +279,16 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
             prev_mins = mins
             dec = strategy.update(c)
 
+            # 0. Weekend blackout (Fri 20:00 -> Mon 05:30 IST): no trade may be
+            #    held or opened. Close any live leg at the window's first bar and
+            #    keep the strategy flat until it reopens Monday. update() still
+            #    ran above, so EMAs/Donchian stay warm through the weekend.
+            if in_blackout(c.start_time):
+                if pos is not None:
+                    close("WEEKEND", buyback_prem(c.start_time, c.close), c.start_time, c.close)
+                strategy.force_flat()
+                continue
+
             # 1. Strategy exit (range SL / EMA reversal / trail): buy the leg back.
             if pos is not None and dec is not None and dec.has_exit:
                 eprice = dec.long_exit_price if dec.long_exit else dec.short_exit_price
@@ -283,7 +311,8 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
                     pos["last_check"] = c.start_time
 
             # 2. 17:25 EOD square-off: close the option (the directional trade
-            #    itself keeps running inside the strategy across the gap).
+            #    keeps running inside the strategy across the gap and rolls at
+            #    17:30). The weekend blackout above handles Fri-20:00 onward.
             if pos is not None and square_off:
                 close("EOD", buyback_prem(c.start_time, c.close), c.start_time, c.close)
 
@@ -296,6 +325,7 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
 
             # 4. Rollover: past the 17:30 gap, if the directional trade is still
             #    open but the option is flat (squared off at 17:25), re-sell.
+            #    The blackout (section 0) already blocks any weekend rollover.
             elif (pos is None and not in_gap and not square_off
                   and c.start_time >= sim_start
                   and strategy.position_state.name != "FLAT"):
@@ -312,10 +342,11 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
 def report_option(trades: list[dict], args) -> None:
     print(f"\n{'=' * 122}")
     tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no TP"
+    wknd_txt = ("weekends TRADED" if args.no_skip_weekends else
+                f"blackout Fri {args.weekend_fri_hour:02d}:00->Mon {args.weekend_mon_hour:02d}:{args.weekend_mon_minute:02d}")
     print(f"DCv2 [OPTION SELL, 17:25 square-off + 17:30 rollover] -- {args.days}d, {args.resolution}, "
           f"premium ~{args.target_premium:.0f}, {args.lots} lots, {tp_txt}, "
-          f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}, "
-          f"weekends {'TRADED' if args.no_skip_weekends else 'blocked'}")
+          f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}, {wknd_txt}")
     print(f"{'=' * 122}")
     if not trades:
         print("No trades.")
@@ -333,7 +364,7 @@ def report_option(trades: list[dict], args) -> None:
           + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "OPEN_AT_END"):
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "WEEKEND", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -371,6 +402,12 @@ def main() -> None:
     p.add_argument("--tp-decay-pct", type=float, default=0.0,
                    help="[option mode] book profit when the sold option decays this %% "
                         "(e.g. 70 -> buy back at 30%% of entry premium; 0 = off)")
+    p.add_argument("--weekend-fri-hour", type=int, default=20,
+                   help="[option mode] weekend blackout starts Friday at this IST hour (default 20:00)")
+    p.add_argument("--weekend-mon-hour", type=int, default=5,
+                   help="[option mode] weekend blackout ends Monday at this IST hour (default 05:xx)")
+    p.add_argument("--weekend-mon-minute", type=int, default=30,
+                   help="[option mode] weekend blackout end minute (default :30 -> 05:30)")
     args = p.parse_args()
 
     setup_logging("WARNING")
