@@ -118,6 +118,50 @@ def test_weekend_block_consumes_trigger_without_trade() -> None:
     assert not s.has_pending and s.position_state == PositionState.FLAT
 
 
+def test_buy_below_both_emas_disables_ema_exit_sl_only() -> None:
+    """2026-07-15 update: a BUY whose trigger sits BELOW both EMAs keeps only
+    the fixed range-low SL -- the EMA-reversal exit is off for that trade."""
+    s = _strategy()
+    for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):        # bull warmup, EMAs ~101-103
+        s.update(_c(_ts(10, 0) + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
+    s._pending_long, s._pending_trigger, s._pending_sl = True, 95.0, 90.0
+
+    d = s.update(_c(_ts(10, 20), 94.0, 96.0, 93.0, 95.0))        # triggers at 95, below both EMAs
+    assert d is not None and d.buy_signal and d.entry_price == 95.0
+    assert s._ema_exit_enabled is False
+
+    # EMA2 is now below EMA4 (relationship against the long) -- must NOT close.
+    d = s.update(_c(_ts(10, 25), 95.0, 96.0, 94.0, 95.0))
+    assert d is None and s.position_state == PositionState.LONG
+
+    d = s.update(_c(_ts(10, 30), 95.0, 95.5, 89.0, 89.5))        # SL still live at 90
+    assert d is not None and d.long_exit and d.exit_reason == "SL"
+    assert d.long_exit_price == pytest.approx(90.0)
+    assert s._ema_exit_enabled is True                            # reset for the next trade
+
+
+def test_sell_above_both_emas_disables_ema_exit_sl_only() -> None:
+    s = _strategy()
+    for i, cl in enumerate((103.0, 102.0, 101.0, 100.0)):        # bear warmup, EMAs ~100-102
+        s.update(_c(_ts(10, 0) + i * 300, cl + 0.5, cl + 1.0, cl - 0.5, cl))
+    s._pending_short, s._pending_trigger, s._pending_sl = True, 110.0, 115.0
+
+    d = s.update(_c(_ts(10, 20), 111.0, 112.0, 109.0, 110.5))    # triggers at 110, above both EMAs
+    assert d is not None and d.sell_signal and d.entry_price == 110.0
+    assert s._ema_exit_enabled is False
+
+    # Rising closes flip EMA2 above EMA4 (against the short) -- must NOT close.
+    d = None
+    for i, cl in enumerate((111.0, 112.0, 113.0)):
+        d = s.update(_c(_ts(10, 25 + 5 * i), cl - 0.5, cl + 0.5, cl - 1.0, cl))
+        assert d is None
+    assert s.position_state == PositionState.SHORT
+
+    d = s.update(_c(_ts(10, 45), 114.0, 116.0, 113.5, 115.5))    # SL still live at 115
+    assert d is not None and d.short_exit and d.exit_reason == "SL"
+    assert d.short_exit_price == pytest.approx(115.0)
+
+
 def test_gap_cancels_pending_and_rearms_after() -> None:
     s = _strategy()
     _bull_setup(s)

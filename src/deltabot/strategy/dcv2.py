@@ -33,6 +33,11 @@ Rules (buy side described; sell side is the exact mirror):
           opened with the relationship favorable and additionally closes the
           rare trade whose pending setup filled after the EMA had already
           flipped (in Pine that trade could only exit via SL).
+      **Exception (2026-07-15)**: if at BUY trigger time BOTH EMA(50) and
+      EMA(200) sit ABOVE the trigger price (price broke out from below the
+      EMAs), the EMA-reversal exit is DISABLED for that trade -- it exits on
+      the fixed signal-range SL only. Mirror for a SELL whose trigger is
+      above both EMAs.
   * **After an SL exit**, the SL bar itself never counts as the re-touch --
     a FRESH band touch from the next bar onward starts the new range
     (Pine's justClosedSL).
@@ -73,6 +78,10 @@ class _Ema:
 
     def update(self, x: float) -> float:
         self._value = x if self._value is None else self._alpha * x + (1 - self._alpha) * self._value
+        return self._value
+
+    @property
+    def value(self) -> float | None:
         return self._value
 
 
@@ -176,6 +185,9 @@ class DCv2Strategy:
         self._pending_sl: float | None = None
         self._in_long = self._in_short = False
         self._sl_level: float | None = None
+        # False when the trade triggered from the "wrong" side of both EMAs
+        # (buy below both / sell above both) -> that trade exits on SL only.
+        self._ema_exit_enabled = True
 
     @property
     def position_state(self) -> PositionState:
@@ -200,8 +212,20 @@ class DCv2Strategy:
     def force_flat(self) -> None:
         self._in_long = self._in_short = False
         self._sl_level = None
+        self._ema_exit_enabled = True
         self._clear_pending()
         self._clear_hunts()
+
+    def _ema_exit_for(self, trig: float, is_long: bool) -> bool:
+        """EMA-reversal exit is DISABLED when the trade triggered from the
+        wrong side of BOTH EMAs (buy below both, sell above both) -- that
+        trade rides on its fixed signal-range SL alone."""
+        et, el = self._ema_trend.value, self._ema_long.value
+        if et is None or el is None:
+            return True
+        if is_long:
+            return not (et > trig and el > trig)
+        return not (et < trig and el < trig)
 
     # ------------------------------------------------------------------ #
     # Intracandle (live/ASAP) helpers -- same conventions as DchannelStrategy.
@@ -222,6 +246,7 @@ class DCv2Strategy:
             if candle.open >= trig or candle.high >= trig:
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
+                self._ema_exit_enabled = self._ema_exit_for(trig, is_long=True)
                 self._clear_pending()
                 return True, False, trig
         elif self._pending_short and self._pending_trigger is not None and self._pending_sl is not None:
@@ -232,6 +257,7 @@ class DCv2Strategy:
             if candle.open <= trig or candle.low <= trig:
                 self._in_short, self._in_long = True, False
                 self._sl_level = sl
+                self._ema_exit_enabled = self._ema_exit_for(trig, is_long=False)
                 self._clear_pending()
                 return True, False, trig
         return False, False, 0.0
@@ -290,17 +316,18 @@ class DCv2Strategy:
             if self._sl_level is not None and candle.low <= self._sl_level:
                 long_exit, long_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
-            elif ema_trend < ema_long:
+            elif self._ema_exit_enabled and ema_trend < ema_long:
                 long_exit, long_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
         elif self._in_short:
             if self._sl_level is not None and candle.high >= self._sl_level:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
-            elif ema_trend > ema_long:
+            elif self._ema_exit_enabled and ema_trend > ema_long:
                 short_exit, short_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
         if long_exit or short_exit:
             self._in_long = self._in_short = False
             self._sl_level = None
+            self._ema_exit_enabled = True
 
         # --- 3. Breakout trigger for a PRIOR-armed pending setup (REAL price).
         #     Weekend block gates only the trade itself: a trigger hit on a
@@ -317,6 +344,7 @@ class DCv2Strategy:
                 if not day_blocked:
                     buy_signal, entry_price, new_sl = True, trig, sl
                     self._in_long, self._sl_level = True, sl
+                    self._ema_exit_enabled = not (ema_trend > trig and ema_long > trig)
                 self._clear_pending()
         elif flat and not square_off and not in_gap and self._pending_short:
             trig, sl = self._pending_trigger, self._pending_sl
@@ -326,6 +354,7 @@ class DCv2Strategy:
                 if not day_blocked:
                     sell_signal, entry_price, new_sl = True, trig, sl
                     self._in_short, self._sl_level = True, sl
+                    self._ema_exit_enabled = not (ema_trend < trig and ema_long < trig)
                 self._clear_pending()
 
         # --- 4. Hunt progression (HA-based), only while flat/no pending/gates ok.
