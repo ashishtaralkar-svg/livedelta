@@ -58,6 +58,14 @@
 //   a trade always closes on the trend reversal instead of running open
 //   indefinitely while price never returns to a far SL.
 //
+// 2026-07-15 BUGFIX #6 (SL fired above the range low): the SL level (longStop/
+//   shortStop) is now pinned at CONFIRMATION time, not at entry. Previously the
+//   resting-breakout-order path placed the entry without setting the stop, and
+//   because the exit block runs before the entry block each bar, a fill via that
+//   resting order was checked against a STALE stop from a prior trade -- so a
+//   trade could "stop out" at a price the current signal range never reached.
+//   Also cancels the resting order when a setup is invalidated pre-trigger.
+//
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
 //
@@ -328,7 +336,8 @@ if flatNow and not squareOff and not inGap and pendingLong
             buyFired := true
         pendingLong := false
     else if low <= pendingSL
-        pendingLong := false   // invalidated before the trigger ever fired
+        strategy.cancel("Long")   // kill any resting breakout order for this dead setup
+        pendingLong := false      // invalidated before the trigger ever fired
     else if not dayBlocked
         strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
 else if flatNow and not squareOff and not inGap and pendingShort
@@ -339,6 +348,7 @@ else if flatNow and not squareOff and not inGap and pendingShort
             sellFired := true
         pendingShort := false
     else if high >= pendingSL
+        strategy.cancel("Short")   // kill any resting breakout order for this dead setup
         pendingShort := false
     else if not dayBlocked
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
@@ -376,6 +386,11 @@ if flatForHunt
                 pendingLong := true
                 pendingTrigger := rangeHiBull
                 pendingSL := rangeLoBull
+                longStop := rangeLoBull   // pin the SL NOW (bugfix 2026-07-15):
+                                          // the exit check runs before section 3,
+                                          // so if the entry fills via the resting
+                                          // stop order, longStop must already hold
+                                          // THIS range's low, not a stale prior one.
                 huntBull := false
                 touchedBull := false
                 rangeHiBull := na
@@ -404,6 +419,9 @@ if flatForHunt
                 pendingShort := true
                 pendingTrigger := rangeLoBear
                 pendingSL := rangeHiBear
+                shortStop := rangeHiBear   // pin the SL NOW (bugfix 2026-07-15): see
+                                           // the bull-side note -- prevents a stale
+                                           // shortStop from a prior trade firing early.
                 huntBear := false
                 touchedBear := false
                 rangeHiBear := na
