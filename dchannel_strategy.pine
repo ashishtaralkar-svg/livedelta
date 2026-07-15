@@ -16,24 +16,23 @@
 //   needs EMA(50) < EMA(200) (both EMAs on HA close).
 //
 // 2026-07-14 UPDATE #2 (trailing SL, replaces the option TP): there is NO
-//   take-profit at all -- the -70% option-premium TP is REMOVED. Instead the
-//   fixed SL (signal range low/high) becomes a TRAILING stop once the EMA
-//   relationship agrees with the position (the SAME condition required to
-//   enter): each bar, while EMA(50) stays above EMA(200) for a long, SL :=
-//   max(current SL, EMA(200)) -- ratchets UP toward EMA(200), never loosens.
-//   Mirror for a short: while EMA(50) stays below EMA(200), SL :=
-//   min(current SL, EMA(200)) -- ratchets DOWN, never loosens. If the EMA
-//   relationship flips against the position, the SL simply stops advancing
-//   (holds at its best level reached so far) rather than reversing -- the
-//   trade then exits naturally once price actually touches that trailed
-//   level, not on the cross itself. This mirrors the SAME arm/tighten
-//   pattern already used by this codebase's HeikinAshi bot (max(existing,
-//   trail level), only ever tightens). EOD square-off is unchanged.
+//   take-profit at all -- the -70% option-premium TP is REMOVED. The SL
+//   starts FIXED at the signal range's opposite extreme (as always) and
+//   STAYS FIXED there while the EMA relationship remains favorable (the same
+//   condition required to enter). It arms trailing ONCE -- on the exact bar
+//   EMA(50) actually CROSSES to the UNFAVORABLE side of EMA(200) (a reversal
+//   EVENT, not a continuous condition) -- and from that bar onward, EVERY
+//   bar for the rest of the trade, SL := max(current SL, EMA(200)) for a
+//   long / min(current SL, EMA(200)) for a short -- ratchets toward
+//   EMA(200), never loosens, and stays armed even if EMA(50) flips back
+//   favorable afterward. Before that first reversal cross, the SL never
+//   moves at all. This mirrors this codebase's HeikinAshi bot's arm/tighten
+//   pattern (max(existing, trail level), only ever tightens), but the ARMING
+//   trigger here is specifically the adverse crossover event, not "while
+//   favorable". EOD square-off is unchanged.
 //
-// HONESTY CHECK: this exact trailing-SL design has NOT been backtested (the
-// earlier note about a "-$33.71 EMA-cross-exit" variant referred to a
-// DIFFERENT, hard-exit-on-cross mechanism that this version no longer uses --
-// disregard that number). Treat this script as unvalidated until backtested.
+// HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
+// Treat this script as unvalidated until backtested.
 //
 // What the live bot does (and what this script mirrors):
 //   * CHART BASIS: synthetic Heikin Ashi, fetched via
@@ -203,6 +202,8 @@ var float pendingTrigger = na
 var float pendingSL = na
 var float longStop = na
 var float shortStop = na
+var bool  trailArmedLong = false   // arms ONCE per trade, on the reversal cross; stays armed
+var bool  trailArmedShort = false
 
 // ----- 0. Settlement gap: cancel pending + clear hunts -----
 if squareOff or inGap
@@ -223,16 +224,23 @@ if squareOff or inGap
     anchorHiBear := na
 
 // ----- 1/2. Exits: check the EXISTING (pre-this-bar) SL first -- if not hit,
-//            tighten it for FUTURE bars using this bar's EMA(200) (trailing,
-//            arm/tighten style, matches the HeikinAshi bot's existing
-//            pattern), then EOD square-off. No separate TP. -----
+//            arm/tighten it for FUTURE bars, then EOD square-off. No separate
+//            TP. TRAILING (2026-07-14 correction): the SL starts FIXED at the
+//            signal range extreme and stays fixed while the EMA relationship
+//            remains favorable. It arms ONCE -- on the bar EMA(50) actually
+//            CROSSES to the unfavorable side of EMA(200) (a reversal event,
+//            not a continuous condition) -- and from that bar onward ratchets
+//            toward EMA(200) every bar (max() for a long, min() for a short),
+//            for the rest of the trade even if the EMA flips back. -----
 justClosedSL = false   // resets false every bar; true only on the exact bar an SL fires
 if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
         justClosedSL := true
     else
-        if emaTrend > emaLong
+        if ta.crossunder(emaTrend, emaLong)   // EMA50 crosses BELOW EMA200: reversal AGAINST the long
+            trailArmedLong := true
+        if trailArmedLong
             longStop := math.max(longStop, emaLong)   // ratchets UP only
         if squareOff
             strategy.close("Long", comment="EOD")
@@ -241,7 +249,9 @@ if strategy.position_size < 0
         strategy.close("Short", comment="SL")
         justClosedSL := true
     else
-        if emaTrend < emaLong
+        if ta.crossover(emaTrend, emaLong)    // EMA50 crosses ABOVE EMA200: reversal AGAINST the short
+            trailArmedShort := true
+        if trailArmedShort
             shortStop := math.min(shortStop, emaLong)  // ratchets DOWN only
         if squareOff
             strategy.close("Short", comment="EOD")
@@ -258,6 +268,7 @@ if flatNow and not squareOff and not inGap and pendingLong
         if not dayBlocked
             strategy.entry("Long", strategy.long, stop=pendingTrigger)
             longStop := pendingSL
+            trailArmedLong := false   // fresh trade: trailing not armed until a reversal cross
             buyFired := true
         pendingLong := false
     else if low <= pendingSL
@@ -269,6 +280,7 @@ else if flatNow and not squareOff and not inGap and pendingShort
         if not dayBlocked
             strategy.entry("Short", strategy.short, stop=pendingTrigger)
             shortStop := pendingSL
+            trailArmedShort := false  // fresh trade: trailing not armed until a reversal cross
             sellFired := true
         pendingShort := false
     else if high >= pendingSL
