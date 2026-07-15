@@ -82,6 +82,15 @@
 //   Combined with UPDATE #7, multiple signals per crossover are now possible;
 //   the only thing that ends a direction's hunting is the opposite EMA cross.
 //
+// 2026-07-15 UPDATE #9 (state-based hunting, supersedes UPDATE #3's crossover-
+//   event arming and subsumes the #7/#8 re-arm patches): the hunt is armed by
+//   the EMA RELATIONSHIP itself -- while EMA(50) > EMA(200) the BUY hunt is
+//   armed, while EMA(50) < EMA(200) the SELL hunt is armed. Fixes signals
+//   silently not forming when the cross happened long ago / off-chart, or
+//   after the daily 17:25 gap cleared the hunt state. Exits are unchanged
+//   (fixed SL, or hard close on the reversal CROSS event). justClosedSL still
+//   forces a fresh DC touch after an SL exit.
+//
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
 //
@@ -218,9 +227,8 @@ emaLong  = ta.ema(haClose, emaLongLen)
 plot(emaTrend, "EMA(trend/50)", color=color.new(color.aqua, 0),   linewidth=2)
 plot(emaLong,  "EMA(long/200)", color=color.new(color.orange, 0), linewidth=2)
 
-// Discrete cross events -- computed once, unconditionally, every bar. Reused
-// both to ARM a fresh hunt (section 0.5) and to ARM the trailing SL on an
-// open position (section 1/2).
+// Discrete cross events -- used ONLY for the exit-on-reversal close (section
+// 1/2). Hunt arming is STATE-based (UPDATE #9), not cross-based.
 crossedBull = ta.crossover(emaTrend, emaLong)    // EMA50 crosses ABOVE EMA200
 crossedBear = ta.crossunder(emaTrend, emaLong)   // EMA50 crosses BELOW EMA200
 
@@ -283,15 +291,17 @@ if squareOff or inGap
     anchorLoBull := na
     anchorHiBear := na
 
-// ----- 0.5. Hunt arming (2026-07-15): a NEW signal search starts ONLY on the
-//            EMA(50)/EMA(200) crossover event -- crossing up arms a BUY hunt,
-//            crossing down arms a SELL hunt, cancelling+resetting whichever
-//            hunt/touch/range state was running for the other direction.
-//            Runs every bar (not gated on being flat) so a cross mid-trade
-//            still arms the next hunt. Williams %R (if enabled) is an extra
-//            condition required alongside the cross, not a replacement for it.
+// ----- 0.5. Hunt arming (2026-07-15 UPDATE #9, supersedes the crossover-event
+//            arming): STATE-based, not event-based. While EMA(50) > EMA(200),
+//            the BUY hunt is armed; while EMA(50) < EMA(200), the SELL hunt is
+//            armed. This means hunting survives the daily 17:25 gap reset and
+//            works even when the cross happened long ago / off-chart -- the
+//            old event-based arming silently left the bot idle in exactly
+//            those cases. The "not huntX" guard makes the reset fire only on
+//            the transition, so an in-progress touch/range is never wiped
+//            mid-hunt. Williams %R (if enabled) gates the arming transition.
 if not squareOff and not inGap
-    if crossedBull and (not useWR or wr < -wrLevel)
+    if emaTrend > emaLong and not huntBull and (not useWR or wr < -wrLevel)
         huntBull := true
         huntBear := false
         touchedBull := false
@@ -302,7 +312,7 @@ if not squareOff and not inGap
         rangeLoBear := na
         anchorLoBull := na
         anchorHiBear := na
-    if crossedBear and (not useWR or wr > -(100.0 - wrLevel))
+    if emaTrend < emaLong and not huntBear and (not useWR or wr > -(100.0 - wrLevel))
         huntBear := true
         huntBull := false
         touchedBull := false
@@ -328,17 +338,15 @@ if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
         justClosedSL := true
-        if emaTrend > emaLong   // trend still bullish -> re-hunt (UPDATE #8). justClosedSL
-            huntBull := true    // keeps THIS bar from counting as the touch, so a FRESH
-                                // DC-low touch (next bar onward) starts the new range.
+        // Re-hunting is automatic (UPDATE #9 state-based arming); justClosedSL
+        // still forces a FRESH DC-low touch from the next bar onward.
     else if crossedBear   // EMA50 crosses BELOW EMA200: reversal against the long -> exit at market
         strategy.close("Long", comment="EMA cross")
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
         justClosedSL := true
-        if emaTrend < emaLong   // trend still bearish -> re-hunt (UPDATE #8, mirror)
-            huntBear := true
+        // Re-hunting is automatic (UPDATE #9); fresh DC-high touch still required.
     else if crossedBull   // EMA50 crosses ABOVE EMA200: reversal against the short -> exit at market
         strategy.close("Short", comment="EMA cross")
 
@@ -358,11 +366,10 @@ if flatNow and not squareOff and not inGap and pendingLong
         pendingLong := false
     else if low <= pendingSL
         strategy.cancel("Long")   // kill any resting breakout order for this dead setup
-        pendingLong := false      // invalidated before the trigger ever fired
-        if emaTrend > emaLong     // trend still bullish -> resume hunting NOW (UPDATE #7):
-            huntBull := true      // section 4 runs after this block on the SAME bar, so if
-                                  // this invalidation candle touches the DC low it becomes
-                                  // the anchor/start of the NEXT signal range immediately.
+        pendingLong := false      // invalidated before the trigger ever fired; hunting is
+                                  // already re-armed (UPDATE #9), and section 4 runs after
+                                  // this block on the SAME bar, so if this invalidation
+                                  // candle touches the DC low it anchors the next range.
     else if not dayBlocked
         strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
 else if flatNow and not squareOff and not inGap and pendingShort
@@ -374,9 +381,8 @@ else if flatNow and not squareOff and not inGap and pendingShort
         pendingShort := false
     else if high >= pendingSL
         strategy.cancel("Short")   // kill any resting breakout order for this dead setup
-        pendingShort := false
-        if emaTrend < emaLong      // trend still bearish -> resume hunting NOW (UPDATE #7,
-            huntBear := true       // mirror of the bull side).
+        pendingShort := false      // hunting already re-armed (UPDATE #9); same-bar DC-high
+                                   // touch can anchor the next range (mirror of bull side).
     else if not dayBlocked
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
 
