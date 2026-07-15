@@ -74,6 +74,14 @@
 //   on the same bar, the invalidation candle ITSELF counts: if it touches the
 //   DC band, it becomes the anchor/start of the next signal range.
 //
+// 2026-07-15 UPDATE #8 (re-hunt after SL exit): an SL exit no longer consumes
+//   the whole trend. If EMA(50) is still on the favorable side of EMA(200)
+//   when the SL fires, the same-direction hunt re-arms -- but the SL bar
+//   itself never counts as the touch (justClosedSL), so a FRESH DC-band touch
+//   from the next bar onward is required to start the new signal range.
+//   Combined with UPDATE #7, multiple signals per crossover are now possible;
+//   the only thing that ends a direction's hunting is the opposite EMA cross.
+//
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
 //
@@ -320,12 +328,17 @@ if strategy.position_size > 0
     if low <= longStop
         strategy.close("Long", comment="SL")
         justClosedSL := true
+        if emaTrend > emaLong   // trend still bullish -> re-hunt (UPDATE #8). justClosedSL
+            huntBull := true    // keeps THIS bar from counting as the touch, so a FRESH
+                                // DC-low touch (next bar onward) starts the new range.
     else if crossedBear   // EMA50 crosses BELOW EMA200: reversal against the long -> exit at market
         strategy.close("Long", comment="EMA cross")
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
         justClosedSL := true
+        if emaTrend < emaLong   // trend still bearish -> re-hunt (UPDATE #8, mirror)
+            huntBear := true
     else if crossedBull   // EMA50 crosses ABOVE EMA200: reversal against the short -> exit at market
         strategy.close("Short", comment="EMA cross")
 
