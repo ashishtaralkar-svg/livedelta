@@ -66,6 +66,14 @@
 //   trade could "stop out" at a price the current signal range never reached.
 //   Also cancels the resting order when a setup is invalidated pre-trigger.
 //
+// 2026-07-15 UPDATE #7 (re-hunt after pre-entry invalidation): when a pending
+//   setup dies because price hit its SL side before the trigger, the hunt for
+//   that same direction RE-ARMS immediately (guarded: only while EMA(50) is
+//   still on the favorable side of EMA(200)) instead of waiting for the next
+//   EMA crossover. Because invalidation is processed before the hunt machine
+//   on the same bar, the invalidation candle ITSELF counts: if it touches the
+//   DC band, it becomes the anchor/start of the next signal range.
+//
 // HONESTY CHECK: this exact trailing-SL design has NOT been backtested.
 // Treat this script as unvalidated until backtested.
 //
@@ -338,6 +346,10 @@ if flatNow and not squareOff and not inGap and pendingLong
     else if low <= pendingSL
         strategy.cancel("Long")   // kill any resting breakout order for this dead setup
         pendingLong := false      // invalidated before the trigger ever fired
+        if emaTrend > emaLong     // trend still bullish -> resume hunting NOW (UPDATE #7):
+            huntBull := true      // section 4 runs after this block on the SAME bar, so if
+                                  // this invalidation candle touches the DC low it becomes
+                                  // the anchor/start of the NEXT signal range immediately.
     else if not dayBlocked
         strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
 else if flatNow and not squareOff and not inGap and pendingShort
@@ -350,6 +362,8 @@ else if flatNow and not squareOff and not inGap and pendingShort
     else if high >= pendingSL
         strategy.cancel("Short")   // kill any resting breakout order for this dead setup
         pendingShort := false
+        if emaTrend < emaLong      // trend still bearish -> resume hunting NOW (UPDATE #7,
+            huntBear := true       // mirror of the bull side).
     else if not dayBlocked
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
 
