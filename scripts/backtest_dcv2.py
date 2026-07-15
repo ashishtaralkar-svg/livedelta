@@ -398,6 +398,57 @@ def report_option(trades: list[dict], args) -> None:
           f"(gross ${sum(t['gross'] for t in trades):.2f}, fees ${total_fee:.2f})")
 
 
+def export_option(trades: list[dict], args, path: str) -> None:
+    """Write every leg to an .xlsx (Trades sheet + a Summary sheet)."""
+    import pandas as pd
+
+    rows, cum = [], 0.0
+    for i, t in enumerate(trades, 1):
+        cum += t["net"]
+        rows.append({
+            "#": i,
+            "entry_IST": _ist(t["entry_time"]),
+            "exit_IST": _ist(t["exit_time"]),
+            "signal": t["signal"],
+            "leg": t["tag"],                 # ENTRY or ROLL
+            "contract": t["contract"],
+            "btc_entry": round(t["btc_entry"], 1),
+            "btc_exit": round(t["btc_exit"], 1),
+            "opt_sold": round(t["opt_in"], 1),
+            "opt_bought_back": round(t["opt_out"], 1),
+            "exit_reason": t["reason"],
+            "gross_usd": round(t["gross"], 2),
+            "fee_usd": round(t["fee"], 2),
+            "net_usd": round(t["net"], 2),
+            "cumulative_net_usd": round(cum, 2),
+        })
+    df = pd.DataFrame(rows)
+
+    closed = [t for t in trades if t["reason"] != "OPEN_AT_END"]
+    wins = [t for t in closed if t["net"] > 0]
+    srows = [
+        ("days", args.days), ("resolution", args.resolution),
+        ("premium_target", args.target_premium), ("lots", args.lots),
+        ("tp_decay_pct", args.tp_decay_pct), ("weekend_mode", args.weekend_mode),
+        ("legs_closed", len(closed)),
+        ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
+        ("gross_usd", round(sum(t["gross"] for t in trades), 2)),
+        ("fees_usd", round(sum(t["fee"] for t in trades), 2)),
+        ("TOTAL_NET_usd", round(sum(t["net"] for t in trades), 2)),
+    ]
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "WEEKEND", "OPEN_AT_END"):
+        rs = [t for t in trades if t["reason"] == reason]
+        if rs:
+            srows.append((f"{reason}_n", len(rs)))
+            srows.append((f"{reason}_net_usd", round(sum(t["net"] for t in rs), 2)))
+    summary = pd.DataFrame(srows, columns=["metric", "value"])
+
+    with pd.ExcelWriter(path, engine="openpyxl") as xl:
+        summary.to_excel(xl, sheet_name="Summary", index=False)
+        df.to_excel(xl, sheet_name="Trades", index=False)
+    print(f"\nExcel written: {path}  ({len(df)} legs)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="DCv2 (Pine port) backtest -- directional BTC or option-sell")
     p.add_argument("--mode", choices=("btc", "option"), default="btc")
@@ -427,6 +478,8 @@ def main() -> None:
     p.add_argument("--tp-decay-pct", type=float, default=0.0,
                    help="[option mode] book profit when the sold option decays this %% "
                         "(e.g. 70 -> buy back at 30%% of entry premium; 0 = off)")
+    p.add_argument("--out", default="",
+                   help="[option mode] also write every leg to this .xlsx file")
     p.add_argument("--weekend-mode", choices=("blackout", "fri-flat", "none"), default="blackout",
                    help="[option mode] weekend handling: blackout (Fri 20:00->Mon 05:30 no trade), "
                         "fri-flat (flatten the whole trade at Friday 17:25, roll Mon-Thu), "
@@ -460,7 +513,10 @@ def main() -> None:
     print(f"Candles: {len(candles)} ({args.resolution}) "
           f"{_ist(candles[0].start_time)} .. {_ist(candles[-1].start_time)}")
     if args.mode == "option":
-        report_option(run_option(candles, settings, args, sim_start), args)
+        trades = run_option(candles, settings, args, sim_start)
+        report_option(trades, args)
+        if args.out:
+            export_option(trades, args, args.out)
     else:
         report(run(candles, args, sim_start), args)
 
