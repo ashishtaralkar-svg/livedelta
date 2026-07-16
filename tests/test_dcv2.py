@@ -213,6 +213,38 @@ def test_sell_trail_arms_below_both_emas_then_close_above_exits() -> None:
     assert s.position_state == PositionState.FLAT
 
 
+def test_next_green_raw_forms_two_candle_range() -> None:
+    """Research variant: raw candles + next_green confirm. A DC-lower touch
+    followed by an immediate GREEN candle arms a 2-candle-range long."""
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    s = DCv2Strategy(dc_period=2, ema_trend_length=2, ema_long_length=4,
+                     use_heikin_ashi=False, confirm_mode="next_green",
+                     skip_weekdays=frozenset())
+    t = _ts(10, 0)
+    for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):   # bull warmup (raw closes rising)
+        s.update(_c(t + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
+    # candle A: long lower wick to DC low, closes back up (keeps EMA bullish).
+    s.update(_c(t + 4 * 300, 103.0, 104.0, 95.0, 103.0))
+    assert s._touched_bull is True
+    d = s.update(_c(t + 5 * 300, 100.0, 110.0, 100.0, 109.0))  # candle B: GREEN -> arm
+    assert s.has_pending and s._pending_long
+    assert s._pending_trigger == 110.0 and s._pending_sl == 95.0   # spans both candles
+
+
+def test_next_green_discards_when_next_candle_not_green() -> None:
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    s = DCv2Strategy(dc_period=2, ema_trend_length=2, ema_long_length=4,
+                     use_heikin_ashi=False, confirm_mode="next_green",
+                     skip_weekdays=frozenset())
+    t = _ts(10, 0)
+    for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):
+        s.update(_c(t + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
+    s.update(_c(t + 4 * 300, 103.0, 104.0, 95.0, 103.0))    # touch (long lower wick, closes up)
+    assert s._touched_bull is True
+    s.update(_c(t + 5 * 300, 105.0, 106.0, 101.0, 104.0))   # RED, no re-touch -> discard
+    assert not s.has_pending and s._touched_bull is False
+
+
 def test_gap_cancels_pending_and_rearms_after() -> None:
     s = _strategy()
     _bull_setup(s)

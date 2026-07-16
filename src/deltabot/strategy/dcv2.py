@@ -147,6 +147,8 @@ class DCv2Strategy:
         dc_period: int = 20,
         ema_trend_length: int = 50,
         ema_long_length: int = 200,
+        use_heikin_ashi: bool = True,
+        confirm_mode: str = "open_extreme",
         skip_weekdays: frozenset[int] = frozenset({5, 6}),  # Mon=0 .. Sat=5, Sun=6 (IST)
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 17,
@@ -157,6 +159,16 @@ class DCv2Strategy:
         self.dc_period = dc_period
         self.ema_trend_length = ema_trend_length
         self.ema_long_length = ema_long_length
+        # use_heikin_ashi=False -> run every indicator/pattern on the RAW candle
+        # OHLC (normal candlestick chart) instead of synthetic Heikin Ashi.
+        self.use_heikin_ashi = use_heikin_ashi
+        # confirm_mode:
+        #   "open_extreme" (default, deployed): the confirming candle has
+        #     open==low (bull) / open==high (bear), highest_touch re-anchor.
+        #   "next_green": a 2-candle range -- a candle touches the DC band and
+        #     the IMMEDIATE NEXT candle is green (bull) / red (bear); the range
+        #     spans those two candles. No open==extreme, no re-anchor.
+        self.confirm_mode = confirm_mode
         self.skip_weekdays = skip_weekdays
         self._tz = ZoneInfo(day_tz)
         self._sess_mins = day_start_hour * 60 + day_start_minute
@@ -288,8 +300,15 @@ class DCv2Strategy:
         ha_low = min(candle.low, ha_open, ha_close)
         self._ha_open, self._ha_close = ha_open, ha_close
 
-        ema_trend = self._ema_trend.update(ha_close)
-        ema_long = self._ema_long.update(ha_close)
+        # Bar OHLC that indicators/patterns run on: Heikin Ashi, or the RAW
+        # candle when use_heikin_ashi is False (normal candlestick chart).
+        if self.use_heikin_ashi:
+            bar_open, bar_high, bar_low, bar_close = ha_open, ha_high, ha_low, ha_close
+        else:
+            bar_open, bar_high, bar_low, bar_close = candle.open, candle.high, candle.low, candle.close
+
+        ema_trend = self._ema_trend.update(bar_close)
+        ema_long = self._ema_long.update(bar_close)
         dc_upper, dc_lower = self._dc.upper, self._dc.lower
         self._warmup_bars += 1
 
@@ -397,52 +416,70 @@ class DCv2Strategy:
                 and not just_closed_sl and self.ready):
             # Bullish hunt progression.
             if self._hunt_bull and dc_lower is not None:
-                if not self._touched_bull:
-                    if candle.low <= dc_lower:
-                        self._touched_bull = True
-                        self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
-                        self._anchor_lo_bull = ha_low
-                else:
-                    if (candle.low <= dc_lower and self._anchor_lo_bull is not None
-                            and ha_low < self._anchor_lo_bull):
-                        self._range_hi_bull, self._range_lo_bull = ha_high, ha_low
-                        self._anchor_lo_bull = ha_low
-                    else:
-                        self._range_hi_bull = max(self._range_hi_bull, ha_high)
-                        self._range_lo_bull = min(self._range_lo_bull, ha_low)
-                    # CONFIRM: open==low shape only -- direction came from the state gate.
-                    if _close_enough(ha_open, ha_low, candle.close):
-                        self._pending_long = True
-                        self._pending_trigger = self._range_hi_bull
-                        self._pending_sl = self._range_lo_bull
-                        self._hunt_bull = self._touched_bull = False
+                if self.confirm_mode == "next_green":
+                    if not self._touched_bull:
+                        if candle.low <= dc_lower:
+                            self._touched_bull = True
+                            self._range_hi_bull, self._range_lo_bull = bar_high, bar_low
+                    elif bar_close > bar_open:   # immediate NEXT candle is GREEN -> 2-candle range
+                        self._arm_long(max(self._range_hi_bull, bar_high),
+                                       min(self._range_lo_bull, bar_low))
+                    elif candle.low <= dc_lower:  # not green but re-touches -> new touch candle
+                        self._range_hi_bull, self._range_lo_bull = bar_high, bar_low
+                    else:                          # not green, no touch -> discard, keep hunting
+                        self._touched_bull = False
                         self._range_hi_bull = self._range_lo_bull = None
-                        self._anchor_lo_bull = None
+                else:
+                    if not self._touched_bull:
+                        if candle.low <= dc_lower:
+                            self._touched_bull = True
+                            self._range_hi_bull, self._range_lo_bull = bar_high, bar_low
+                            self._anchor_lo_bull = bar_low
+                    else:
+                        if (candle.low <= dc_lower and self._anchor_lo_bull is not None
+                                and bar_low < self._anchor_lo_bull):
+                            self._range_hi_bull, self._range_lo_bull = bar_high, bar_low
+                            self._anchor_lo_bull = bar_low
+                        else:
+                            self._range_hi_bull = max(self._range_hi_bull, bar_high)
+                            self._range_lo_bull = min(self._range_lo_bull, bar_low)
+                        # CONFIRM: open==low shape -- direction came from the state gate.
+                        if _close_enough(bar_open, bar_low, candle.close):
+                            self._arm_long(self._range_hi_bull, self._range_lo_bull)
 
             # Bearish hunt progression (mirror).
             if self._hunt_bear and dc_upper is not None:
-                if not self._touched_bear:
-                    if candle.high >= dc_upper:
-                        self._touched_bear = True
-                        self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
-                        self._anchor_hi_bear = ha_high
-                else:
-                    if (candle.high >= dc_upper and self._anchor_hi_bear is not None
-                            and ha_high > self._anchor_hi_bear):
-                        self._range_hi_bear, self._range_lo_bear = ha_high, ha_low
-                        self._anchor_hi_bear = ha_high
+                if self.confirm_mode == "next_green":
+                    if not self._touched_bear:
+                        if candle.high >= dc_upper:
+                            self._touched_bear = True
+                            self._range_hi_bear, self._range_lo_bear = bar_high, bar_low
+                    elif bar_close < bar_open:   # immediate NEXT candle is RED -> 2-candle range
+                        self._arm_short(max(self._range_hi_bear, bar_high),
+                                        min(self._range_lo_bear, bar_low))
+                    elif candle.high >= dc_upper:
+                        self._range_hi_bear, self._range_lo_bear = bar_high, bar_low
                     else:
-                        self._range_hi_bear = max(self._range_hi_bear, ha_high)
-                        self._range_lo_bear = min(self._range_lo_bear, ha_low)
-                    if _close_enough(ha_open, ha_high, candle.close):
-                        self._pending_short = True
-                        self._pending_trigger = self._range_lo_bear
-                        self._pending_sl = self._range_hi_bear
-                        self._hunt_bear = self._touched_bear = False
+                        self._touched_bear = False
                         self._range_hi_bear = self._range_lo_bear = None
-                        self._anchor_hi_bear = None
+                else:
+                    if not self._touched_bear:
+                        if candle.high >= dc_upper:
+                            self._touched_bear = True
+                            self._range_hi_bear, self._range_lo_bear = bar_high, bar_low
+                            self._anchor_hi_bear = bar_high
+                    else:
+                        if (candle.high >= dc_upper and self._anchor_hi_bear is not None
+                                and bar_high > self._anchor_hi_bear):
+                            self._range_hi_bear, self._range_lo_bear = bar_high, bar_low
+                            self._anchor_hi_bear = bar_high
+                        else:
+                            self._range_hi_bear = max(self._range_hi_bear, bar_high)
+                            self._range_lo_bear = min(self._range_lo_bear, bar_low)
+                        if _close_enough(bar_open, bar_high, candle.close):
+                            self._arm_short(self._range_hi_bear, self._range_lo_bear)
 
-        self._dc.push(ha_high, ha_low)
+        self._dc.push(bar_high, bar_low)
         self._prev_now_mins = now_mins
 
         if not (long_exit or short_exit or buy_signal or sell_signal):
@@ -455,6 +492,22 @@ class DCv2Strategy:
         )
 
     # ------------------------------------------------------------------ #
+    def _arm_long(self, rng_hi: float, rng_lo: float) -> None:
+        self._pending_long = True
+        self._pending_trigger = rng_hi
+        self._pending_sl = rng_lo
+        self._hunt_bull = self._touched_bull = False
+        self._range_hi_bull = self._range_lo_bull = None
+        self._anchor_lo_bull = None
+
+    def _arm_short(self, rng_hi: float, rng_lo: float) -> None:
+        self._pending_short = True
+        self._pending_trigger = rng_lo
+        self._pending_sl = rng_hi
+        self._hunt_bear = self._touched_bear = False
+        self._range_hi_bear = self._range_lo_bear = None
+        self._anchor_hi_bear = None
+
     def _clear_pending(self) -> None:
         self._pending_long = self._pending_short = False
         self._pending_trigger = self._pending_sl = None
