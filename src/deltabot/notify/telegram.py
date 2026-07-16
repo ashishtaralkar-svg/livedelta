@@ -39,10 +39,13 @@ def _num(x, digits: int = 1) -> str:
 def _format(event: NotifyEvent, ctx: dict) -> str:
     emoji = _EMOJI.get(event, "ℹ️")
     if event in (NotifyEvent.ENTRY_LONG, NotifyEvent.ENTRY_SHORT):
-        # Options entry: show the contract sold and the premium received.
+        # Options entry: show the contract sold and the premium received. A
+        # rollover (tag=ROLL) is a re-sell of an already-open trade at 17:30 --
+        # label it so it isn't mistaken for a brand-new signal.
         if ctx.get("contract"):
+            head = "ROLLOVER SELL" if ctx.get("tag") == "ROLL" else f"SELL {ctx.get('direction')}"
             msg = (
-                f"{emoji} <b>SELL {ctx.get('direction')}</b> {ctx.get('contract')}\n"
+                f"{emoji} <b>{head}</b> {ctx.get('contract')}\n"
                 f"Sell premium: {_num(ctx.get('premium'))}\n"
                 f"BTC: {_num(ctx.get('btc_price'))}"
             )

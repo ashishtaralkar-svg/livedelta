@@ -458,7 +458,7 @@ class DCv2Engine:
             await self.notifier.notify(
                 event, direction=direction, contract=symbol or "?",
                 premium=fill, btc_price=btc_price, sl_level=sl_level,
-                tp_price=round(self._tp_price, 1),
+                tp_price=round(self._tp_price, 1), tag=tag,
             )
         finally:
             self._entry_in_progress = False
