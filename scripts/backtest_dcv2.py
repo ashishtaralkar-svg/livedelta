@@ -102,6 +102,7 @@ def _make_strategy(args) -> DCv2Strategy:
         ema_long_length=args.ema_long_length,
         use_heikin_ashi=not args.raw_candles,
         confirm_mode=args.confirm_mode,
+        direction_gate=args.direction_gate,
         skip_weekdays=frozenset({5, 6}) if not args.no_skip_weekends else frozenset(),
         day_start_hour=args.day_start_hour, day_start_minute=args.day_start_minute,
         square_off_hour=args.square_off_hour, square_off_minute=args.square_off_minute,
@@ -373,7 +374,7 @@ def report_option(trades: list[dict], args) -> None:
         wknd_txt = f"blackout Fri {args.weekend_fri_hour:02d}:00->Mon {args.weekend_mon_hour:02d}:{args.weekend_mon_minute:02d}"
     chart_txt = "RAW candles" if args.raw_candles else "Heikin Ashi"
     print(f"DCv2 [OPTION SELL, 17:25 square-off + 17:30 rollover] -- {args.days}d, {args.resolution}, "
-          f"{chart_txt}, confirm={args.confirm_mode}, "
+          f"{chart_txt}, confirm={args.confirm_mode}, gate={args.direction_gate}, "
           f"premium ~{args.target_premium:.0f}, {args.lots} lots, {tp_txt}, "
           f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}, {wknd_txt}")
     print(f"{'=' * 122}")
@@ -468,6 +469,10 @@ def main() -> None:
     p.add_argument("--confirm-mode", choices=("open_extreme", "next_green"), default="open_extreme",
                    help="signal-range confirm: open_extreme (open==low/high, default) or "
                         "next_green (DC-touch candle + immediate next green/red candle = 2-candle range)")
+    p.add_argument("--direction-gate", choices=("ema", "session_line"), default="ema",
+                   help="ema (EMA50/200 gate + EMA exits, default) or session_line (ignore EMAs; "
+                        "17:30 session line -> BUY range must be entirely above it, SELL below; "
+                        "no EMA exits, no rollover, 17:25 flattens the trade)")
     p.add_argument("--qty", type=float, default=1.0, help="[btc mode] BTC position size (P&L = points x qty)")
     p.add_argument("--no-skip-weekends", action="store_true",
                    help="also take entries on Sat/Sun (blocked by default, like the Pine script)")

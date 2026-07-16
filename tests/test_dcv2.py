@@ -245,6 +245,36 @@ def test_next_green_discards_when_next_candle_not_green() -> None:
     assert not s.has_pending and s._touched_bull is False
 
 
+def test_session_line_whole_range_filter() -> None:
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    s = DCv2Strategy(direction_gate="session_line", skip_weekdays=frozenset())
+    s._session_line = 100.0
+    assert s._session_ok_long(101.0) and not s._session_ok_long(99.0)     # buy: whole range above
+    assert s._session_ok_short(99.0) and not s._session_ok_short(101.0)   # sell: whole range below
+
+
+def test_session_line_arm_discards_below_line_keeps_hunting() -> None:
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    s = DCv2Strategy(direction_gate="session_line", skip_weekdays=frozenset())
+    s._session_line = 100.0
+    s._hunt_bull = s._touched_bull = True
+    s._arm_long(rng_hi=105.0, rng_lo=99.0)     # range low below line -> discard, keep hunting
+    assert not s.has_pending and s._hunt_bull is True and s._touched_bull is False
+    s._touched_bull = True
+    s._arm_long(rng_hi=105.0, rng_lo=101.0)    # entirely above -> arm
+    assert s.has_pending and s._pending_long
+
+
+def test_session_line_1725_flattens_the_trade() -> None:
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    s = DCv2Strategy(direction_gate="session_line", skip_weekdays=frozenset())
+    s._in_long, s._sl_level, s._exit_mode = True, 90.0, "none"
+    s._prev_now_mins = 17 * 60 + 24            # 17:24 -> next bar crosses the 17:25 square-off
+    d = s.update(_c(_ts(17, 25), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.long_exit and d.exit_reason == "EOD"
+    assert s.position_state == PositionState.FLAT
+
+
 def test_gap_cancels_pending_and_rearms_after() -> None:
     s = _strategy()
     _bull_setup(s)

@@ -149,6 +149,7 @@ class DCv2Strategy:
         ema_long_length: int = 200,
         use_heikin_ashi: bool = True,
         confirm_mode: str = "open_extreme",
+        direction_gate: str = "ema",
         skip_weekdays: frozenset[int] = frozenset({5, 6}),  # Mon=0 .. Sat=5, Sun=6 (IST)
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 17,
@@ -169,6 +170,17 @@ class DCv2Strategy:
         #     the IMMEDIATE NEXT candle is green (bull) / red (bear); the range
         #     spans those two candles. No open==extreme, no re-anchor.
         self.confirm_mode = confirm_mode
+        # direction_gate:
+        #   "ema" (default, deployed): EMA(50) vs EMA(200) decides which side
+        #     hunts, plus the EMA-reversal / two-stage-trail exits.
+        #   "session_line": EMAs are IGNORED entirely. A horizontal session line
+        #     is drawn at each 17:30 (the session-open price). Both directions
+        #     hunt; a BUY range is taken only if it sits ENTIRELY ABOVE the line
+        #     (range low >= line), a SELL range only if ENTIRELY BELOW it (range
+        #     high <= line). No EMA-reversal/trail exit; the trade exits on its
+        #     fixed range SL or the 17:25 square-off (which FLATTENS it). No
+        #     rollover -- hunting restarts fresh at 17:30 with the new line.
+        self.direction_gate = direction_gate
         self.skip_weekdays = skip_weekdays
         self._tz = ZoneInfo(day_tz)
         self._sess_mins = day_start_hour * 60 + day_start_minute
@@ -187,6 +199,7 @@ class DCv2Strategy:
         self._ha_close: float | None = None
 
         self._prev_now_mins: int | None = None
+        self._session_line: float | None = None   # price at the last 17:30 (session_line mode)
 
         # Hunt state machine.
         self._hunt_bull = self._hunt_bear = False
@@ -241,15 +254,32 @@ class DCv2Strategy:
         self._clear_hunts()
 
     def _exit_mode_for(self, trig: float, is_long: bool) -> str:
-        """A trade triggering from the wrong side of BOTH EMAs (buy below
-        both, sell above both) uses the two-stage "trail" exit; otherwise the
-        normal EMA-relationship "cross" exit."""
+        """session_line mode: no EMA/trail exit at all ("none" -> SL / 17:25
+        only). EMA mode: a trade triggering from the wrong side of BOTH EMAs
+        (buy below both, sell above both) uses the two-stage "trail" exit;
+        otherwise the normal EMA-relationship "cross" exit."""
+        if self.direction_gate == "session_line":
+            return "none"
         et, el = self._ema_trend.value, self._ema_long.value
         if et is None or el is None:
             return "cross"
         if is_long:
             return "trail" if (et > trig and el > trig) else "cross"
         return "trail" if (et < trig and el < trig) else "cross"
+
+    def _session_ok_long(self, range_lo: float | None) -> bool:
+        """session_line mode: a BUY range is valid only if it sits ENTIRELY
+        ABOVE the session line. No-op (always True) in EMA mode."""
+        if self.direction_gate != "session_line":
+            return True
+        return (self._session_line is not None and range_lo is not None
+                and range_lo >= self._session_line)
+
+    def _session_ok_short(self, range_hi: float | None) -> bool:
+        if self.direction_gate != "session_line":
+            return True
+        return (self._session_line is not None and range_hi is not None
+                and range_hi <= self._session_line)
 
     # ------------------------------------------------------------------ #
     # Intracandle (live/ASAP) helpers -- same conventions as DchannelStrategy.
@@ -318,17 +348,29 @@ class DCv2Strategy:
                       and now_mins >= self._sq_mins and self._prev_now_mins < self._sq_mins)
         in_gap = self._sq_mins <= now_mins < self._sess_mins
         day_blocked = local.weekday() in self.skip_weekdays
+        # session_line mode: (re)draw the session line at 17:30 each day.
+        session_start = (self._prev_now_mins is not None
+                         and now_mins >= self._sess_mins and self._prev_now_mins < self._sess_mins)
+        if self.direction_gate == "session_line" and session_start:
+            self._session_line = candle.open
 
         # --- 0. Settlement gap: cancel pending + clear hunts (never closes a position) ---
         if square_off or in_gap:
             self._clear_pending()
             self._clear_hunts()
 
-        # --- 0.5. Hunt arming: STATE-based on the EMA(50)/EMA(200) relationship.
-        #     The "not already armed" guard makes the reset fire only on the
-        #     transition, so an in-progress range is never wiped mid-hunt. ---
+        # --- 0.5. Hunt arming. EMA mode: STATE-based on EMA(50) vs EMA(200)
+        #     (the "not already armed" guard fires the reset only on the
+        #     transition). session_line mode: EMAs ignored -> BOTH directions
+        #     always hunt; the session-line filter decides which range is taken
+        #     (in _arm_long/_arm_short). ---
         if not square_off and not in_gap and self.ready:
-            if ema_trend > ema_long and not self._hunt_bull:
+            if self.direction_gate == "session_line":
+                if not self._hunt_bull:
+                    self._hunt_bull = True
+                if not self._hunt_bear:
+                    self._hunt_bear = True
+            elif ema_trend > ema_long and not self._hunt_bull:
                 self._hunt_bull, self._hunt_bear = True, False
                 self._reset_ranges()
             elif ema_trend < ema_long and not self._hunt_bear:
@@ -344,9 +386,13 @@ class DCv2Strategy:
         just_closed_sl = False
 
         # --- 1/2. Exits: fixed SL (REAL price at the range extreme), or the EMA
-        #     relationship flipping against the position. No TP, no EOD close. ---
+        #     relationship flipping against the position. session_line mode adds
+        #     a 17:25 square-off that FLATTENS the trade (its only time exit;
+        #     exit_mode is "none" so no EMA/trail exit fires there). ---
         if self._in_long:
-            if self._sl_level is not None and candle.low <= self._sl_level:
+            if self.direction_gate == "session_line" and square_off:
+                long_exit, long_exit_price, exit_reason = True, candle.close, "EOD"
+            elif self._sl_level is not None and candle.low <= self._sl_level:
                 long_exit, long_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
             elif self._exit_mode == "cross" and ema_trend < ema_long:
@@ -361,7 +407,9 @@ class DCv2Strategy:
                     long_exit, long_exit_price, exit_reason = True, candle.close, "TRAIL"
                     just_closed_sl = True   # like SL: skip this bar, hunt anew from next
         elif self._in_short:
-            if self._sl_level is not None and candle.high >= self._sl_level:
+            if self.direction_gate == "session_line" and square_off:
+                short_exit, short_exit_price, exit_reason = True, candle.close, "EOD"
+            elif self._sl_level is not None and candle.high >= self._sl_level:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
             elif self._exit_mode == "cross" and ema_trend > ema_long:
@@ -393,7 +441,7 @@ class DCv2Strategy:
                 if not day_blocked:
                     buy_signal, entry_price, new_sl = True, trig, sl
                     self._in_long, self._sl_level = True, sl
-                    self._exit_mode = "trail" if (ema_trend > trig and ema_long > trig) else "cross"
+                    self._exit_mode = self._exit_mode_for(trig, is_long=True)
                     self._trail_armed = False
                 self._clear_pending()
         elif flat and not square_off and not in_gap and self._pending_short:
@@ -404,7 +452,7 @@ class DCv2Strategy:
                 if not day_blocked:
                     sell_signal, entry_price, new_sl = True, trig, sl
                     self._in_short, self._sl_level = True, sl
-                    self._exit_mode = "trail" if (ema_trend < trig and ema_long < trig) else "cross"
+                    self._exit_mode = self._exit_mode_for(trig, is_long=False)
                     self._trail_armed = False
                 self._clear_pending()
 
@@ -493,6 +541,13 @@ class DCv2Strategy:
 
     # ------------------------------------------------------------------ #
     def _arm_long(self, rng_hi: float, rng_lo: float) -> None:
+        if not self._session_ok_long(rng_lo):
+            # session_line mode: range not entirely above the line -> discard the
+            # completed range but keep hunting (huntBull stays on).
+            self._touched_bull = False
+            self._range_hi_bull = self._range_lo_bull = None
+            self._anchor_lo_bull = None
+            return
         self._pending_long = True
         self._pending_trigger = rng_hi
         self._pending_sl = rng_lo
@@ -501,6 +556,11 @@ class DCv2Strategy:
         self._anchor_lo_bull = None
 
     def _arm_short(self, rng_hi: float, rng_lo: float) -> None:
+        if not self._session_ok_short(rng_hi):
+            self._touched_bear = False
+            self._range_hi_bear = self._range_lo_bear = None
+            self._anchor_hi_bear = None
+            return
         self._pending_short = True
         self._pending_trigger = rng_lo
         self._pending_sl = rng_hi
