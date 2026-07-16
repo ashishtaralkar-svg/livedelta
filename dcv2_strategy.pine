@@ -35,8 +35,9 @@
 //             close back BELOW both EMAs exits at that close ("TRAIL").
 //           Mirror for a SELL triggering above both EMAs (arms on a close
 //           below both, exits on a close back above both).
-//   * AFTER AN SL EXIT: the SL bar itself never counts as the re-touch -- a
-//     FRESH band touch from the next bar onward starts the new range.
+//   * AFTER AN SL OR TRAIL EXIT: that exit bar never counts as the re-touch --
+//     the new-signal search begins on the immediate next bar (a FRESH band
+//     touch from there starts the new range).
 //   * SETTLEMENT GAP (17:25-17:30 IST): cancels pending setups + clears hunt
 //     state, blocks entries -- but NEVER closes an open position.
 //   * WEEKEND BLOCK (Sat/Sun IST, on by default): a trigger hit on a blocked
@@ -217,6 +218,7 @@ if strategy.position_size > 0
             trailArmedLong := true
         else if trailArmedLong and close < emaTrend and close < emaLong
             strategy.close("Long", comment="TRAIL")
+            justClosedSL := true   // like SL: skip this bar, hunt anew from next
 if strategy.position_size < 0
     if high >= shortStop
         strategy.close("Short", comment="SL")
@@ -228,6 +230,7 @@ if strategy.position_size < 0
             trailArmedShort := true
         else if trailArmedShort and close > emaTrend and close > emaLong
             strategy.close("Short", comment="TRAIL")
+            justClosedSL := true   // like SL: skip this bar, hunt anew from next
 
 // ----- 3. Breakout trigger for a PRIOR-armed pending setup (ASAP, real price).
 //          Weekend block gates only the real order. Invalidation clears the
@@ -267,7 +270,8 @@ else if flatNow and not squareOff and not inGap and pendingShort
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
 
 // ----- 4. Hunt progression (HA-based), only while flat/no pending/gates ok.
-//          justClosedSL: the SL bar itself never counts as the re-touch. -----
+//          justClosedSL: after an SL OR TRAIL exit, that exit bar never counts
+//          as the re-touch -- a new signal is hunted from the NEXT bar. -----
 flatForHunt = strategy.position_size == 0 and not pendingLong and not pendingShort and not squareOff and not inGap and not justClosedSL
 if flatForHunt
     // Bullish hunt progression.

@@ -45,9 +45,9 @@ Rules (buy side described; sell side is the exact mirror):
       both, exits on a close back above both). Close checks use the REAL
       candle close against the HA-based EMA levels, per this codebase's
       levels-from-HA / crossings-from-real-price convention.
-  * **After an SL exit**, the SL bar itself never counts as the re-touch --
-    a FRESH band touch from the next bar onward starts the new range
-    (Pine's justClosedSL).
+  * **After an SL or TRAIL exit**, that exit bar never counts as the
+    re-touch -- the new-signal search begins on the immediate next bar, and
+    a FRESH band touch from there starts the new range (Pine's justClosedSL).
   * **Settlement gap** (17:25-17:30 IST): cancels any pending setup and
     clears hunt state; blocks entries; does NOT close an open position.
     State-based arming re-arms immediately after the gap.
@@ -340,6 +340,7 @@ class DCv2Strategy:
                     self._trail_armed = True
                 elif self._trail_armed and candle.close < ema_trend and candle.close < ema_long:
                     long_exit, long_exit_price, exit_reason = True, candle.close, "TRAIL"
+                    just_closed_sl = True   # like SL: skip this bar, hunt anew from next
         elif self._in_short:
             if self._sl_level is not None and candle.high >= self._sl_level:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
@@ -351,6 +352,7 @@ class DCv2Strategy:
                     self._trail_armed = True
                 elif self._trail_armed and candle.close > ema_trend and candle.close > ema_long:
                     short_exit, short_exit_price, exit_reason = True, candle.close, "TRAIL"
+                    just_closed_sl = True   # like SL: skip this bar, hunt anew from next
         if long_exit or short_exit:
             self._in_long = self._in_short = False
             self._sl_level = None
@@ -388,7 +390,8 @@ class DCv2Strategy:
                 self._clear_pending()
 
         # --- 4. Hunt progression (HA-based), only while flat/no pending/gates ok.
-        #     just_closed_sl: the SL bar itself never counts as the re-touch. ---
+        #     just_closed_sl: after an SL OR TRAIL exit, that exit bar never
+        #     counts -- the new-signal search begins on the IMMEDIATE NEXT bar. ---
         flat_now = not self._in_long and not self._in_short
         if (flat_now and not self.has_pending and not square_off and not in_gap
                 and not just_closed_sl and self.ready):

@@ -98,6 +98,24 @@ def test_invalidation_before_trigger_discards_setup() -> None:
     assert not s.has_pending and s.position_state == PositionState.FLAT
 
 
+def test_trail_exit_skips_its_own_bar_like_sl() -> None:
+    """After a TRAIL exit (like an SL exit), the exit bar must NOT start a new
+    range even if it touches a Donchian band -- hunting resumes NEXT bar."""
+    s = _strategy()
+    # Put the strategy directly into an armed trail-mode long with a far SL.
+    s._in_long, s._exit_mode, s._trail_armed, s._sl_level = True, "trail", True, 50.0
+    s._warmup_bars = 100
+    s._ema_trend._value = s._ema_long._value = 200.0   # EMAs high -> a low close is below both
+    for _ in range(s.dc_period):
+        s._dc.push(100.0, 100.0)                        # dc_upper = dc_lower = 100
+
+    # Exit candle closes at 100 (below both post-update EMAs -> TRAIL) and its
+    # real high/low (101/99) touch BOTH Donchian bands.
+    d = s.update(_c(_ts(10, 30), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.long_exit and d.exit_reason == "TRAIL"
+    assert not s._touched_bull and not s._touched_bear   # exit bar skipped, no touch registered
+
+
 def test_no_eod_close_position_survives_1725() -> None:
     s = _strategy()
     _bull_setup(s, day=8)
