@@ -156,6 +156,22 @@ class Settings(BaseSettings):
     dchannel_intracandle_enabled: bool = False
     dchannel_tp_poll_seconds: float = 15.0  # poll option mark for the premium-decay TP (0 = only at 5m close)
 
+    # DCv2 (strategy=dcv2): 5m Donchian(20) + open==low/high on HA, EMA(50)/EMA(200)
+    # STATE-based hunt gate, fixed signal-range SL, EMA-reversal + two-stage TRAIL
+    # exits; option SELL with a 70% premium-decay TP, 17:25 daily square-off and a
+    # 17:30 same-direction rollover, and a Friday-flat before the weekend. Best
+    # backtest (5m, 25 lots, fri-flat, 70% TP): +$1,056 net / 6mo.
+    dcv2_dc_period: int = 20
+    dcv2_ema_trend_length: int = 50
+    dcv2_ema_long_length: int = 200
+    # ASAP intracandle ENTRY + SL: open the instant REAL price breaks the trigger,
+    # buy back the instant it touches the fixed range SL (TRAIL/EMA-reversal stay
+    # closed-bar). False = strictly closed-bar (exactly matches the backtest).
+    dcv2_intracandle_enabled: bool = True
+    dcv2_tp_poll_seconds: float = 15.0   # poll option mark for the 70% decay TP (0 = only at 5m close)
+    dcv2_weekend_flat: bool = True       # flatten the whole trade at Friday's 17:25 (no weekend carry)
+    dcv2_rollover_enabled: bool = True   # re-sell a fresh option at 17:30 while the trade is still open
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

@@ -56,3 +56,24 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # DCv2 bot -- runs on its OWN Delta SUB-ACCOUNT, in parallel with the other
+  # bots which it NEVER touches (separate capital, DELTA_STATE_FILE=state/dcv2_pos.json).
+  # Fill .env.dcv2 first (cp .env.dcv2.example .env.dcv2, add the sub-account API
+  # keys). Bring it up ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build dcv2bot
+  dcv2bot:
+    build: .
+    image: deltabot:latest
+    container_name: dcv2bot
+    restart: always
+    env_file:
+      - .env.dcv2
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
