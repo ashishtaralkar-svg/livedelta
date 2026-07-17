@@ -50,7 +50,13 @@ def fetch_option_candles(
     out) so a single blip doesn't abort a long backtest.
     """
     params = {"symbol": symbol, "resolution": resolution, "start": start, "end": end}
-    for attempt in range(4):
+    # Transient network/DNS blips (getaddrinfo failed, read timeouts) can last
+    # many seconds; retry generously with capped backoff so one hiccup never
+    # aborts a multi-minute backtest. Total retry budget ~90s before giving up.
+    attempts = 8
+    backoff = [1, 2, 4, 8, 15, 20, 30]
+    resp = None
+    for attempt in range(attempts):
         try:
             resp = client.get("/v2/history/candles", params=params)
             resp.raise_for_status()
@@ -61,13 +67,16 @@ def fetch_option_candles(
             sc = exc.response.status_code
             if 400 <= sc < 500 and sc != 429:
                 return {}
-            if attempt == 3:
+            if attempt == attempts - 1:
                 raise
-            time.sleep(1.0 + attempt)
-        except (httpx.TimeoutException, httpx.TransportError):
-            if attempt == 3:
-                raise
-            time.sleep(1.0 + attempt)
+            time.sleep(backoff[min(attempt, len(backoff) - 1)])
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            if attempt == attempts - 1:
+                # Give up on THIS contract instead of killing the whole run --
+                # the caller treats an empty result as "couldn't price, skip".
+                print(f"NOTE: skipping {symbol} after {attempts} network failures ({exc!r})")
+                return {}
+            time.sleep(backoff[min(attempt, len(backoff) - 1)])
     rows = resp.json().get("result") or []
     out: dict[int, Candle] = {}
     for r in rows:
