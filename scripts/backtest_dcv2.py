@@ -257,8 +257,13 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
             return False
         if floor:
             entry_prem = max(entry_prem, op.intrinsic_value(sym, btc_px))
+        # Paper-trade filter: an entry whose SL is WIDER than --max-sl-pct of the
+        # BTC price is too much risk -> tracked but NOT counted in the real NET.
+        sl_pct = abs(btc_px - sl_level) / btc_px * 100.0 if sl_level else 0.0
+        is_paper = args.paper_trade_wide_sl and args.max_sl_pct > 0 and sl_pct > args.max_sl_pct
         pos = {"is_buy": is_buy, "sym": sym, "candles": ocandles, "entry_time": ts,
                "entry_btc": btc_px, "entry_prem": entry_prem, "sl_level": sl_level, "tag": tag,
+               "sl_pct": sl_pct, "is_paper": is_paper,
                "tp_price": entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None,
                "last_check": ts}
         return True
@@ -278,6 +283,7 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
             "signal": "BUY" if pos["is_buy"] else "SELL", "contract": pos["sym"],
             "tag": pos["tag"], "btc_entry": pos["entry_btc"], "btc_exit": exit_btc,
             "opt_in": entry_fill, "opt_out": exit_fill, "reason": reason,
+            "sl_pct": pos.get("sl_pct", 0.0), "is_paper": pos.get("is_paper", False),
             "gross": gross, "fee": fee, "net": gross - fee,
         })
         pos = None
@@ -394,20 +400,25 @@ def report_option(trades: list[dict], args) -> None:
         print(f"{_ist(t['entry_time']):<22}{t['signal']:<5}{t['tag']:<6}{t['contract']:<22}"
               f"{t['btc_entry']:>9.1f}{t['btc_exit']:>9.1f}{t['opt_in']:>8.1f}{t['opt_out']:>8.1f} "
               f"{t['reason']:<12}{t['net']:>10.2f}")
-    closed = [t for t in trades if t["reason"] != "OPEN_AT_END"]
+    # Real legs drive the NET; paper legs (wide SL) are tracked but excluded.
+    real = [t for t in trades if not t.get("is_paper")]
+    paper = [t for t in trades if t.get("is_paper")]
+    closed = [t for t in real if t["reason"] != "OPEN_AT_END"]
     wins = [t for t in closed if t["net"] > 0]
     print(f"{'-' * 122}")
-    print(f"Legs: {len(closed)} closed"
-          + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
+    print(f"REAL legs: {len(closed)} closed"
+          + (" (+1 still open at data end)" if len(real) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
     for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "ROLL", "WEEKEND", "OPEN_AT_END"):
-        rs = [t for t in trades if t["reason"] == reason]
+        rs = [t for t in real if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
-    total_fee = sum(t["fee"] for t in trades)
-    print(f"TOTAL NET: ${sum(t['net'] for t in trades):.2f} "
-          f"(gross ${sum(t['gross'] for t in trades):.2f}, fees ${total_fee:.2f})")
+    print(f"TOTAL NET (real): ${sum(t['net'] for t in real):.2f} "
+          f"(gross ${sum(t['gross'] for t in real):.2f}, fees ${sum(t['fee'] for t in real):.2f})")
+    if paper:
+        print(f"PAPER legs (wide SL >{args.max_sl_pct:.2f}%, NOT counted): {len(paper)}  "
+              f"would-be net ${sum(t['net'] for t in paper):.2f}")
 
 
 def export_option(trades: list[dict], args, path: str) -> None:
@@ -416,13 +427,16 @@ def export_option(trades: list[dict], args, path: str) -> None:
 
     rows, cum = [], 0.0
     for i, t in enumerate(trades, 1):
-        cum += t["net"]
+        if not t.get("is_paper"):
+            cum += t["net"]      # cumulative tracks REAL legs only
         rows.append({
             "#": i,
             "entry_IST": _ist(t["entry_time"]),
             "exit_IST": _ist(t["exit_time"]),
             "signal": t["signal"],
             "leg": t["tag"],                 # ENTRY or ROLL
+            "paper": "PAPER" if t.get("is_paper") else "",
+            "sl_pct": round(t.get("sl_pct", 0.0), 3),
             "contract": t["contract"],
             "btc_entry": round(t["btc_entry"], 1),
             "btc_exit": round(t["btc_exit"], 1),
@@ -436,20 +450,25 @@ def export_option(trades: list[dict], args, path: str) -> None:
         })
     df = pd.DataFrame(rows)
 
-    closed = [t for t in trades if t["reason"] != "OPEN_AT_END"]
+    real = [t for t in trades if not t.get("is_paper")]
+    paper = [t for t in trades if t.get("is_paper")]
+    closed = [t for t in real if t["reason"] != "OPEN_AT_END"]
     wins = [t for t in closed if t["net"] > 0]
     srows = [
         ("days", args.days), ("resolution", args.resolution),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("tp_decay_pct", args.tp_decay_pct), ("weekend_mode", args.weekend_mode),
-        ("legs_closed", len(closed)),
+        ("paper_trade_wide_sl", args.paper_trade_wide_sl), ("max_sl_pct", args.max_sl_pct),
+        ("real_legs_closed", len(closed)),
         ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
-        ("gross_usd", round(sum(t["gross"] for t in trades), 2)),
-        ("fees_usd", round(sum(t["fee"] for t in trades), 2)),
-        ("TOTAL_NET_usd", round(sum(t["net"] for t in trades), 2)),
+        ("gross_usd_real", round(sum(t["gross"] for t in real), 2)),
+        ("fees_usd_real", round(sum(t["fee"] for t in real), 2)),
+        ("TOTAL_NET_usd_real", round(sum(t["net"] for t in real), 2)),
+        ("paper_legs", len(paper)),
+        ("paper_wouldbe_net_usd", round(sum(t["net"] for t in paper), 2)),
     ]
     for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "ROLL", "WEEKEND", "OPEN_AT_END"):
-        rs = [t for t in trades if t["reason"] == reason]
+        rs = [t for t in real if t["reason"] == reason]
         if rs:
             srows.append((f"{reason}_n", len(rs)))
             srows.append((f"{reason}_net_usd", round(sum(t["net"] for t in rs), 2)))
@@ -500,6 +519,12 @@ def main() -> None:
     p.add_argument("--exit-slippage-pct", type=float, default=0.0)
     p.add_argument("--no-intrinsic-floor", action="store_true",
                    help="[option mode] disable intrinsic-value flooring (NOT recommended)")
+    p.add_argument("--paper-trade-wide-sl", action="store_true",
+                   help="[option mode] entries whose SL is wider than --max-sl-pct of BTC price "
+                        "are PAPER (tracked, but no real leg / excluded from the real NET)")
+    p.add_argument("--max-sl-pct", type=float, default=0.67,
+                   help="[option mode] SL-distance %% of BTC price above which a trade is paper "
+                        "(default 0.67; only applies with --paper-trade-wide-sl)")
     p.add_argument("--tp-decay-pct", type=float, default=0.0,
                    help="[option mode] book profit when the sold option decays this %% "
                         "(e.g. 70 -> buy back at 30%% of entry premium; 0 = off)")
