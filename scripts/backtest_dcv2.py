@@ -95,6 +95,13 @@ def _first_decay_time(candles: dict, after: int, upto: int, tp_price: float) -> 
     return min(hit) if hit else None
 
 
+def _first_rally_time(candles: dict, after: int, upto: int, tp_price: float) -> int | None:
+    """Earliest option-candle start_time in (after, upto] whose HIGH rallied UP
+    to tp_price -- the buy-side (long option) take-profit."""
+    hit = [t for t, c in candles.items() if after < t <= upto and c.high >= tp_price]
+    return min(hit) if hit else None
+
+
 def _make_strategy(args) -> DCv2Strategy:
     return DCv2Strategy(
         dc_period=args.dc_period,
@@ -203,7 +210,9 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
     es = args.entry_slippage_pct / 100.0
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
-    tp_decay = args.tp_decay_pct / 100.0   # 0 = off; 0.70 -> buy back at 30% of entry
+    side = args.side                       # "sell" (default) or "buy"
+    tp_decay = args.tp_decay_pct / 100.0   # sell: 0.70 -> buy back at 30% of entry
+    tp_gain = args.tp_gain_pct / 100.0     # buy:  1.00 -> sell when premium DOUBLES
     sq_mins = args.square_off_hour * 60 + args.square_off_minute
     sess_mins = args.day_start_hour * 60 + args.day_start_minute
     # Weekend blackout: no position held or opened from Fri --weekend-fri-hour
@@ -242,7 +251,12 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
 
     def open_leg(client, ts: int, btc_px: float, is_buy: bool, sl_level, tag: str) -> bool:
         nonlocal pos
-        otype = OptionType.PUT if is_buy else OptionType.CALL
+        # SELL side: bullish signal -> sell PUT, bearish -> sell CALL.
+        # BUY side:  bullish signal -> buy  CALL, bearish -> buy  PUT.
+        if side == "buy":
+            otype = OptionType.CALL if is_buy else OptionType.PUT
+        else:
+            otype = OptionType.PUT if is_buy else OptionType.CALL
         expiry = op.select_expiry_date(ts, cutoff)
         resolved = op.resolve_by_premium(
             client, underlying, otype, btc_px, expiry, interval,
@@ -261,11 +275,14 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
         # BTC price is too much risk -> tracked but NOT counted in the real NET.
         sl_pct = abs(btc_px - sl_level) / btc_px * 100.0 if sl_level else 0.0
         is_paper = args.paper_trade_wide_sl and args.max_sl_pct > 0 and sl_pct > args.max_sl_pct
+        # TP price: SELL -> decay to (1-tp_decay)*entry; BUY -> rally to (1+tp_gain)*entry.
+        if side == "buy":
+            tp_price = entry_prem * (1.0 + tp_gain) if tp_gain > 0 else None
+        else:
+            tp_price = entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None
         pos = {"is_buy": is_buy, "sym": sym, "candles": ocandles, "entry_time": ts,
                "entry_btc": btc_px, "entry_prem": entry_prem, "sl_level": sl_level, "tag": tag,
-               "sl_pct": sl_pct, "is_paper": is_paper,
-               "tp_price": entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None,
-               "last_check": ts}
+               "sl_pct": sl_pct, "is_paper": is_paper, "tp_price": tp_price, "last_check": ts}
         return True
 
     def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float) -> None:
@@ -273,9 +290,14 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
         assert pos is not None
         if floor:
             exit_prem = max(exit_prem, op.intrinsic_value(pos["sym"], exit_btc))
-        entry_fill = pos["entry_prem"] * (1 - es)   # selling: receive less on entry
-        exit_fill = exit_prem * (1 + xs)            # buying back: pay more
-        gross = (entry_fill - exit_fill) * lots * op.LOT_BTC
+        if side == "buy":
+            entry_fill = pos["entry_prem"] * (1 + es)   # buying: pay more on entry
+            exit_fill = exit_prem * (1 - xs)            # selling back: receive less
+            gross = (exit_fill - entry_fill) * lots * op.LOT_BTC   # profit when premium RISES
+        else:
+            entry_fill = pos["entry_prem"] * (1 - es)   # selling: receive less on entry
+            exit_fill = exit_prem * (1 + xs)            # buying back: pay more
+            gross = (entry_fill - exit_fill) * lots * op.LOT_BTC   # profit when premium DECAYS
         fee = (op.side_fee(pos["entry_btc"], entry_fill, lots)
                + op.side_fee(exit_btc, exit_fill, lots))
         trades.append({
@@ -315,16 +337,17 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
                 eprice = dec.long_exit_price if dec.long_exit else dec.short_exit_price
                 close(dec.exit_reason, buyback_prem(c.start_time, eprice), c.start_time, eprice)
 
-            # 1b. Decay take-profit (only if no strategy exit this bar, matching
-            #     the conservative "strategy exit first" convention): buy the
-            #     option back once its premium has decayed to tp_price. Booking
-            #     the profit ENDS the trade -- flatten the strategy so it hunts
-            #     a fresh signal instead of rolling the position over. The
-            #     intrinsic floor blocks an impossible decay below intrinsic.
-            if pos is not None and tp_decay > 0 and pos["tp_price"] is not None:
-                can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
-                t_tp = (_first_decay_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"])
-                        if can_decay else None)
+            # 1b. Take-profit (only if no strategy exit this bar, conservative).
+            #     SELL: premium DECAYS to tp_price (buy back). BUY: premium
+            #     RALLIES to tp_price (sell). Booking it ENDS the trade -> flatten
+            #     the strategy so it hunts a fresh signal (no rollover).
+            if pos is not None and pos["tp_price"] is not None:
+                if side == "buy":
+                    t_tp = _first_rally_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"])
+                else:
+                    can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
+                    t_tp = (_first_decay_time(pos["candles"], pos["last_check"], c.start_time, pos["tp_price"])
+                            if can_decay else None)
                 if t_tp is not None:
                     close("TP", pos["tp_price"], t_tp, c.close)
                     strategy.force_flat()
@@ -376,7 +399,10 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
 
 def report_option(trades: list[dict], args) -> None:
     print(f"\n{'=' * 122}")
-    tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no TP"
+    if args.side == "buy":
+        tp_txt = f"BUY, {args.tp_gain_pct:.0f}%-gain TP"
+    else:
+        tp_txt = f"SELL, {args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "SELL, no TP"
     if args.no_skip_weekends:
         wknd_txt = "weekends TRADED"
     elif args.weekend_mode == "fri-flat":
@@ -511,8 +537,14 @@ def main() -> None:
     p.add_argument("--square-off-hour", type=int, default=17)
     p.add_argument("--square-off-minute", type=int, default=25)
     # option mode
+    p.add_argument("--side", choices=("sell", "buy"), default="sell",
+                   help="[option mode] sell options (default) or BUY them (bullish->buy CALL, "
+                        "bearish->buy PUT; profit when the premium rises)")
+    p.add_argument("--tp-gain-pct", type=float, default=100.0,
+                   help="[option mode, --side buy] take profit when premium rises this %% "
+                        "(100 -> option doubles; 0 = off)")
     p.add_argument("--target-premium", type=float, default=900.0,
-                   help="[option mode] sell the strike whose premium is nearest this (default 900)")
+                   help="[option mode] the strike whose premium is nearest this (sell 900 / buy ~400)")
     p.add_argument("--lots", type=int, default=25)
     p.add_argument("--opt-resolution", default="1m", help="[option mode] option candle resolution")
     p.add_argument("--entry-slippage-pct", type=float, default=0.0)
