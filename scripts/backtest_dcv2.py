@@ -103,6 +103,7 @@ def _make_strategy(args) -> DCv2Strategy:
         use_heikin_ashi=not args.raw_candles,
         confirm_mode=args.confirm_mode,
         direction_gate=args.direction_gate,
+        no_settlement_gap=args.continuous_roll,
         skip_weekdays=frozenset({5, 6}) if not args.no_skip_weekends else frozenset(),
         day_start_hour=args.day_start_hour, day_start_minute=args.day_start_minute,
         square_off_hour=args.square_off_hour, square_off_minute=args.square_off_minute,
@@ -324,16 +325,22 @@ def run_option(candles: list[Candle], settings, args, sim_start: int) -> list[di
                 else:
                     pos["last_check"] = c.start_time
 
-            # 2. 17:25 EOD square-off: close the option. Normally the directional
-            #    trade keeps running across the gap and rolls at 17:30. In
-            #    fri-flat mode, the last square-off before the weekend (Friday)
-            #    also FLATTENS the trade so nothing carries over (reason WEEKEND).
+            # 2. 17:25 square-off. Friday -> flatten (WEEKEND). Otherwise:
+            #    - continuous-roll: close the expiring option AND immediately
+            #      re-sell the same-direction NEXT-DAY option at 17:25 (one-step
+            #      roll) if the directional trade is still open.
+            #    - default: close (EOD); the trade rolls at 17:30 (section 4).
             if pos is not None and square_off:
                 weekend = flatten_before_weekend(c.start_time)
-                close("WEEKEND" if weekend else "EOD",
-                      buyback_prem(c.start_time, c.close), c.start_time, c.close)
                 if weekend:
+                    close("WEEKEND", buyback_prem(c.start_time, c.close), c.start_time, c.close)
                     strategy.force_flat()
+                elif args.continuous_roll and strategy.position_state.name != "FLAT":
+                    close("ROLL", buyback_prem(c.start_time, c.close), c.start_time, c.close)
+                    is_buy = strategy.position_state.name == "LONG"
+                    open_leg(client, c.start_time, c.close, is_buy, strategy.sl_level, "ROLL")
+                else:
+                    close("EOD", buyback_prem(c.start_time, c.close), c.start_time, c.close)
 
             # 3. New entry from a fresh strategy signal.
             if pos is None and dec is not None and dec.has_entry:
@@ -394,7 +401,7 @@ def report_option(trades: list[dict], args) -> None:
           + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "WEEKEND", "OPEN_AT_END"):
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "ROLL", "WEEKEND", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -441,7 +448,7 @@ def export_option(trades: list[dict], args, path: str) -> None:
         ("fees_usd", round(sum(t["fee"] for t in trades), 2)),
         ("TOTAL_NET_usd", round(sum(t["net"] for t in trades), 2)),
     ]
-    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "WEEKEND", "OPEN_AT_END"):
+    for reason in ("SL", "EMA_CROSS", "TRAIL", "TP", "EOD", "ROLL", "WEEKEND", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             srows.append((f"{reason}_n", len(rs)))
@@ -473,6 +480,10 @@ def main() -> None:
                    help="ema (EMA50/200 gate + EMA exits, default) or session_line (ignore EMAs; "
                         "17:30 session line -> BUY range must be entirely above it, SELL below; "
                         "no EMA exits, no rollover, 17:25 flattens the trade)")
+    p.add_argument("--continuous-roll", action="store_true",
+                   help="remove the 17:25-17:30 no-trade gap (continuous) and roll a still-open "
+                        "trade at 17:25 into the next-day option in one step (no 17:30 step). "
+                        "Weekend skip + Friday-flat are kept.")
     p.add_argument("--qty", type=float, default=1.0, help="[btc mode] BTC position size (P&L = points x qty)")
     p.add_argument("--no-skip-weekends", action="store_true",
                    help="also take entries on Sat/Sun (blocked by default, like the Pine script)")

@@ -150,6 +150,7 @@ class DCv2Strategy:
         use_heikin_ashi: bool = True,
         confirm_mode: str = "open_extreme",
         direction_gate: str = "ema",
+        no_settlement_gap: bool = False,
         skip_weekdays: frozenset[int] = frozenset({5, 6}),  # Mon=0 .. Sat=5, Sun=6 (IST)
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 17,
@@ -181,6 +182,8 @@ class DCv2Strategy:
         #     fixed range SL or the 17:25 square-off (which FLATTENS it). No
         #     rollover -- hunting restarts fresh at 17:30 with the new line.
         self.direction_gate = direction_gate
+        # no_settlement_gap: remove the 17:25-17:30 no-trade window (continuous).
+        self.no_settlement_gap = no_settlement_gap
         self.skip_weekdays = skip_weekdays
         self._tz = ZoneInfo(day_tz)
         self._sess_mins = day_start_hour * 60 + day_start_minute
@@ -347,6 +350,12 @@ class DCv2Strategy:
         square_off = (self._prev_now_mins is not None
                       and now_mins >= self._sq_mins and self._prev_now_mins < self._sq_mins)
         in_gap = self._sq_mins <= now_mins < self._sess_mins
+        # no_settlement_gap: trade continuously across 17:25-17:30 -- no entry
+        # block and no pending/hunt clearing at the boundary (the option roll is
+        # handled by the executor/runner; the 17:00 expiry cutoff already keeps
+        # near-settlement entries on the next-day option, so holding is safe).
+        if self.no_settlement_gap:
+            square_off = in_gap = False
         day_blocked = local.weekday() in self.skip_weekdays
         # session_line mode: (re)draw the session line at 17:30 each day.
         session_start = (self._prev_now_mins is not None

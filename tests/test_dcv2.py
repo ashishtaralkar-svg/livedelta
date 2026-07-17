@@ -245,6 +245,23 @@ def test_next_green_discards_when_next_candle_not_green() -> None:
     assert not s.has_pending and s._touched_bull is False
 
 
+def test_no_settlement_gap_keeps_pending_through_the_window() -> None:
+    """no_settlement_gap: the 17:25-17:30 window no longer cancels a pending
+    setup (default behavior DOES cancel it)."""
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    default = DCv2Strategy(skip_weekdays=frozenset())
+    default._pending_long, default._pending_trigger, default._pending_sl = True, 100.0, 90.0
+    default._prev_now_mins = 17 * 60 + 25              # already past the square-off edge
+    default.update(_c(_ts(17, 26), 95.0, 96.0, 94.0, 95.0))
+    assert not default.has_pending                    # default: gap cancels it
+
+    cont = DCv2Strategy(no_settlement_gap=True, skip_weekdays=frozenset())
+    cont._pending_long, cont._pending_trigger, cont._pending_sl = True, 100.0, 90.0
+    cont._prev_now_mins = 17 * 60 + 25
+    cont.update(_c(_ts(17, 26), 95.0, 96.0, 94.0, 95.0))
+    assert cont.has_pending                           # continuous: survives the window
+
+
 def test_session_line_whole_range_filter() -> None:
     from deltabot.strategy.dcv2 import DCv2Strategy
     s = DCv2Strategy(direction_gate="session_line", skip_weekdays=frozenset())
