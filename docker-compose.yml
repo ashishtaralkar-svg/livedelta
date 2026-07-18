@@ -77,3 +77,26 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # DCv3 bot -- DCv2's signal logic but BUYS options instead of selling
+  # (the mirror of dcv2bot), on its OWN Delta SUB-ACCOUNT, in parallel with
+  # dcv2bot/the other bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/dcv3_pos.json). Fill .env.dcv3 first (cp
+  # .env.dcv3.example .env.dcv3, add the sub-account API keys). Bring it up
+  # ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build dcv3bot
+  dcv3bot:
+    build: .
+    image: deltabot:latest
+    container_name: dcv3bot
+    restart: always
+    env_file:
+      - .env.dcv3
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

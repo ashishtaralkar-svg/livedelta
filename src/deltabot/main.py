@@ -8,6 +8,7 @@ import signal
 from .config import Settings, load_settings
 from .core.dchannel_trader import DchannelEngine
 from .core.dcv2_trader import DCv2Engine
+from .core.dcv3_trader import DCv3Engine
 from .core.heikin_ashi_trader import HeikinAshiEngine
 from .core.revbreak_trader import RevBreakSellEngine
 from .enums import NotifyEvent
@@ -34,6 +35,8 @@ async def run(settings: Settings) -> None:
         engine = DchannelEngine(settings, rest, notifier)
     elif settings.strategy == "dcv2":
         engine = DCv2Engine(settings, rest, notifier)
+    elif settings.strategy == "dcv3":
+        engine = DCv3Engine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)
