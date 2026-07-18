@@ -39,14 +39,18 @@ def _num(x, digits: int = 1) -> str:
 def _format(event: NotifyEvent, ctx: dict) -> str:
     emoji = _EMOJI.get(event, "ℹ️")
     if event in (NotifyEvent.ENTRY_LONG, NotifyEvent.ENTRY_SHORT):
-        # Options entry: show the contract sold and the premium received. A
-        # rollover (tag=ROLL) is a re-sell of an already-open trade at 17:30 --
-        # label it so it isn't mistaken for a brand-new signal.
+        # Options entry: show the contract traded and the premium paid/received.
+        # side="buy" (DCv3 etc.) BUYS the option; default/"sell" SELLS it (all
+        # other bots). A rollover (tag=ROLL) re-trades an already-open position
+        # at 17:30 -- label it so it isn't mistaken for a brand-new signal.
         if ctx.get("contract"):
-            head = "ROLLOVER SELL" if ctx.get("tag") == "ROLL" else f"SELL {ctx.get('direction')}"
+            is_buy_side = ctx.get("side") == "buy"
+            verb = "BUY" if is_buy_side else "SELL"
+            head = f"ROLLOVER {verb}" if ctx.get("tag") == "ROLL" else f"{verb} {ctx.get('direction')}"
+            prem_label = "Buy premium" if is_buy_side else "Sell premium"
             msg = (
                 f"{emoji} <b>{head}</b> {ctx.get('contract')}\n"
-                f"Sell premium: {_num(ctx.get('premium'))}\n"
+                f"{prem_label}: {_num(ctx.get('premium'))}\n"
                 f"BTC: {_num(ctx.get('btc_price'))}"
             )
             if ctx.get("sl_level") is not None:
@@ -80,13 +84,14 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
             f"{ctx.get('direction')} @ {ctx.get('price'):.2f}"
         )
     if event == NotifyEvent.EXIT:
-        # Options exit: show contract, buy/sell premiums and per-trade PnL.
+        # Options exit: show contract, entry/exit premiums and per-trade PnL.
         if ctx.get("contract"):
             pnl = ctx.get("pnl")
             pnl_mark = "🟢" if isinstance(pnl, (int, float)) and pnl >= 0 else "🔴"
+            open_verb, close_verb = ("Buy", "Sell") if ctx.get("side") == "buy" else ("Sell", "Buy")
             return (
                 f"{emoji} <b>EXIT</b> ({ctx.get('reason', '')}) {ctx.get('contract')}\n"
-                f"Sell: {_num(ctx.get('entry_premium'))} → Buy: {_num(ctx.get('exit_premium'))}\n"
+                f"{open_verb}: {_num(ctx.get('entry_premium'))} → {close_verb}: {_num(ctx.get('exit_premium'))}\n"
                 f"{pnl_mark} PnL: {_num(pnl, 2)} USD"
             )
         return f"{emoji} <b>EXIT</b> ({ctx.get('reason', '')}) size={ctx.get('size')}"

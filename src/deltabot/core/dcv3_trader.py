@@ -352,7 +352,7 @@ class DCv3Engine:
         self.strategy.force_flat()
         await self.notifier.notify(
             NotifyEvent.EXIT, reason="closed outside the bot (self-healed)",
-            contract=contract or "?", size=self.settings.option_contracts,
+            contract=contract or "?", size=self.settings.option_contracts, side="buy",
         )
 
     # ------------------------------------------------------------------ #
@@ -381,7 +381,7 @@ class DCv3Engine:
             await self.notifier.notify(
                 NotifyEvent.EXIT, reason="TP", contract=contract or "?",
                 entry_premium=entry_prem, exit_premium=exit_prem,
-                pnl=round(gross, 2), size=lots,
+                pnl=round(gross, 2), size=lots, side="buy",
             )
         finally:
             self._closing = False
@@ -410,7 +410,7 @@ class DCv3Engine:
             await self.notifier.notify(
                 NotifyEvent.EXIT, reason=reason, contract=contract or "?",
                 entry_premium=entry_prem, exit_premium=fill,
-                pnl=round(gross, 2), size=lots,
+                pnl=round(gross, 2), size=lots, side="buy",
             )
         finally:
             self._closing = False
@@ -462,7 +462,7 @@ class DCv3Engine:
             await self.notifier.notify(
                 event, direction=direction, contract=symbol or "?",
                 premium=fill, btc_price=btc_price, sl_level=sl_level,
-                tp_price=round(self._tp_price, 1), tag=tag,
+                tp_price=round(self._tp_price, 1), tag=tag, side="buy",
             )
         finally:
             self._entry_in_progress = False
@@ -588,6 +588,7 @@ class DCv3Engine:
                 await self.notifier.notify(
                     NotifyEvent.EXIT, reason=reason, contract=contract or "?",
                     entry_premium=entry_prem, exit_premium=fill, pnl=round(gross, 2), size=lots,
+                    side="buy",
                 )
             except Exception as exc:  # noqa: BLE001
                 log.error("DCv3: square-off close failed", extra={"extra": {"error": str(exc)}})
