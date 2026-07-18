@@ -39,7 +39,8 @@ class OptionsMarginError(RuntimeError):
 
 
 class OptionsExecutor:
-    """Manages entry and exit for a single short-option leg."""
+    """Manages entry and exit for a single option leg (SELL short or BUY long,
+    per ``settings.option_side``)."""
 
     def __init__(self, rest: RestClient, settings: Settings) -> None:
         self._rest = rest
@@ -50,6 +51,18 @@ class OptionsExecutor:
         self._option_type: OptionType | None = None
         self._symbol: str | None = None  # human-readable contract, e.g. C-BTC-61400-250626
         self._strike: float | None = None
+
+    @property
+    def is_buy_side(self) -> bool:
+        return self._settings.option_side == "buy"
+
+    def _option_type_for(self, signal_dir: int) -> OptionType:
+        """SELL: bullish -> sell PUT, bearish -> sell CALL. BUY: bullish -> buy
+        CALL, bearish -> buy PUT (the mirror -- a bought CALL profits when BTC
+        rises, matching a bullish signal directly)."""
+        if self.is_buy_side:
+            return OptionType.CALL if signal_dir == SignalDir.LONG else OptionType.PUT
+        return OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -111,7 +124,7 @@ class OptionsExecutor:
         Returns the winning chain entry dict (``symbol``, ``mark_price``,
         ``product_id``, ``strike``, ...) or ``None`` if the chain is empty/unpriced.
         """
-        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
+        option_type = self._option_type_for(signal_dir)
         expiry = self._select_expiry()
         underlying = self.underlying
 
@@ -157,14 +170,16 @@ class OptionsExecutor:
         best = await self.select_by_premium(signal_dir, target_premium)
         if best is None:
             return None, None
-        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
+        option_type = self._option_type_for(signal_dir)
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
 
         await self._check_balance()
-        await self._maybe_set_leverage(best["product_id"])
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(best["product_id"])   # leverage/margin is a sell-side concept
 
         size = self._settings.option_contracts
         result = await asyncio.to_thread(
-            self._rest.place_market_order, best["product_id"], size, Side.SELL
+            self._rest.place_market_order, best["product_id"], size, open_side
         )
 
         self._product_id = best["product_id"]
@@ -174,7 +189,7 @@ class OptionsExecutor:
         self._strike = best["strike"]
 
         log.info(
-            "Option SELL (by premium) placed",
+            f"Option {open_side.value.upper()} (by premium) placed",
             extra={"extra": {
                 "product_id": best["product_id"], "size": size,
                 "fill_price": result.average_fill_price, "mark_price": best["mark_price"],
@@ -201,16 +216,18 @@ class OptionsExecutor:
             )
             return None
 
-        option_type = OptionType.PUT if signal_dir == SignalDir.LONG else OptionType.CALL
+        option_type = self._option_type_for(signal_dir)
         target_strike = self._calc_strike(btc_price, option_type)
         expiry = self._select_expiry()
         underlying = self.underlying
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
 
         log.info(
             "Options entry",
             extra={
                 "extra": {
                     "signal": "BUY" if signal_dir == SignalDir.LONG else "SELL",
+                    "side": open_side.value,
                     "option_type": option_type.value,
                     "target_strike": target_strike,
                     "expiry": expiry.isoformat(),
@@ -225,14 +242,15 @@ class OptionsExecutor:
         product_id, strike, symbol = await self._select_contract(
             underlying, expiry, target_strike, option_type
         )
-        await self._maybe_set_leverage(product_id)
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(product_id)
 
         size = self._settings.option_contracts
         result = await asyncio.to_thread(
-            self._rest.place_market_order, product_id, size, Side.SELL
+            self._rest.place_market_order, product_id, size, open_side
         )
 
-        # Record state only AFTER the SELL has been accepted by the exchange.
+        # Record state only AFTER the order has been accepted by the exchange.
         self._product_id = product_id
         self._size = size
         self._option_type = option_type
@@ -240,7 +258,7 @@ class OptionsExecutor:
         self._strike = strike
 
         log.info(
-            "Option SELL order placed",
+            f"Option {open_side.value.upper()} order placed",
             extra={
                 "extra": {
                     "product_id": product_id,
@@ -253,10 +271,11 @@ class OptionsExecutor:
         return result.average_fill_price
 
     async def close_option(self) -> float | None:
-        """Buy back (reduce-only) the tracked short option to close the position.
+        """Close (reduce-only) the tracked option position -- BUY it back if we're
+        short (sell side), or SELL it if we're long (buy side).
 
         Returns the average fill price (or ``None`` if nothing was tracked). State
-        is cleared ONLY after the buy-back is accepted, so a failure leaves the
+        is cleared ONLY after the close is accepted, so a failure leaves the
         position tracked for a retry rather than orphaning it.
         """
         if self._product_id is None:
@@ -265,20 +284,21 @@ class OptionsExecutor:
 
         product_id = self._product_id
         size = self._size
+        close_side = Side.SELL if self.is_buy_side else Side.BUY
 
         log.info("Options exit", extra={"extra": {"product_id": product_id, "size": size}})
 
         result = await asyncio.to_thread(
-            self._rest.place_market_order, product_id, size, Side.BUY, True  # reduce_only=True
+            self._rest.place_market_order, product_id, size, close_side, True  # reduce_only=True
         )
 
-        # Clear state only AFTER the buy-back has been accepted.
+        # Clear state only AFTER the close has been accepted.
         self._product_id = None
         self._size = 0
         self._option_type = None
 
         log.info(
-            "Option BUY (close) order placed",
+            f"Option {close_side.value.upper()} (close) order placed",
             extra={
                 "extra": {
                     "product_id": product_id,

@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     # that margin actually changes. Higher leverage locks less margin but moves the
     # liquidation price much closer (can liquidate before the strategy SL fires).
     option_leverage: int = 0
+    # "sell" (default, all current bots): SELL the option, profit on premium decay.
+    # "buy": BUY the option instead (bullish signal -> buy CALL, bearish -> buy
+    # PUT), profit when the premium RISES; max loss is capped at the premium
+    # paid, no margin/leverage concept applies.
+    option_side: str = "sell"
 
     # --- Strategy ---
     # "revbreak" (default, RevBreakSellStrategy): prev-day-zone / open-gate
