@@ -116,57 +116,6 @@ def test_trail_exit_skips_its_own_bar_like_sl() -> None:
     assert not s._touched_bull and not s._touched_bear   # exit bar skipped, no touch registered
 
 
-def test_intracandle_sl_flat_skips_its_own_bar_like_closed_bar_sl() -> None:
-    """Live-engine parity: an INTRACANDLE SL (force_flat(skip_hunt_this_bar=True)
-    called mid-candle, before this candle closes -- mirrors _handle_forming_candle
-    in dcv2_trader.py) must ALSO exclude that same candle from starting a new
-    hunt once its closed-bar update() runs, exactly like a closed-bar SL/TRAIL
-    exit does via just_closed_sl. Regression for a real live divergence: on
-    2026-07-21 a real trade's SL was hit intracandle at 23:17 inside the
-    23:15-23:20 candle; because force_flat() cleared _in_long before that
-    candle's update() ran, the closed-bar SL branch never set just_closed_sl,
-    so the live strategy wrongly treated the SL-exit candle itself as the
-    first touch of the new hunt -- diverging from the backtest, which always
-    defers hunting to the next candle after an SL."""
-    s = _strategy()
-    s._in_long, s._exit_mode, s._sl_level = True, "cross", 50.0
-    s._warmup_bars = 100
-    s._ema_trend._value = s._ema_long._value = 40.0   # EMA bullish -> hunt_bull re-arms
-    for _ in range(s.dc_period):
-        s._dc.push(100.0, 100.0)                        # dc_upper = dc_lower = 100
-
-    # Live engine detects the SL touch against a REAL tick mid-candle and
-    # flattens the strategy BEFORE this candle closes.
-    s.force_flat(skip_hunt_this_bar=True)
-    assert s.position_state == PositionState.FLAT
-
-    # The same candle later closes; its real high/low (101/99) touch BOTH
-    # Donchian bands, which would normally start a new hunt touch. Nothing
-    # interesting happens on this bar (the exit already fired intracandle,
-    # and the touch is skipped) -> update() returns None, same as any other
-    # quiet bar.
-    d = s.update(_c(_ts(10, 30), 100.0, 101.0, 99.0, 100.0))
-    assert d is None
-    assert not s._touched_bull and not s._touched_bear   # exit bar skipped, no touch registered
-
-    # The NEXT candle is free to register a touch normally.
-    s.update(_c(_ts(10, 35), 100.0, 101.0, 99.0, 100.0))
-    assert s._touched_bull   # hunting resumed on the following bar
-
-
-def test_intracandle_sl_flag_is_consumed_only_once() -> None:
-    """The skip-hunt flag must not leak into the candle AFTER the exit candle."""
-    s = _strategy()
-    s._in_long, s._exit_mode, s._sl_level = True, "cross", 50.0
-    s._warmup_bars = 100
-    s._ema_trend._value = s._ema_long._value = 40.0
-    for _ in range(s.dc_period):
-        s._dc.push(100.0, 100.0)
-    s.force_flat(skip_hunt_this_bar=True)
-    s.update(_c(_ts(10, 30), 100.0, 101.0, 99.0, 100.0))   # consumes the flag
-    assert s._skip_hunt_next is False
-
-
 def test_no_eod_close_position_survives_1725() -> None:
     s = _strategy()
     _bull_setup(s, day=8)

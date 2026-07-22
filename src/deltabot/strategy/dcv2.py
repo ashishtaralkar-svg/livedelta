@@ -229,16 +229,6 @@ class DCv2Strategy:
         self._exit_mode = "cross"
         self._trail_armed = False
 
-        # Set by force_flat(skip_hunt_this_bar=True) when an INTRACANDLE exit
-        # (SL hit ASAP, before the candle closes) flattens the position outside
-        # of update(). Without this, the next update() call for that SAME candle
-        # sees itself already flat -- the closed-bar SL branch (which normally
-        # sets just_closed_sl) never runs -- so the exit candle would wrongly
-        # be used as the first touch of the new hunt instead of being skipped
-        # like a closed-bar SL/TRAIL exit is. Consumed (and cleared) by the
-        # very next update() call.
-        self._skip_hunt_next = False
-
     @property
     def position_state(self) -> PositionState:
         if self._in_long:
@@ -279,23 +269,13 @@ class DCv2Strategy:
             "exit_mode": self._exit_mode,
         }
 
-    def force_flat(self, skip_hunt_this_bar: bool = False) -> None:
-        """skip_hunt_this_bar: pass True when this flattens a position that was
-        exited INTRACANDLE (SL hit ASAP, before the forming candle closes) --
-        it makes the current/forming candle's later update() call defer hunt
-        progression to the NEXT candle, matching the closed-bar SL/TRAIL exit's
-        just_closed_sl behavior instead of using the exit candle itself as a
-        touch. Other force_flat() callers (reconcile/self-heal at startup,
-        entry-failure rollback) have no "current candle" to protect and should
-        leave this False."""
+    def force_flat(self) -> None:
         self._in_long = self._in_short = False
         self._sl_level = None
         self._exit_mode = "cross"
         self._trail_armed = False
         self._clear_pending()
         self._clear_hunts()
-        if skip_hunt_this_bar:
-            self._skip_hunt_next = True
 
     def _exit_mode_for(self, trig: float, is_long: bool) -> str:
         """session_line mode: no EMA/trail exit at all ("none" -> SL / 17:25
@@ -446,13 +426,7 @@ class DCv2Strategy:
         buy_signal = sell_signal = False
         entry_price = candle.close
         new_sl: float | None = None
-        # Carry forward an intracandle exit's skip-this-bar flag (see
-        # force_flat's skip_hunt_this_bar) so THIS candle -- the one whose
-        # intracandle SL already flattened the position before it closed --
-        # is excluded from hunt progression below, same as a closed-bar
-        # SL/TRAIL exit would exclude itself via just_closed_sl.
-        just_closed_sl = self._skip_hunt_next
-        self._skip_hunt_next = False
+        just_closed_sl = False
 
         # --- 1/2. Exits: fixed SL (REAL price at the range extreme), or the EMA
         #     relationship flipping against the position. session_line mode adds

@@ -211,7 +211,7 @@ class DCv2Engine:
             if long_sl or short_sl:
                 log.info("DCv2: intracandle SL touch — closing ASAP",
                          extra={"extra": {"sl": sl, "price": candle.close}})
-                self.strategy.force_flat(skip_hunt_this_bar=True)
+                self.strategy.force_flat()
                 await self._close_leg("SL", btc_exit_price=sl if sl is not None else candle.close)
                 return
         # ASAP entry: the instant REAL price breaks the pending trigger.
