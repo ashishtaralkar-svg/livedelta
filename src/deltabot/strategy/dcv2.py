@@ -196,6 +196,7 @@ class DCv2Strategy:
         self._ema_trend = _Ema(self.ema_trend_length)
         self._ema_long = _Ema(self.ema_long_length)
         self._warmup_bars = 0
+        self._dbg: dict = {}   # per-bar diagnostic snapshot (see update / debug_state)
 
         # Running Heikin Ashi state.
         self._ha_open: float | None = None
@@ -247,6 +248,26 @@ class DCv2Strategy:
     @property
     def sl_level(self) -> float | None:
         return self._sl_level
+
+    def debug_state(self) -> dict:
+        """Full internal-state snapshot for the engine's optional per-candle
+        diagnostic log (no side effects). Combines this bar's computed values
+        (``_dbg``) with the persistent hunt/pending/position flags, so a missed
+        or unexpected signal can be diagnosed minute-by-minute after the fact."""
+        def r(x):
+            return round(x, 2) if isinstance(x, (int, float)) else None
+        return {
+            **self._dbg,
+            "ready": self.ready,
+            "hunt_bull": self._hunt_bull, "hunt_bear": self._hunt_bear,
+            "touched_bull": self._touched_bull, "touched_bear": self._touched_bear,
+            "range_hi_bull": r(self._range_hi_bull), "range_lo_bull": r(self._range_lo_bull),
+            "range_hi_bear": r(self._range_hi_bear), "range_lo_bear": r(self._range_lo_bear),
+            "pending_long": self._pending_long, "pending_short": self._pending_short,
+            "pending_trig": r(self._pending_trigger), "pending_sl": r(self._pending_sl),
+            "pos": self.position_state.name, "sl_level": r(self._sl_level),
+            "exit_mode": self._exit_mode,
+        }
 
     def force_flat(self) -> None:
         self._in_long = self._in_short = False
@@ -344,6 +365,19 @@ class DCv2Strategy:
         ema_long = self._ema_long.update(bar_close)
         dc_upper, dc_lower = self._dc.upper, self._dc.lower
         self._warmup_bars += 1
+
+        # Diagnostic snapshot of the values the strategy USED this bar (DC bands
+        # are the prior-20 exclusion, before this bar is pushed). Read by
+        # debug_state() for the engine's optional per-candle state log.
+        self._dbg = {
+            "ha_o": round(bar_open, 2), "ha_h": round(bar_high, 2),
+            "ha_l": round(bar_low, 2), "ha_c": round(bar_close, 2),
+            "ema50": round(ema_trend, 2), "ema200": round(ema_long, 2),
+            "dc_lo": round(dc_lower, 2) if dc_lower is not None else None,
+            "dc_hi": round(dc_upper, 2) if dc_upper is not None else None,
+            "open_eq_low": _close_enough(bar_open, bar_low, candle.close),
+            "open_eq_high": _close_enough(bar_open, bar_high, candle.close),
+        }
 
         local = datetime.fromtimestamp(candle.start_time, tz=self._tz)
         now_mins = local.hour * 60 + local.minute

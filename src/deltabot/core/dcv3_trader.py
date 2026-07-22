@@ -253,6 +253,13 @@ class DCv3Engine:
 
         dec = self.strategy.update(candle)
 
+        # Optional per-candle diagnostic snapshot (DELTA_DCV2_DEBUG_STATE=true).
+        if self.settings.dcv2_debug_state:
+            log.info("DCv3 state", extra={"extra": {
+                "candle": candle.start_time, "o": candle.open, "h": candle.high,
+                "l": candle.low, "c": candle.close, "blocked": self._entries_blocked(),
+                "has_option": self.executor.has_open_position, **self.strategy.debug_state()}})
+
         # 1. Closed-bar exit (SL / EMA_CROSS / TRAIL) closes the option.
         if dec is not None and dec.has_exit and self.executor.has_open_position:
             exit_price = dec.long_exit_price if dec.long_exit else dec.short_exit_price

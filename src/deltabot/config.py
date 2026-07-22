@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     dcv2_tp_poll_seconds: float = 15.0   # poll option mark for the 70% decay TP (0 = only at 5m close)
     dcv2_weekend_flat: bool = True       # flatten the whole trade at Friday's 17:25 (no weekend carry)
     dcv2_rollover_enabled: bool = True   # re-sell a fresh option at 17:30 while the trade is still open
+    # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
+    # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
+    # missed/unexpected signal be reconstructed minute-by-minute from the live
+    # bot's own data instead of REST history. Off by default (verbose).
+    dcv2_debug_state: bool = False
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
