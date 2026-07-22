@@ -5,6 +5,7 @@
 .env.dchannel
 .env.dcv2
 .env.dcv3
+.env.dcv2sim
 state/
 
 # Python

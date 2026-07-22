@@ -100,3 +100,25 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # DCv2-SIM shadow bot -- runs the SAME DCv2 strategy CLOSED-BAR (the backtest
+  # model) but places NO real orders (DELTA_PAPER_MODE=true). It posts
+  # [DCv2-SIM] signals to Telegram so you can compare the model against the live
+  # dcv2bot in real time. Uses NO capital and can reuse any read-capable key.
+  # Fill .env.dcv2sim first. Bring it up ALONE:
+  #   docker compose up -d --build dcv2simbot
+  dcv2simbot:
+    build: .
+    image: deltabot:latest
+    container_name: dcv2simbot
+    restart: always
+    env_file:
+      - .env.dcv2sim
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

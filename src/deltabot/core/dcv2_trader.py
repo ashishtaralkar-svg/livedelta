@@ -47,7 +47,7 @@ from ..models import Candle
 from ..strategy.dcv2 import DCv2Strategy
 from . import position_state
 from .candle_aggregator import CandleAggregator
-from .options_executor import OptionsExecutor, OptionsMarginError
+from .options_executor import OptionsExecutor, OptionsMarginError, PaperExecutor
 
 _IST = ZoneInfo("Asia/Kolkata")
 _BAR_SECONDS = 300  # 5 minutes — DCv2's validated timeframe
@@ -74,7 +74,8 @@ class DCv2Engine:
             square_off_hour=settings.square_off_hour,
             square_off_minute=settings.square_off_minute,
         )
-        self.executor = OptionsExecutor(rest, settings)
+        self.executor = (PaperExecutor(rest, settings) if settings.paper_mode
+                         else OptionsExecutor(rest, settings))
         self.aggregator = CandleAggregator(
             on_closed=self._on_closed_candle, on_forming=self._on_forming_candle
         )
@@ -318,6 +319,8 @@ class DCv2Engine:
 
     # ------------------------------------------------------------------ #
     async def _maybe_verify_position(self) -> None:
+        if self.settings.paper_mode:
+            return   # paper positions are not on the exchange; nothing to verify
         iv = self.settings.position_verify_seconds
         if iv <= 0 or self._closing or self._entry_in_progress or not self.executor.has_open_position:
             self._verify_misses = 0
@@ -474,6 +477,15 @@ class DCv2Engine:
     async def _sync_options_to_exchange(self) -> None:
         """Reconcile the open option with the exchange on start/reconnect (this
         sub-account runs only dcv2bot, so any open short is ours)."""
+        if self.settings.paper_mode:
+            # No real positions to reconcile; a paper leg never survives a
+            # restart. Start flat and let the strategy re-hunt.
+            self.executor.clear()
+            self._entry_premium = self._tp_price = self._current_dir = None
+            self.strategy.force_flat()
+            self._closing = False
+            log.info("DCv2 (paper): reconcile skipped — starting FLAT")
+            return
         state_file = self.settings.state_file
         saved = position_state.load(state_file) if state_file else None
         owned_symbol = saved.get("symbol") if saved else None

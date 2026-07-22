@@ -420,3 +420,46 @@ class OptionsExecutor:
         offset = self._settings.option_offset
         raw = btc_price + offset if option_type == OptionType.PUT else btc_price - offset
         return int(round(raw / interval) * interval)
+
+
+class PaperExecutor(OptionsExecutor):
+    """Shadow (paper) executor: selects REAL contracts and reads REAL marks for
+    realistic premiums, but NEVER places an order. Used by the paper-mode
+    shadow bot so its Telegram signals mirror the model without any exchange
+    risk. Cannot trade by construction -- it never calls place_market_order."""
+
+    async def open_option_by_premium(
+        self, signal_dir: int, target_premium: float
+    ) -> tuple[float | None, str | None]:
+        if self._product_id is not None:
+            return None, None
+        best = await self.select_by_premium(signal_dir, target_premium)
+        if best is None:
+            return None, None
+        # Track it, but place NO order -- the "fill" is the current mark price.
+        self._product_id = best["product_id"]
+        self._size = self._settings.option_contracts
+        self._option_type = self._option_type_for(signal_dir)
+        self._symbol = best["symbol"]
+        self._strike = best["strike"]
+        log.info("PAPER open (no order)", extra={"extra": {
+            "symbol": best["symbol"], "mark": best["mark_price"], "side": self._settings.option_side}})
+        return best["mark_price"], best["symbol"]
+
+    async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
+        raise NotImplementedError("paper mode uses open_option_by_premium")
+
+    async def close_option(self) -> float | None:
+        if self._product_id is None:
+            return None
+        symbol = self._symbol
+        fill = None
+        try:
+            fill = await asyncio.to_thread(self._rest.get_mark_price, symbol)
+        except Exception as exc:  # noqa: BLE001 — paper close is best-effort
+            log.warning("PAPER close: mark fetch failed", extra={"extra": {"error": str(exc)}})
+        self._product_id = None
+        self._size = 0
+        self._option_type = None
+        log.info("PAPER close (no order)", extra={"extra": {"symbol": symbol, "mark": fill}})
+        return fill

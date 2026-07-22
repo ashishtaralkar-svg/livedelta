@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     # PUT), profit when the premium RISES; max loss is capped at the premium
     # paid, no margin/leverage concept applies.
     option_side: str = "sell"
+    # paper_mode: SHADOW bot -- run the full strategy + Telegram notifications
+    # but place NO real orders (PaperExecutor selects real contracts and reads
+    # real marks for realistic premiums, but never trades). Reconcile/self-heal
+    # are skipped (nothing on the exchange). Pair with intracandle=false to
+    # mirror the backtest exactly, and a distinct DELTA_BOT_LABEL (e.g. DCv2-SIM)
+    # so its signals are comparable-but-separable from the live bot's.
+    paper_mode: bool = False
 
     # --- Strategy ---
     # "revbreak" (default, RevBreakSellStrategy): prev-day-zone / open-gate
