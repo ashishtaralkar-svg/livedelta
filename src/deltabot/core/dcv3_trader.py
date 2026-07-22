@@ -219,7 +219,7 @@ class DCv3Engine:
             if long_sl or short_sl:
                 log.info("DCv3: intracandle SL touch — closing ASAP",
                          extra={"extra": {"sl": sl, "price": candle.close}})
-                self.strategy.force_flat()
+                self.strategy.force_flat(skip_hunt_this_bar=True)
                 await self._close_leg("SL", btc_exit_price=sl if sl is not None else candle.close)
                 return
         if self.executor.has_open_position or self._entry_in_progress:
