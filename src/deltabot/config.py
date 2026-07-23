@@ -183,6 +183,12 @@ class Settings(BaseSettings):
     dcv2_tp_poll_seconds: float = 15.0   # poll option mark for the 70% decay TP (0 = only at 5m close)
     dcv2_weekend_flat: bool = True       # flatten the whole trade at Friday's 17:25 (no weekend carry)
     dcv2_rollover_enabled: bool = True   # re-sell a fresh option at 17:30 while the trade is still open
+    # Remove the 17:25-17:30 settlement gap: close AND immediately re-sell the
+    # still-open directional trade's option in the SAME 17:25 event (no 5-minute
+    # wait), and let the strategy's own hunt/pending machinery run through that
+    # window too (matches the backtest's --continuous-roll, validated +14-51%
+    # over the gapped version). False (default) = today's live behavior unchanged.
+    dcv2_continuous_roll: bool = False
     # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
     # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
     # missed/unexpected signal be reconstructed minute-by-minute from the live

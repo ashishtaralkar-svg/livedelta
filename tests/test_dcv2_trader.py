@@ -216,6 +216,59 @@ async def test_square_off_friday_flattens_the_trade(monkeypatch) -> None:
     assert exits and exits[-1].kwargs["reason"] == "WEEKEND"
 
 
+async def test_square_off_continuous_roll_immediately_resells(monkeypatch) -> None:
+    """dcv2_continuous_roll=True, Mon-Thu: close AND re-sell in the SAME
+    _square_off() call -- no waiting for the 17:30 gap to clear."""
+    engine = _make_engine(skip_weekdays="Sat,Sun", dcv2_continuous_roll=True)
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.strategy._in_long = True
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 25, tzinfo=_ist))  # Wed
+    await engine._square_off()
+    assert engine.executor.close_calls == 1
+    assert engine.executor.has_open_position   # re-sold immediately
+    assert engine.strategy.position_state == PositionState.LONG   # directional trade untouched
+    exits = _exit_calls(engine.notifier)
+    assert exits and exits[-1].kwargs["reason"] == "ROLL"   # not "EOD"
+    entries = [c for c in engine.notifier.notify.await_args_list
+               if c.args and c.args[0] == NotifyEvent.ENTRY_LONG]
+    assert entries and entries[-1].kwargs["tag"] == "ROLL"
+
+
+async def test_square_off_continuous_roll_friday_still_flattens(monkeypatch) -> None:
+    """Friday-flat takes priority over continuous-roll: no immediate re-sell."""
+    engine = _make_engine(skip_weekdays="Sat,Sun", dcv2_continuous_roll=True)
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.strategy._in_long = True
+    _fake_now(monkeypatch, datetime(2026, 7, 10, 17, 25, tzinfo=_ist))  # Fri (Sat tomorrow)
+    await engine._square_off()
+    assert engine.executor.close_calls == 1
+    assert not engine.executor.has_open_position
+    assert engine.strategy.position_state == PositionState.FLAT
+    exits = _exit_calls(engine.notifier)
+    assert exits and exits[-1].kwargs["reason"] == "WEEKEND"
+
+
+async def test_entries_blocked_ignores_gap_when_continuous_roll(monkeypatch) -> None:
+    """With continuous_roll on, entries are never blocked by the 17:25-17:30
+    same-day gap (only weekday blocking still applies)."""
+    engine = _make_engine(skip_weekdays="Sat,Sun", dcv2_continuous_roll=True)
+    engine._sq_off_date = datetime(2026, 7, 8, tzinfo=_ist).date()
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 26, tzinfo=_ist))  # 1 min after square-off
+    assert engine._entries_blocked() is False
+
+    _fake_now(monkeypatch, datetime(2026, 7, 11, 12, 0, tzinfo=_ist))  # Sat -> still blocked
+    assert engine._entries_blocked() is True
+
+
+async def test_entries_blocked_respects_gap_by_default(monkeypatch) -> None:
+    """Default (continuous_roll=False): the same-day 17:25-17:30 gap still
+    blocks entries, matching today's live behavior."""
+    engine = _make_engine(skip_weekdays="Sat,Sun")
+    engine._sq_off_date = datetime(2026, 7, 8, tzinfo=_ist).date()
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 26, tzinfo=_ist))  # inside the gap
+    assert engine._entries_blocked() is True
+
+
 # ---------------------------------------------------------------------- #
 # 17:30 rollover: trade still open + option flat -> re-sell
 # ---------------------------------------------------------------------- #

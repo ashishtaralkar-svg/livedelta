@@ -85,6 +85,7 @@ class DCv3Engine:
             day_start_minute=settings.day_start_minute,
             square_off_hour=settings.square_off_hour,
             square_off_minute=settings.square_off_minute,
+            no_settlement_gap=settings.dcv2_continuous_roll,
         )
         self.executor = OptionsExecutor(rest, settings)
         self.aggregator = CandleAggregator(
@@ -92,6 +93,7 @@ class DCv3Engine:
         )
         self.ws: WebSocketManager | None = None
         self._last_closed_start: int | None = None
+        self._last_btc_close: float | None = None   # for the continuous-roll notify message
         self._tasks: set[asyncio.Task] = set()
         self._sq_off_task: asyncio.Task | None = None
         self._tp_poll_task: asyncio.Task | None = None
@@ -250,6 +252,7 @@ class DCv3Engine:
                 log.warning("DCv3: candle gap — re-seeding")
                 await self._warmup()
         self._last_closed_start = candle.start_time
+        self._last_btc_close = candle.close
 
         dec = self.strategy.update(candle)
 
@@ -542,6 +545,8 @@ class DCv3Engine:
         now = datetime.now(_IST)
         if now.weekday() in self.settings.skip_weekday_ints:
             return True
+        if self.settings.dcv2_continuous_roll:
+            return False   # no same-day settlement gap -- _square_off() rolls immediately
         if self._sq_off_date != now.date():
             return False
         resume = now.replace(hour=self.settings.entry_resume_hour,
@@ -578,9 +583,12 @@ class DCv3Engine:
         now = datetime.now(_IST)
         self._sq_off_date = now.date()
         weekend_flat = self._weekend_flat_today(now)
-        reason = "WEEKEND" if weekend_flat else "EOD"
+        still_open = self.strategy.position_state != PositionState.FLAT
+        continuous_roll = self.settings.dcv2_continuous_roll and not weekend_flat and still_open
+        reason = "WEEKEND" if weekend_flat else ("ROLL" if continuous_roll else "EOD")
         log.info("DCv3: 17:25 square-off firing",
-                 extra={"extra": {"date": str(self._sq_off_date), "weekend_flat": weekend_flat}})
+                 extra={"extra": {"date": str(self._sq_off_date), "weekend_flat": weekend_flat,
+                                  "continuous_roll": continuous_roll}})
         if self.executor.has_open_position:
             try:
                 contract = self.executor.tracked_symbol
@@ -604,3 +612,14 @@ class DCv3Engine:
         if weekend_flat:
             self.strategy.force_flat()
             log.info("DCv3: weekend-flat — directional trade closed, no rollover")
+            return
+        # Continuous-roll: immediately re-buy for the still-open directional trade
+        # in THIS SAME event -- no 17:25-17:30 wait. Mon-Thu, gapped mode
+        # (default): leave the option flat here; the 17:30 rollover in
+        # _handle_closed_candle re-buys it once _entries_blocked() clears.
+        if continuous_roll:
+            signal_dir = (SignalDir.LONG.value if self.strategy.position_state == PositionState.LONG
+                          else SignalDir.SHORT.value)
+            btc_price = self._last_btc_close if self._last_btc_close is not None else 0.0
+            log.info("DCv3: continuous-roll — immediately re-buying at square-off")
+            await self._open_entry(signal_dir, self.strategy.sl_level, btc_price, tag="ROLL")

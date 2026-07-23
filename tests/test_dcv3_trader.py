@@ -212,6 +212,34 @@ async def test_entries_never_blocked_on_saturday_24x7(monkeypatch) -> None:
     assert engine._entries_blocked() is False
 
 
+async def test_square_off_continuous_roll_immediately_rebuys(monkeypatch) -> None:
+    """dcv2_continuous_roll=True: close AND re-buy in the SAME _square_off()
+    call -- no waiting for the 17:30 gap to clear."""
+    engine = _make_engine(dcv2_continuous_roll=True)
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.strategy._in_long = True
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 25, tzinfo=_ist))  # Wed
+    await engine._square_off()
+    assert engine.executor.close_calls == 1
+    assert engine.executor.has_open_position   # re-bought immediately
+    assert engine.strategy.position_state == PositionState.LONG
+    exits = _exit_calls(engine.notifier)
+    assert exits and exits[-1].kwargs["reason"] == "ROLL"
+    entries = [c for c in engine.notifier.notify.await_args_list
+               if c.args and c.args[0] == NotifyEvent.ENTRY_LONG]
+    assert entries and entries[-1].kwargs["tag"] == "ROLL"
+
+
+async def test_entries_blocked_ignores_gap_when_continuous_roll(monkeypatch) -> None:
+    engine = _make_engine(skip_weekdays="Sat,Sun", dcv2_continuous_roll=True)
+    engine._sq_off_date = datetime(2026, 7, 8, tzinfo=_ist).date()
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 26, tzinfo=_ist))  # 1 min after square-off
+    assert engine._entries_blocked() is False
+
+    _fake_now(monkeypatch, datetime(2026, 7, 11, 12, 0, tzinfo=_ist))  # Sat -> still blocked
+    assert engine._entries_blocked() is True
+
+
 # ---------------------------------------------------------------------- #
 # 17:30 rollover: trade still open + option flat -> re-BUY
 # ---------------------------------------------------------------------- #
