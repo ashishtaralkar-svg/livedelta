@@ -248,6 +248,37 @@ async def test_square_off_continuous_roll_friday_still_flattens(monkeypatch) -> 
     assert exits and exits[-1].kwargs["reason"] == "WEEKEND"
 
 
+async def test_square_off_continuous_roll_skips_when_flattened_by_race(monkeypatch) -> None:
+    """Race: the same-timestamp candle-close handler flattens the strategy
+    (SL/EMA_CROSS/TRAIL) concurrently while close_option() is awaiting. The
+    roll must be skipped entirely -- not default to SHORT with no SL, which
+    is the actual bug seen live (a phantom C-BTC roll with sl_level: null)."""
+    engine = _make_engine(skip_weekdays="Sat,Sun", dcv2_continuous_roll=True)
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.strategy._in_long = True
+    engine.strategy._sl_level = 59000.0
+
+    real_close = engine.executor.close_option
+
+    async def _close_and_race_flatten():
+        fill = await real_close()
+        engine.strategy.force_flat()   # simulate the concurrent candle-close exit
+        return fill
+    engine.executor.close_option = _close_and_race_flatten
+
+    calls_before = len(engine.notifier.notify.await_args_list)
+    _fake_now(monkeypatch, datetime(2026, 7, 8, 17, 25, tzinfo=_ist))  # Wed
+    await engine._square_off()
+
+    assert engine.executor.close_calls == 1
+    assert not engine.executor.has_open_position   # no phantom roll opened
+    assert engine.strategy.position_state == PositionState.FLAT
+    new_calls = engine.notifier.notify.await_args_list[calls_before:]
+    entries = [c for c in new_calls
+               if c.args and c.args[0] in (NotifyEvent.ENTRY_LONG, NotifyEvent.ENTRY_SHORT)]
+    assert not entries
+
+
 async def test_entries_blocked_ignores_gap_when_continuous_roll(monkeypatch) -> None:
     """With continuous_roll on, entries are never blocked by the 17:25-17:30
     same-day gap (only weekday blocking still applies)."""

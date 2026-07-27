@@ -89,6 +89,78 @@ def test_ema_cross_exit_closes_long() -> None:
     assert s.position_state == PositionState.FLAT
 
 
+def test_target_rr_disabled_by_default() -> None:
+    s = _strategy()
+    _bull_setup(s)
+    d = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))
+    assert d.sl_level == pytest.approx(95.0)
+    assert s._target_level is None   # target_rr defaults to 0 -> no target set
+
+
+def test_target_rr_1to1_hits_and_exits_long() -> None:
+    """Entry 110, SL 95 -> risk 15 -> 1:1 target = 125. Price reaching 125
+    exits with reason TARGET at exactly that level."""
+    s = _strategy(target_rr=1.0)
+    _bull_setup(s)
+    d_entry = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))
+    assert d_entry.sl_level == pytest.approx(95.0)
+    assert s._target_level == pytest.approx(125.0)
+
+    d = s.update(_c(_ts(10, 35), 120.0, 130.0, 118.0, 126.0))   # high reaches 125
+    assert d is not None and d.long_exit and d.exit_reason == "TARGET"
+    assert d.long_exit_price == pytest.approx(125.0)
+    assert s.position_state == PositionState.FLAT
+    assert s._target_level is None   # cleared on exit
+
+
+def test_target_rr_1to1_hits_and_exits_short() -> None:
+    """Entry 110, SL 115 -> risk 5 -> 1:1 target = 105."""
+    s = _strategy(target_rr=1.0)
+    for i, cl in enumerate((103.0, 102.0, 101.0, 100.0)):
+        s.update(_c(_ts(10, 0) + i * 300, cl + 0.5, cl + 1.0, cl - 0.5, cl))
+    s._pending_short, s._pending_trigger, s._pending_sl = True, 110.0, 115.0
+
+    d_entry = s.update(_c(_ts(10, 20), 111.0, 112.0, 109.0, 110.5))
+    assert d_entry.sell_signal and d_entry.entry_price == 110.0
+    assert s._target_level == pytest.approx(105.0)
+
+    d = s.update(_c(_ts(10, 25), 108.0, 109.0, 103.0, 104.0))   # low reaches 105
+    assert d is not None and d.short_exit and d.exit_reason == "TARGET"
+    assert d.short_exit_price == pytest.approx(105.0)
+    assert s.position_state == PositionState.FLAT
+
+
+def test_sl_takes_priority_over_target_same_candle() -> None:
+    """If one candle's range spans BOTH the SL and the target (a gap/wide
+    candle), the SL check runs first -- conservative, matches the SL-before-
+    everything convention used elsewhere in this strategy."""
+    s = _strategy(target_rr=1.0)
+    _bull_setup(s)
+    d_entry = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))
+    assert d_entry.sl_level == pytest.approx(95.0) and s._target_level == pytest.approx(125.0)
+
+    d = s.update(_c(_ts(10, 35), 110.0, 130.0, 90.0, 100.0))   # spans both SL(95) and target(125)
+    assert d is not None and d.long_exit and d.exit_reason == "SL"
+
+
+def test_ema_exit_false_disables_cross_and_trail_keeps_sl() -> None:
+    """ema_exit=False: a position that would normally EMA_CROSS-exit stays
+    open (fixed SL only); it still exits normally when SL is actually hit."""
+    s = _strategy(ema_exit=False)
+    _bull_setup(s)
+    d_entry = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))
+    sl = d_entry.sl_level
+    for i, cl in enumerate((106.0, 102.0, 99.0)):   # would flip EMA2 below EMA4
+        assert cl > sl
+        d = s.update(_c(_ts(10, 35 + 5 * i), cl + 1.0, cl + 2.0, max(cl - 1.0, sl + 1.0), cl))
+        assert d is None   # no EMA_CROSS exit fires
+    assert s.position_state == PositionState.LONG   # still open, only SL protects it
+
+    d = s.update(_c(_ts(10, 50), 99.0, 99.5, sl - 1.0, sl - 0.5))
+    assert d is not None and d.long_exit and d.exit_reason == "SL"
+    assert s.position_state == PositionState.FLAT
+
+
 def test_invalidation_before_trigger_discards_setup() -> None:
     s = _strategy()
     _bull_setup(s)
@@ -114,6 +186,55 @@ def test_trail_exit_skips_its_own_bar_like_sl() -> None:
     d = s.update(_c(_ts(10, 30), 100.0, 101.0, 99.0, 100.0))
     assert d is not None and d.long_exit and d.exit_reason == "TRAIL"
     assert not s._touched_bull and not s._touched_bear   # exit bar skipped, no touch registered
+
+
+def test_ema_filter_ok_logic() -> None:
+    """_ema_filter_ok: off -> always True; on -> BUY needs fast>slow, SELL fast<slow."""
+    off = _strategy()
+    assert off._ema_filter_ok(is_long=True) and off._ema_filter_ok(is_long=False)
+
+    s = _strategy(ema_filter_fast=2, ema_filter_slow=3)
+    s._ema_filt_fast._value, s._ema_filt_slow._value = 110.0, 100.0   # fast > slow
+    assert s._ema_filter_ok(is_long=True) is True
+    assert s._ema_filter_ok(is_long=False) is False
+    s._ema_filt_fast._value = 90.0                                    # fast < slow
+    assert s._ema_filter_ok(is_long=True) is False
+    assert s._ema_filter_ok(is_long=False) is True
+    s._ema_filt_fast._value = None                                    # not warm -> block
+    assert s._ema_filter_ok(is_long=True) is False
+
+
+def test_ema_filter_blocks_buy_when_trend_disagrees(monkeypatch) -> None:
+    """A pending long that hits its trigger is CONSUMED (no entry) when the EMA
+    filter says the trend is against it."""
+    s = _strategy(ema_filter_fast=2, ema_filter_slow=3)
+    _bull_setup(s)   # arms a pending long (filter EMAs computed but overridden below)
+    assert s.has_pending
+    monkeypatch.setattr(s, "_ema_filter_ok", lambda is_long: False)
+    d = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))   # crosses the trigger
+    assert d is None or not d.buy_signal          # blocked
+    assert not s.has_pending                      # setup consumed
+    assert s.position_state == PositionState.FLAT
+
+
+def test_ema_filter_allows_buy_when_trend_agrees(monkeypatch) -> None:
+    s = _strategy(ema_filter_fast=2, ema_filter_slow=3)
+    _bull_setup(s)
+    monkeypatch.setattr(s, "_ema_filter_ok", lambda is_long: True)
+    d = s.update(_c(_ts(10, 30), 110.0, 112.0, 109.0, 111.0))
+    assert d is not None and d.buy_signal
+    assert s.position_state == PositionState.LONG
+
+
+def test_ema_filter_extends_warmup() -> None:
+    """With the filter on, ready() needs filter_slow bars (here 6 > ema_long 4)."""
+    s = _strategy(ema_filter_fast=3, ema_filter_slow=6)
+    for _ in range(s.dc_period):
+        s._dc.push(100.0, 100.0)
+    s._warmup_bars = 5
+    assert s.ready is False    # < filter_slow (6)
+    s._warmup_bars = 6
+    assert s.ready is True
 
 
 def test_no_eod_close_position_survives_1725() -> None:
@@ -173,6 +294,21 @@ def test_buy_trail_arms_above_both_emas_then_close_below_exits() -> None:
     assert d is not None and d.long_exit and d.exit_reason == "TRAIL"
     assert d.long_exit_price == pytest.approx(95.0)               # exits at the close
     assert s.position_state == PositionState.FLAT
+
+
+def test_ema_exit_false_disables_trail_too() -> None:
+    s = _strategy(ema_exit=False)
+    for i, cl in enumerate((100.0, 101.0, 102.0, 103.0)):
+        s.update(_c(_ts(10, 0) + i * 300, cl - 0.5, cl + 0.5, cl - 1.0, cl))
+    s._pending_long, s._pending_trigger, s._pending_sl = True, 95.0, 90.0
+    s.update(_c(_ts(10, 20), 94.0, 96.0, 93.0, 95.0))            # entry at 95 (trail mode)
+
+    d = s.update(_c(_ts(10, 25), 110.0, 122.0, 109.0, 120.0))    # would normally arm
+    assert d is None and s._trail_armed is False                  # never arms with ema_exit=False
+
+    d = s.update(_c(_ts(10, 30), 96.0, 97.0, 94.0, 95.0))        # would normally exit if armed
+    assert d is None
+    assert s.position_state == PositionState.LONG                 # unaffected -- only SL protects it
 
 
 def test_sell_above_both_emas_uses_trail_mode() -> None:

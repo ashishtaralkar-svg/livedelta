@@ -67,6 +67,8 @@ class DCv2Engine:
             dc_period=settings.dcv2_dc_period,
             ema_trend_length=settings.dcv2_ema_trend_length,
             ema_long_length=settings.dcv2_ema_long_length,
+            ema_filter_fast=settings.dcv2_ema_filter_fast,
+            ema_filter_slow=settings.dcv2_ema_filter_slow,
             skip_weekdays=settings.skip_weekday_ints,
             day_tz=settings.day_tz,
             day_start_hour=settings.day_start_hour,
@@ -147,8 +149,9 @@ class DCv2Engine:
     async def _warmup(self) -> None:
         now = int(time.time())
         last_closed_end = (now // _BAR_SECONDS) * _BAR_SECONDS
+        longest_ema = max(self.settings.dcv2_ema_long_length, self.settings.dcv2_ema_filter_slow)
         bars_needed = max(
-            self.settings.warmup_candles + self.settings.dcv2_ema_long_length + 50,
+            self.settings.warmup_candles + longest_ema + 50,
             self.settings.warmup_days * 86400 // _BAR_SECONDS,
         )
         start = last_closed_end - bars_needed * _BAR_SECONDS
@@ -628,8 +631,16 @@ class DCv2Engine:
         # option flat here; the 17:30 rollover in _handle_closed_candle re-sells
         # it once _entries_blocked() clears.
         if continuous_roll:
-            signal_dir = (SignalDir.LONG.value if self.strategy.position_state == PositionState.LONG
-                          else SignalDir.SHORT.value)
+            state = self.strategy.position_state
+            if state == PositionState.FLAT:
+                # Race: the same-timestamp candle-close handler flattened the
+                # strategy (SL/EMA_CROSS/TRAIL) while close_option() above was
+                # awaiting. Nothing left to roll -- selling here would open an
+                # untracked position with no real signal or SL behind it.
+                log.warning("DCv2: continuous-roll skipped — strategy went FLAT "
+                            "during square-off (candle-close race)")
+                return
+            signal_dir = SignalDir.LONG.value if state == PositionState.LONG else SignalDir.SHORT.value
             btc_price = self._last_btc_close if self._last_btc_close is not None else 0.0
             log.info("DCv2: continuous-roll — immediately re-selling at square-off")
             await self._open_entry(signal_dir, self.strategy.sl_level, btc_price, tag="ROLL")

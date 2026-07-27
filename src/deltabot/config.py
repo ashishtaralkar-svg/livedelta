@@ -176,6 +176,13 @@ class Settings(BaseSettings):
     dcv2_dc_period: int = 20
     dcv2_ema_trend_length: int = 50
     dcv2_ema_long_length: int = 200
+    # Optional SECOND EMA trend filter, on top of the existing EMA(50)/(200)
+    # logic: a BUY entry requires EMA(filter_fast) > EMA(filter_slow), a SELL
+    # requires EMA(filter_fast) < EMA(filter_slow) (both on HA close). e.g.
+    # 150/600. 0/0 (default) = filter OFF, existing behavior unchanged. When on,
+    # the strategy needs filter_slow bars of warmup before it will trade.
+    dcv2_ema_filter_fast: int = 0
+    dcv2_ema_filter_slow: int = 0
     # ASAP intracandle ENTRY + SL: open the instant REAL price breaks the trigger,
     # buy back the instant it touches the fixed range SL (TRAIL/EMA-reversal stay
     # closed-bar). False = strictly closed-bar (exactly matches the backtest).

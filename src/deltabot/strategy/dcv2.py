@@ -147,10 +147,15 @@ class DCv2Strategy:
         dc_period: int = 20,
         ema_trend_length: int = 50,
         ema_long_length: int = 200,
+        ema_filter_fast: int = 0,
+        ema_filter_slow: int = 0,
         use_heikin_ashi: bool = True,
         confirm_mode: str = "open_extreme",
         direction_gate: str = "ema",
         no_settlement_gap: bool = False,
+        ema_exit: bool = True,
+        target_rr: float = 0.0,
+        target_pct: float = 0.0,
         skip_weekdays: frozenset[int] = frozenset({5, 6}),  # Mon=0 .. Sat=5, Sun=6 (IST)
         day_tz: str = "Asia/Kolkata",
         day_start_hour: int = 17,
@@ -161,6 +166,30 @@ class DCv2Strategy:
         self.dc_period = dc_period
         self.ema_trend_length = ema_trend_length
         self.ema_long_length = ema_long_length
+        # Optional second EMA trend filter (0/0 = off). When both > 0, an entry
+        # is gated: BUY needs EMA(fast) > EMA(slow), SELL needs EMA(fast) <
+        # EMA(slow), on HA close. Layered ON TOP of the existing EMA(50)/(200)
+        # logic -- everything else unchanged.
+        self.ema_filter_fast = ema_filter_fast
+        self.ema_filter_slow = ema_filter_slow
+        self._ema_filter_on = ema_filter_fast > 0 and ema_filter_slow > 0
+        # ema_exit=False: disable BOTH EMA-based exits (the "cross" EMA-reversal
+        # exit AND the two-stage "trail" exit) -- a position then closes ONLY on
+        # its fixed range SL (or an external administrative close: square-off/
+        # rollover/weekend/TP, handled outside the strategy).
+        self.ema_exit = ema_exit
+        # target_rr > 0: on entry, set a fixed profit target at
+        # entry +/- risk*target_rr, where risk = |entry - sl_level| (the SAME
+        # distance as the fixed SL, just on the profitable side). 1.0 = a 1:1
+        # risk:reward target. Checked independently of ema_exit -- it can run
+        # alongside EMA_CROSS/TRAIL (whichever hits first) or, with
+        # ema_exit=False, be the ONLY profit exit next to the fixed SL.
+        self.target_rr = target_rr
+        # target_pct > 0: a FIXED-percent profit target at entry +/-
+        # target_pct%% of the entry price (independent of the SL distance).
+        # Used for directional BTC trades (--mode btc): e.g. 1.0 = exit at a
+        # 1%% move in favour. Takes precedence over target_rr when both set.
+        self.target_pct = target_pct
         # use_heikin_ashi=False -> run every indicator/pattern on the RAW candle
         # OHLC (normal candlestick chart) instead of synthetic Heikin Ashi.
         self.use_heikin_ashi = use_heikin_ashi
@@ -195,6 +224,8 @@ class DCv2Strategy:
         self._dc = _Donchian(self.dc_period)
         self._ema_trend = _Ema(self.ema_trend_length)
         self._ema_long = _Ema(self.ema_long_length)
+        self._ema_filt_fast = _Ema(self.ema_filter_fast) if self._ema_filter_on else None
+        self._ema_filt_slow = _Ema(self.ema_filter_slow) if self._ema_filter_on else None
         self._warmup_bars = 0
         self._dbg: dict = {}   # per-bar diagnostic snapshot (see update / debug_state)
 
@@ -221,6 +252,7 @@ class DCv2Strategy:
         self._pending_sl: float | None = None
         self._in_long = self._in_short = False
         self._sl_level: float | None = None
+        self._target_level: float | None = None   # set on entry when target_rr > 0
         # "cross" (default): exit when the EMA50/200 relationship flips against
         # the position. "trail": the trade triggered from the wrong side of
         # BOTH EMAs (buy below both / sell above both) -> fixed SL until a
@@ -239,7 +271,8 @@ class DCv2Strategy:
 
     @property
     def ready(self) -> bool:
-        return self._dc.ready and self._warmup_bars >= self.ema_long_length
+        need = max(self.ema_long_length, self.ema_filter_slow if self._ema_filter_on else 0)
+        return self._dc.ready and self._warmup_bars >= need
 
     @property
     def has_pending(self) -> bool:
@@ -272,10 +305,21 @@ class DCv2Strategy:
     def force_flat(self) -> None:
         self._in_long = self._in_short = False
         self._sl_level = None
+        self._target_level = None
         self._exit_mode = "cross"
         self._trail_armed = False
         self._clear_pending()
         self._clear_hunts()
+
+    def _ema_filter_ok(self, is_long: bool) -> bool:
+        """Optional EMA(fast)/(slow) trend filter. Off -> always True. On:
+        a BUY needs EMA(fast) > EMA(slow), a SELL needs EMA(fast) < EMA(slow)."""
+        if not self._ema_filter_on:
+            return True
+        f, s = self._ema_filt_fast.value, self._ema_filt_slow.value
+        if f is None or s is None:
+            return False   # not warm yet -> don't enter
+        return f > s if is_long else f < s
 
     def _exit_mode_for(self, trig: float, is_long: bool) -> str:
         """session_line mode: no EMA/trail exit at all ("none" -> SL / 17:25
@@ -290,6 +334,17 @@ class DCv2Strategy:
         if is_long:
             return "trail" if (et > trig and el > trig) else "cross"
         return "trail" if (et < trig and el < trig) else "cross"
+
+    def _target_for(self, entry_price: float, sl_level: float | None, is_long: bool) -> float | None:
+        """Fixed profit target. target_pct (fixed %% of entry) takes precedence;
+        else target_rr (multiple of the SL distance). None if both disabled."""
+        if self.target_pct > 0:
+            dist = self.target_pct / 100.0 * entry_price
+            return entry_price + dist if is_long else entry_price - dist
+        if self.target_rr <= 0 or sl_level is None:
+            return None
+        risk = abs(entry_price - sl_level)
+        return entry_price + risk * self.target_rr if is_long else entry_price - risk * self.target_rr
 
     def _session_ok_long(self, range_lo: float | None) -> bool:
         """session_line mode: a BUY range is valid only if it sits ENTIRELY
@@ -322,8 +377,12 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open >= trig or candle.high >= trig:
+                if not self._ema_filter_ok(is_long=True):
+                    self._clear_pending()   # trend filter blocks -> consume, no entry
+                    return False, False, 0.0
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
+                self._target_level = self._target_for(trig, sl, is_long=True)
                 self._exit_mode = self._exit_mode_for(trig, is_long=True)
                 self._trail_armed = False
                 self._clear_pending()
@@ -334,8 +393,12 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open <= trig or candle.low <= trig:
+                if not self._ema_filter_ok(is_long=False):
+                    self._clear_pending()
+                    return False, False, 0.0
                 self._in_short, self._in_long = True, False
                 self._sl_level = sl
+                self._target_level = self._target_for(trig, sl, is_long=False)
                 self._exit_mode = self._exit_mode_for(trig, is_long=False)
                 self._trail_armed = False
                 self._clear_pending()
@@ -363,6 +426,9 @@ class DCv2Strategy:
 
         ema_trend = self._ema_trend.update(bar_close)
         ema_long = self._ema_long.update(bar_close)
+        if self._ema_filter_on:
+            self._ema_filt_fast.update(bar_close)
+            self._ema_filt_slow.update(bar_close)
         dc_upper, dc_lower = self._dc.upper, self._dc.lower
         self._warmup_bars += 1
 
@@ -438,9 +504,12 @@ class DCv2Strategy:
             elif self._sl_level is not None and candle.low <= self._sl_level:
                 long_exit, long_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
-            elif self._exit_mode == "cross" and ema_trend < ema_long:
+            elif self._target_level is not None and candle.high >= self._target_level:
+                long_exit, long_exit_price, exit_reason = True, self._target_level, "TARGET"
+                just_closed_sl = True
+            elif self.ema_exit and self._exit_mode == "cross" and ema_trend < ema_long:
                 long_exit, long_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
-            elif self._exit_mode == "trail":
+            elif self.ema_exit and self._exit_mode == "trail":
                 # Two-stage trail (entry was below both EMAs): a REAL close
                 # above BOTH EMAs arms it; once armed, a REAL close back below
                 # BOTH EMAs exits. A bar can't do both, so if/elif is safe.
@@ -455,9 +524,12 @@ class DCv2Strategy:
             elif self._sl_level is not None and candle.high >= self._sl_level:
                 short_exit, short_exit_price, exit_reason = True, self._sl_level, "SL"
                 just_closed_sl = True
-            elif self._exit_mode == "cross" and ema_trend > ema_long:
+            elif self._target_level is not None and candle.low <= self._target_level:
+                short_exit, short_exit_price, exit_reason = True, self._target_level, "TARGET"
+                just_closed_sl = True
+            elif self.ema_exit and self._exit_mode == "cross" and ema_trend > ema_long:
                 short_exit, short_exit_price, exit_reason = True, candle.close, "EMA_CROSS"
-            elif self._exit_mode == "trail":
+            elif self.ema_exit and self._exit_mode == "trail":
                 if not self._trail_armed and candle.close < ema_trend and candle.close < ema_long:
                     self._trail_armed = True
                 elif self._trail_armed and candle.close > ema_trend and candle.close > ema_long:
@@ -466,6 +538,7 @@ class DCv2Strategy:
         if long_exit or short_exit:
             self._in_long = self._in_short = False
             self._sl_level = None
+            self._target_level = None
             self._exit_mode = "cross"
             self._trail_armed = False
 
@@ -481,20 +554,22 @@ class DCv2Strategy:
             if sl is not None and candle.low <= sl:
                 self._clear_pending()   # invalidated before the trigger (SL side first, conservative)
             elif trig is not None and candle.high >= trig:
-                if not day_blocked:
+                if not day_blocked and self._ema_filter_ok(is_long=True):
                     buy_signal, entry_price, new_sl = True, trig, sl
                     self._in_long, self._sl_level = True, sl
+                    self._target_level = self._target_for(trig, sl, is_long=True)
                     self._exit_mode = self._exit_mode_for(trig, is_long=True)
                     self._trail_armed = False
-                self._clear_pending()
+                self._clear_pending()   # consumed (traded, blocked, or filtered out)
         elif flat and not square_off and not in_gap and self._pending_short:
             trig, sl = self._pending_trigger, self._pending_sl
             if sl is not None and candle.high >= sl:
                 self._clear_pending()
             elif trig is not None and candle.low <= trig:
-                if not day_blocked:
+                if not day_blocked and self._ema_filter_ok(is_long=False):
                     sell_signal, entry_price, new_sl = True, trig, sl
                     self._in_short, self._sl_level = True, sl
+                    self._target_level = self._target_for(trig, sl, is_long=False)
                     self._exit_mode = self._exit_mode_for(trig, is_long=False)
                     self._trail_armed = False
                 self._clear_pending()
