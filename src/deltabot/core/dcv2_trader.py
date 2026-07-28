@@ -542,7 +542,12 @@ class DCv2Engine:
 
         self.executor.clear()
         self._entry_premium = self._tp_price = self._current_dir = None
-        self.strategy.force_flat()
+        # Only reset the strategy on a genuine position DESYNC. When it is already
+        # flat, a reconnect reconcile must NOT force_flat() -- that would wipe the
+        # in-progress hunt/touch/range (and any armed pending), making the bot drop
+        # setups that were mid-formation when the WebSocket reconnected.
+        if self.strategy.position_state != PositionState.FLAT:
+            self.strategy.force_flat()
         self._closing = False
         log.info("DCv2 reconcile: no owned position — state FLAT")
 

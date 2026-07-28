@@ -328,6 +328,36 @@ async def test_no_rollover_when_flat() -> None:
 
 
 # ---------------------------------------------------------------------- #
+# Reconnect reconcile must NOT wipe an in-progress hunt when already flat
+# ---------------------------------------------------------------------- #
+async def test_reconnect_while_flat_preserves_hunt() -> None:
+    """A WS-reconnect reconcile, when the bot is already FLAT, must NOT
+    force_flat() -- that would wipe the in-progress hunt/touch/range and drop a
+    setup that was mid-formation when the socket reconnected (the live bug)."""
+    engine = _make_engine()   # FakeRest() -> no positions; strategy starts flat
+    engine.strategy._hunt_bear = True
+    engine.strategy._touched_bear = True
+    engine.strategy._range_hi_bear = 64013.5
+    engine.strategy._range_lo_bear = 63772.5
+    assert engine.strategy.position_state == PositionState.FLAT
+    await engine._sync_options_to_exchange()
+    # The setup survives the reconcile.
+    assert engine.strategy._touched_bear is True
+    assert engine.strategy._range_hi_bear == 64013.5
+    assert engine.strategy._hunt_bear is True
+
+
+async def test_reconcile_flattens_a_real_desync() -> None:
+    """If the strategy THINKS it holds a position but the exchange returns none,
+    the reconcile still force_flats it (reconciles the genuine desync)."""
+    engine = _make_engine()
+    engine.strategy._in_short = True          # strategy believes it's short
+    engine.strategy._touched_bear = True
+    await engine._sync_options_to_exchange()  # exchange (FakeRest) shows nothing
+    assert engine.strategy.position_state == PositionState.FLAT   # desync reset
+
+
+# ---------------------------------------------------------------------- #
 # Self-heal + weekend entry block
 # ---------------------------------------------------------------------- #
 class VerifyRest(FakeRest):
