@@ -25,10 +25,10 @@
 // BUY pattern is the exact mirror (Donchian LOWER band, open==high touch,
 // open==low confirm).
 //
-// See three_candle_strategy.pine for the full tradeable version (entries,
+// See tcp_strategy.pine for the full tradeable version (entries,
 // fixed SL, weekend block, option-sell backtest wiring).
 // ============================================================================
-indicator("Three Candle Pattern — Signal Only", overlay=true, max_labels_count=500)
+indicator("TCP - Three Candle Pattern — Signal Only", overlay=true, max_labels_count=500)
 
 // ============================================================
 // Inputs
@@ -151,5 +151,5 @@ plotshape(sellPattern, title="SELL PATTERN (3 candles complete)", style=shape.la
 plotshape(buyPattern, title="BUY PATTERN (3 candles complete)", style=shape.labelup, location=location.belowbar,
      color=color.new(color.teal, 0), textcolor=color.white, size=size.normal, text="PATTERN")
 
-alertcondition(sellPattern, title="Sell Pattern", message="Three Candle Pattern: SELL setup complete")
-alertcondition(buyPattern, title="Buy Pattern", message="Three Candle Pattern: BUY setup complete")
+alertcondition(sellPattern, title="Sell Pattern", message="TCP: SELL setup complete")
+alertcondition(buyPattern, title="Buy Pattern", message="TCP: BUY setup complete")

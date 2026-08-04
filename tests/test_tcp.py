@@ -1,4 +1,4 @@
-"""ThreeCandleStrategy: pattern match (A touch+shape, B wick-both-sides, C
+"""TCPStrategy: pattern match (A touch+shape, B wick-both-sides, C
 confirm) -> armed pending -> breakout entry -> fixed SL exit. Uses
 use_heikin_ashi=False throughout so tests control raw OHLC directly."""
 
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from deltabot.enums import PositionState
 from deltabot.models import Candle
-from deltabot.strategy.three_candle import ThreeCandleStrategy
+from deltabot.strategy.tcp import TCPStrategy
 
 _T0 = 1_700_000_000
 _IST = ZoneInfo("Asia/Kolkata")
@@ -23,7 +23,7 @@ def _c(i: int, o: float, h: float, l: float, c: float) -> Candle:
     return Candle(start_time=_T0 + i * 300, open=o, high=h, low=l, close=c, volume=1.0)
 
 
-def _warm(strat: ThreeCandleStrategy, n: int = 20, hi: float = 100.0, lo: float = 90.0) -> int:
+def _warm(strat: TCPStrategy, n: int = 20, hi: float = 100.0, lo: float = 90.0) -> int:
     """Push n flat warmup bars (dc_upper=hi, dc_lower=lo after this)."""
     i = 0
     for i in range(n):
@@ -32,7 +32,7 @@ def _warm(strat: ThreeCandleStrategy, n: int = 20, hi: float = 100.0, lo: float 
 
 
 def test_sell_pattern_arms_pending_with_correct_trigger_and_sl() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)   # dc_upper=100, dc_lower=90
 
     # A: open==low, high touches/exceeds dc_upper(100).
@@ -52,7 +52,7 @@ def test_sell_pattern_arms_pending_with_correct_trigger_and_sl() -> None:
 
 
 def test_sell_trigger_breaks_and_sl_exits() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # A
     s.update(_c(i, 97, 100, 93, 96)); i += 1        # B
@@ -72,7 +72,7 @@ def test_sell_trigger_breaks_and_sl_exits() -> None:
 
 
 def test_sell_setup_invalidated_when_sl_side_hit_before_trigger() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     s.update(_c(i, 97, 100, 93, 96)); i += 1
@@ -84,7 +84,7 @@ def test_sell_setup_invalidated_when_sl_side_hit_before_trigger() -> None:
 
 
 def test_candle_b_shape_mismatch_resets_the_hunt() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1   # A ok
     # B candidate with NO lower wick (open==low) -> fails "wick both sides".
@@ -103,7 +103,7 @@ def test_candle_b_only_needs_wick_both_sides_no_high_low_constraint() -> None:
     """B making a NEW HIGH above A, and NOT undercutting A's low, still
     qualifies as long as it has a wick on both sides (the old high<=A.high /
     low<A.low constraints were dropped)."""
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # A: high=101, low=95
 
@@ -122,7 +122,7 @@ def test_candle_b_that_is_itself_a_fresh_a_reanchors_instead_of_resetting() -> N
     """A candle that fails the B shape check (wick both sides) because it is
     ITSELF a valid open==low touch candle must re-anchor as the new candle 1,
     not be discarded while the hunt resets to idle."""
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # bar1 = A (open==low, touches 100)
 
@@ -150,7 +150,7 @@ def test_candle_c_must_undercut_a_low_not_just_b_low() -> None:
     constraint to A, B can sit ABOVE A's low. C must break below A's low too,
     or the pattern must NOT arm (the whole sequence has to trend lower than
     where it started, not just lower than the middle bar)."""
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # A: low=95, high=101
     s.update(_c(i, 98, 102, 96, 99)); i += 1        # B: low=96 (does NOT undercut A)
@@ -162,7 +162,7 @@ def test_candle_c_must_undercut_a_low_not_just_b_low() -> None:
 
 
 def test_candle_c_shape_mismatch_resets_the_hunt() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1   # A
     s.update(_c(i, 97, 100, 93, 96)); i += 1   # B ok
@@ -173,7 +173,7 @@ def test_candle_c_shape_mismatch_resets_the_hunt() -> None:
 
 
 def test_buy_pattern_mirrors_sell() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)   # dc_upper=100, dc_lower=90
 
     # A: open==high, low touches/breaches dc_lower(90).
@@ -194,7 +194,7 @@ def test_buy_pattern_mirrors_sell() -> None:
 
 
 def test_ready_reflects_donchian_warmup() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     assert s.ready is False
     _warm(s, n=19)
     assert s.ready is False
@@ -203,7 +203,7 @@ def test_ready_reflects_donchian_warmup() -> None:
 
 
 def test_target_rr_1to2_fires_before_and_takes_priority_over_sl_tie() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False, target_rr=2.0)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False, target_rr=2.0)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # A
     s.update(_c(i, 97, 100, 93, 96)); i += 1        # B
@@ -223,7 +223,7 @@ def test_target_rr_1to2_fires_before_and_takes_priority_over_sl_tie() -> None:
 
 
 def test_target_rr_off_by_default_only_sl_exits() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)   # target_rr=0
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)   # target_rr=0
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     s.update(_c(i, 97, 100, 93, 96)); i += 1
@@ -233,7 +233,7 @@ def test_target_rr_off_by_default_only_sl_exits() -> None:
 
 
 def test_daily_filter_blocks_sell_when_no_prior_open_high_day() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
     # Day 1 & 2: NOT open==high (high exceeds open both days) -> filter unsatisfied.
     s.update(Candle(start_time=_ist_ts(2026, 1, 1, 10, 0), open=100, high=105, low=98, close=102, volume=1.0))
     s.update(Candle(start_time=_ist_ts(2026, 1, 2, 10, 0), open=100, high=106, low=97, close=101, volume=1.0))
@@ -253,7 +253,7 @@ def test_daily_filter_blocks_sell_when_no_prior_open_high_day() -> None:
 
 
 def test_daily_filter_allows_sell_when_a_prior_day_was_open_high() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
     # Day 1: open==high (bearish daily shape) -> satisfies the filter.
     s.update(Candle(start_time=_ist_ts(2026, 1, 1, 10, 0), open=100, high=100, low=95, close=97, volume=1.0))
     s.update(Candle(start_time=_ist_ts(2026, 1, 2, 10, 0), open=100, high=106, low=97, close=101, volume=1.0))
@@ -272,7 +272,7 @@ def test_daily_filter_allows_sell_when_a_prior_day_was_open_high() -> None:
 
 
 def test_daily_filter_blocks_buy_when_no_prior_open_low_day() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False, daily_filter_days=3)
     s.update(Candle(start_time=_ist_ts(2026, 1, 1, 10, 0), open=100, high=105, low=98, close=102, volume=1.0))
     s.update(Candle(start_time=_ist_ts(2026, 1, 2, 10, 0), open=100, high=106, low=97, close=101, volume=1.0))
 
@@ -293,7 +293,7 @@ def test_daily_filter_blocks_buy_when_no_prior_open_low_day() -> None:
 def test_intracandle_pending_confirms_on_real_price_break() -> None:
     """apply_intracandle_pending fires the instant the FORMING candle's real
     price breaks the trigger, without waiting for the bar to close."""
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1        # A
     s.update(_c(i, 97, 100, 93, 96)); i += 1        # B
@@ -310,7 +310,7 @@ def test_intracandle_pending_confirms_on_real_price_break() -> None:
 
 
 def test_intracandle_pending_invalidates_on_sl_side_first() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     s.update(_c(i, 97, 100, 93, 96)); i += 1
@@ -324,7 +324,7 @@ def test_intracandle_pending_invalidates_on_sl_side_first() -> None:
 
 
 def test_check_intracandle_sl_detects_real_price_touch() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     s.update(_c(i, 97, 100, 93, 96)); i += 1
@@ -339,7 +339,7 @@ def test_check_intracandle_sl_detects_real_price_touch() -> None:
 
 
 def test_debug_state_reports_current_hunt_and_position() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     d = s.debug_state()
@@ -348,7 +348,7 @@ def test_debug_state_reports_current_hunt_and_position() -> None:
 
 
 def test_force_flat_clears_position_and_hunt_state() -> None:
-    s = ThreeCandleStrategy(dc_period=20, use_heikin_ashi=False)
+    s = TCPStrategy(dc_period=20, use_heikin_ashi=False)
     i = _warm(s)
     s.update(_c(i, 95, 101, 95, 99)); i += 1
     s.update(_c(i, 97, 100, 93, 96)); i += 1

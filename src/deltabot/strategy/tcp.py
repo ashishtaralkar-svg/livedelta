@@ -1,4 +1,4 @@
-"""Three Candle Pattern strategy (option SELL only).
+"""TCP (Three Candle Pattern) strategy (option SELL only).
 
 All levels/shapes are computed on synthetic Heikin Ashi (matching DCv2's
 formula); "touch" and trigger/SL crossings use REAL candle high/low, same
@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo
 from ..enums import PositionState
 from ..models import Candle
 
-__all__ = ["ThreeCandleStrategy", "ThreeCandleDecision"]
+__all__ = ["TCPStrategy", "TCPDecision"]
 
 
 def _close_enough(a: float, b: float, scale: float) -> bool:
@@ -77,7 +77,7 @@ class _Donchian:
 
 
 @dataclass(frozen=True)
-class ThreeCandleDecision:
+class TCPDecision:
     candle: Candle
     long_exit: bool
     short_exit: bool
@@ -98,7 +98,7 @@ class ThreeCandleDecision:
         return self.buy_signal or self.sell_signal
 
 
-class ThreeCandleStrategy:
+class TCPStrategy:
     def __init__(self, *, dc_period: int = 20, use_heikin_ashi: bool = True,
                 skip_weekdays: frozenset[int] = frozenset(),
                 day_tz: str = "Asia/Kolkata", target_rr: float = 0.0,
@@ -358,7 +358,7 @@ class ThreeCandleStrategy:
             self._buy_state, self._buy_a, self._buy_b = "idle", None, None
 
     # ------------------------------------------------------------------ #
-    def update(self, candle: Candle) -> ThreeCandleDecision | None:
+    def update(self, candle: Candle) -> TCPDecision | None:
         if self._ha_open is None:
             ha_open = (candle.open + candle.close) / 2.0
         else:
@@ -438,7 +438,7 @@ class ThreeCandleStrategy:
 
         self._dc.push(bh, bl)
 
-        return ThreeCandleDecision(
+        return TCPDecision(
             candle=candle, long_exit=long_exit, short_exit=short_exit,
             long_exit_price=long_exit_price, short_exit_price=short_exit_price,
             buy_signal=buy_signal, sell_signal=sell_signal,

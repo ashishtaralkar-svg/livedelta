@@ -1,7 +1,7 @@
 //@version=5
 // ============================================================================
 // THREE CANDLE PATTERN — TradingView port of
-//   src/deltabot/strategy/three_candle.py (2026-08-03)
+//   src/deltabot/strategy/tcp.py (2026-08-03)
 //
 // Pure price-action pattern on synthetic Heikin Ashi. NO EMA gate -- sell
 // pattern and buy pattern are both independently hunted at all times. Must be
@@ -33,7 +33,7 @@
 // BUY pattern is the exact mirror (Donchian LOWER band, open==high touch,
 // open==low confirm; trigger = pattern high, sl = pattern low; sell a PUT).
 // ============================================================================
-strategy("Three Candle Pattern (bot-faithful)",
+strategy("TCP - Three Candle Pattern (bot-faithful)",
      overlay              = true,
      pyramiding           = 0,
      initial_capital      = 10000,

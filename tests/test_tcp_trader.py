@@ -1,4 +1,4 @@
-"""ThreeCandleEngine: the option-BUY live engine wired to ThreeCandleStrategy.
+"""TCPEngine: the option-BUY live engine wired to TCPStrategy.
 Same structure/fakes as test_dcv3_trader.py (also a BUY-side engine): rally TP
 (not decay), reconcile looks for a LONG position, P&L sign, PUT/CALL direction
 labeling, weekend-flat/entries-blocked, self-heal, reconcile."""
@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from deltabot.config import Settings
-from deltabot.core.three_candle_trader import ThreeCandleEngine
+from deltabot.core.tcp_trader import TCPEngine
 from deltabot.enums import NotifyEvent, PositionState, SignalDir
 from deltabot.models import Candle
 
@@ -71,12 +71,12 @@ class FakeRest:
         return self._mark
 
 
-def _make_engine(**kw) -> ThreeCandleEngine:
-    base = dict(strategy="three_candle", target_premium=400.0, take_profit_pct=50.0,
+def _make_engine(**kw) -> TCPEngine:
+    base = dict(strategy="tcp", target_premium=400.0, take_profit_pct=50.0,
                 option_contracts=25, option_side="buy", state_file="", skip_weekdays="Sun")
     base.update(kw)
     settings = Settings(_env_file=None, **base)
-    engine = ThreeCandleEngine(settings, rest=FakeRest(), notifier=AsyncMock())
+    engine = TCPEngine(settings, rest=FakeRest(), notifier=AsyncMock())
     engine.executor = FakeExecutor()
     return engine
 
@@ -181,7 +181,7 @@ async def test_intracandle_sl_closes_leg_and_flattens() -> None:
 # 17:25 square-off: Mon-Sat config -> Saturday flattens (Sunday is the skip day)
 # ---------------------------------------------------------------------- #
 def _fake_now(monkeypatch, dt):
-    import deltabot.core.three_candle_trader as mod
+    import deltabot.core.tcp_trader as mod
 
     class _FakeDatetime(datetime):
         @classmethod
@@ -218,7 +218,7 @@ async def test_square_off_wednesday_keeps_direction_for_rollover(monkeypatch) ->
 
 async def test_entries_blocked_on_sunday() -> None:
     engine = _make_engine()   # skip_weekdays="Sun"
-    import deltabot.core.three_candle_trader as mod
+    import deltabot.core.tcp_trader as mod
     orig = mod.datetime
 
     class _FakeDatetime(datetime):

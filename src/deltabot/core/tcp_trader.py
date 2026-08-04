@@ -1,13 +1,13 @@
-"""Three Candle Pattern live trading engine (option BUY).
+"""TCP (Three Candle Pattern) live trading engine (option BUY).
 
-Runs ThreeCandleStrategy on 5-minute BTC candles and BUYS options: a bullish
+Runs TCPStrategy on 5-minute BTC candles and BUYS options: a bullish
 pattern trigger (SELL of a break above the pattern high, HA open==low confirm
 sequence) buys a CALL near ``target_premium`` (e.g. 400), a bearish trigger
 buys a PUT. Profit comes from the premium RISING (or the SL/target level
 being hit), not decaying -- this is the option-BUY vehicle, mirroring
 DCv3Engine's relationship to DCv2Engine (same infra, opposite vehicle).
 
-STRATEGY (see src/deltabot/strategy/three_candle.py for the full rule set):
+STRATEGY (see src/deltabot/strategy/tcp.py for the full rule set):
   SELL pattern (3 exact consecutive HA bars) -> buys a CALL on breakout.
   BUY pattern (mirror) -> buys a PUT on breakout.
   No EMA gate; both directions independently hunted at all times.
@@ -15,7 +15,7 @@ STRATEGY (see src/deltabot/strategy/three_candle.py for the full rule set):
 TAKE-PROFIT: a straightforward PREMIUM-GAIN target, tp_price = fill * (1 +
 take_profit_pct/100) -- e.g. take_profit_pct=50 means exit once the bought
 option's premium is up 50% from entry (validated in scripts/backtest_dcv2.py
---variant three_candle --side buy --target-premium 400 --tp-gain-pct 50:
+--variant tcp --side buy --target-premium 400 --tp-gain-pct 50:
 1mo +$84.87 net at 25 lots, 68 legs, 52.9% win rate).
 
 EXECUTION TIMING (same convention as DCv2Engine/DCv3Engine):
@@ -49,7 +49,7 @@ from ..exchange.rest_client import RestClient
 from ..exchange.ws_manager import WebSocketManager
 from ..logging_setup import get_logger
 from ..models import Candle
-from ..strategy.three_candle import ThreeCandleStrategy
+from ..strategy.tcp import TCPStrategy
 from . import position_state
 from .candle_aggregator import CandleAggregator
 from .options_executor import OptionsExecutor, OptionsMarginError
@@ -60,8 +60,8 @@ _BAR_SECONDS = 300  # 5 minutes
 log = get_logger(__name__)
 
 
-class ThreeCandleEngine:
-    """Live engine wired to ThreeCandleStrategy, executed via BUYING options
+class TCPEngine:
+    """Live engine wired to TCPStrategy, executed via BUYING options
     (the same option-BUY vehicle as DCv3Engine). See module docstring."""
 
     def __init__(self, settings: Settings, rest: RestClient, notifier) -> None:
@@ -69,7 +69,7 @@ class ThreeCandleEngine:
         self.rest = rest
         self.notifier = notifier
 
-        self.strategy = ThreeCandleStrategy(
+        self.strategy = TCPStrategy(
             dc_period=settings.dcv2_dc_period,
             skip_weekdays=settings.skip_weekday_ints,
             day_tz=settings.day_tz,
@@ -116,7 +116,7 @@ class ThreeCandleEngine:
         self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
         if self.settings.dcv2_tp_poll_seconds > 0:
             self._tp_poll_task = asyncio.create_task(self._tp_poll_loop())
-        log.info("ThreeCandleEngine: starting live (BUY side)")
+        log.info("TCPEngine: starting live (BUY side)")
         await self.ws.run()
 
     async def stop(self) -> None:
@@ -132,9 +132,9 @@ class ThreeCandleEngine:
                     position_state.clear(self.settings.state_file)
                 await self.notifier.notify(NotifyEvent.EXIT, reason="shutdown",
                                            size=self.settings.option_contracts)
-                log.info("ThreeCandle: closed option on shutdown")
+                log.info("TCP: closed option on shutdown")
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: failed to close on shutdown", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: failed to close on shutdown", extra={"extra": {"error": str(exc)}})
 
     async def daily_summary(self) -> None:
         pass
@@ -155,7 +155,7 @@ class ThreeCandleEngine:
             self.strategy.update(c)
         if closed:
             self._last_closed_start = closed[-1].start_time
-        log.info("ThreeCandle warmup done",
+        log.info("TCP warmup done",
                  extra={"extra": {"candles": len(closed), "ready": self.strategy.ready}})
 
     async def _fetch_history_paged(self, start: int, end: int) -> list[Candle]:
@@ -187,7 +187,7 @@ class ThreeCandleEngine:
         now = int(time.time())
         current_bar = (now // _BAR_SECONDS) * _BAR_SECONDS
         if current_bar - self._last_closed_start > _BAR_SECONDS:
-            log.warning("ThreeCandle: candle gap detected — re-seeding")
+            log.warning("TCP: candle gap detected — re-seeding")
             await self._warmup()
 
     # ------------------------------------------------------------------ #
@@ -206,7 +206,7 @@ class ThreeCandleEngine:
         if self.executor.has_open_position and not self._closing:
             long_sl, short_sl, sl = self.strategy.check_intracandle_sl(candle.close)
             if long_sl or short_sl:
-                log.info("ThreeCandle: intracandle SL touch — closing ASAP",
+                log.info("TCP: intracandle SL touch — closing ASAP",
                          extra={"extra": {"sl": sl, "price": candle.close}})
                 self.strategy.force_flat()
                 await self._close_leg("SL", btc_exit_price=sl if sl is not None else candle.close)
@@ -217,13 +217,13 @@ class ThreeCandleEngine:
             return
         confirmed, invalidated, entry_price = self.strategy.apply_intracandle_pending(candle)
         if invalidated:
-            log.info("ThreeCandle: setup invalidated intracandle (SL side hit before trigger)")
+            log.info("TCP: setup invalidated intracandle (SL side hit before trigger)")
             return
         if confirmed:
             signal_dir = (SignalDir.LONG.value
                           if self.strategy.position_state == PositionState.LONG
                           else SignalDir.SHORT.value)
-            log.info("ThreeCandle: intracandle breakout — entering ASAP",
+            log.info("TCP: intracandle breakout — entering ASAP",
                      extra={"extra": {"trigger": entry_price}})
             await self._open_entry(signal_dir, self.strategy.sl_level, entry_price, tag="ENTRY")
 
@@ -236,7 +236,7 @@ class ThreeCandleEngine:
         if self._last_closed_start is not None:
             gap = candle.start_time - self._last_closed_start
             if gap > _BAR_SECONDS:
-                log.warning("ThreeCandle: candle gap — re-seeding")
+                log.warning("TCP: candle gap — re-seeding")
                 await self._warmup()
         self._last_closed_start = candle.start_time
         self._last_btc_close = candle.close
@@ -244,7 +244,7 @@ class ThreeCandleEngine:
         dec = self.strategy.update(candle)
 
         if self.settings.dcv2_debug_state:
-            log.info("ThreeCandle state", extra={"extra": {
+            log.info("TCP state", extra={"extra": {
                 "candle": candle.start_time, "o": candle.open, "h": candle.high,
                 "l": candle.low, "c": candle.close, "blocked": self._entries_blocked(),
                 "has_option": self.executor.has_open_position, **self.strategy.debug_state()}})
@@ -262,7 +262,7 @@ class ThreeCandleEngine:
                 try:
                     mark = await asyncio.to_thread(self.rest.get_mark_price, symbol)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("ThreeCandle: get_mark_price failed", extra={"extra": {"error": str(exc)}})
+                    log.warning("TCP: get_mark_price failed", extra={"extra": {"error": str(exc)}})
             if mark is not None and mark >= self._tp_price:
                 await self._close_tp(mark)
                 return
@@ -282,7 +282,7 @@ class ThreeCandleEngine:
             signal_dir = (SignalDir.LONG.value
                           if self.strategy.position_state == PositionState.LONG
                           else SignalDir.SHORT.value)
-            log.info("ThreeCandle: rollover — re-buying option for the still-open trade")
+            log.info("TCP: rollover — re-buying option for the still-open trade")
             await self._open_entry(signal_dir, self.strategy.sl_level, candle.close, tag="ROLL")
 
     # ------------------------------------------------------------------ #
@@ -302,10 +302,10 @@ class ThreeCandleEngine:
             try:
                 mark = await asyncio.to_thread(self.rest.get_mark_price, symbol)
             except Exception as exc:  # noqa: BLE001
-                log.warning("ThreeCandle: TP-poll mark fetch failed", extra={"extra": {"error": str(exc)}})
+                log.warning("TCP: TP-poll mark fetch failed", extra={"extra": {"error": str(exc)}})
                 continue
             if mark is not None and self._tp_price is not None and mark >= self._tp_price:
-                log.info("ThreeCandle: premium-gain TP hit (poll)",
+                log.info("TCP: premium-gain TP hit (poll)",
                          extra={"extra": {"mark": mark, "tp": self._tp_price}})
                 await self._close_tp(mark)
 
@@ -327,18 +327,18 @@ class ThreeCandleEngine:
                 self.rest.get_option_positions, self.executor.underlying
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("ThreeCandle: position-verify fetch failed", extra={"extra": {"error": str(exc)}})
+            log.warning("TCP: position-verify fetch failed", extra={"extra": {"error": str(exc)}})
             return
         if any(p["size"] > 0 and p.get("product_id") == tracked for p in positions):
             self._verify_misses = 0
             return
         self._verify_misses += 1
         if self._verify_misses < 2:
-            log.warning("ThreeCandle: tracked position not on exchange (1st miss) — rechecking",
+            log.warning("TCP: tracked position not on exchange (1st miss) — rechecking",
                         extra={"extra": {"contract": self.executor.tracked_symbol}})
             return
         contract = self.executor.tracked_symbol
-        log.warning("ThreeCandle: position closed OUTSIDE the bot — self-healing to FLAT",
+        log.warning("TCP: position closed OUTSIDE the bot — self-healing to FLAT",
                     extra={"extra": {"contract": contract}})
         self.executor.clear()
         if self.settings.state_file:
@@ -361,7 +361,7 @@ class ThreeCandleEngine:
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: TP close failed", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: TP close failed", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"TP close: {exc}")
                 return
             if self.settings.state_file:
@@ -372,7 +372,7 @@ class ThreeCandleEngine:
             gross = (exit_prem - entry_prem) * lots * 0.001 if entry_prem is not None else 0.0
             self.strategy.force_flat()
             self._entry_premium = self._tp_price = self._current_dir = None
-            log.info("ThreeCandle TP hit", extra={"extra": {"contract": contract, "exit_prem": exit_prem}})
+            log.info("TCP TP hit", extra={"extra": {"contract": contract, "exit_prem": exit_prem}})
             await self.notifier.notify(
                 NotifyEvent.EXIT, reason="TP", contract=contract or "?",
                 entry_premium=entry_prem, exit_premium=exit_prem,
@@ -390,7 +390,7 @@ class ThreeCandleEngine:
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: leg close failed", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: leg close failed", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"{reason} close: {exc}")
                 return
             if self.settings.state_file:
@@ -400,7 +400,7 @@ class ThreeCandleEngine:
             gross = ((fill - entry_prem) * lots * 0.001
                      if (entry_prem is not None and fill is not None) else 0.0)
             self._entry_premium = self._tp_price = self._current_dir = None
-            log.info("ThreeCandle exit", extra={"extra": {
+            log.info("TCP exit", extra={"extra": {
                 "reason": reason, "contract": contract, "btc_exit": btc_exit_price}})
             await self.notifier.notify(
                 NotifyEvent.EXIT, reason=reason, contract=contract or "?",
@@ -424,17 +424,17 @@ class ThreeCandleEngine:
                     signal_dir, self.settings.target_premium
                 )
             except OptionsMarginError as exc:
-                log.error("ThreeCandle: margin/balance error", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: margin/balance error", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"Balance: {exc}")
                 self.strategy.force_flat()
                 return
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: open_option_by_premium failed", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: open_option_by_premium failed", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=str(exc))
                 self.strategy.force_flat()
                 return
             if fill is None:
-                log.warning("ThreeCandle: no option fill — flattening to stay in sync")
+                log.warning("TCP: no option fill — flattening to stay in sync")
                 self.strategy.force_flat()
                 return
 
@@ -449,7 +449,7 @@ class ThreeCandleEngine:
                     tp_price=self._tp_price, direction=signal_dir,
                 )
             direction = "CALL" if is_buy_signal else "PUT"
-            log.info("ThreeCandle entry", extra={"extra": {
+            log.info("TCP entry", extra={"extra": {
                 "tag": tag, "direction": direction, "symbol": symbol, "fill": fill,
                 "tp_price": round(self._tp_price, 1), "sl_level": sl_level}})
             event = NotifyEvent.ENTRY_LONG if is_buy_signal else NotifyEvent.ENTRY_SHORT
@@ -477,13 +477,13 @@ class ThreeCandleEngine:
                     self.rest.get_option_positions, self.executor.underlying
                 )
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle reconcile: fetch failed",
+                log.error("TCP reconcile: fetch failed",
                           extra={"extra": {"error": str(exc), "attempt": attempt}})
                 positions = []
             longs = [p for p in positions if p["size"] > 0]
             if longs or not believe_owned:
                 break
-            log.warning("ThreeCandle reconcile: expected a position but fetch is empty — retrying",
+            log.warning("TCP reconcile: expected a position but fetch is empty — retrying",
                         extra={"extra": {"owned": owned_symbol, "attempt": attempt}})
             await asyncio.sleep(1.5)
 
@@ -495,7 +495,7 @@ class ThreeCandleEngine:
                 self._current_dir = saved.get("direction")
             opt_type = OptionType.CALL if match["symbol"].startswith("C-") else OptionType.PUT
             self.executor.adopt(match["product_id"], match["size"], opt_type, match.get("symbol"))
-            log.info("ThreeCandle reconcile: adopted open long",
+            log.info("TCP reconcile: adopted open long",
                      extra={"extra": {"symbol": match["symbol"]}})
             return
 
@@ -507,7 +507,7 @@ class ThreeCandleEngine:
                 opt_type = OptionType.CALL if str(owned_symbol).startswith("C-") else OptionType.PUT
                 self.executor.adopt(int(saved["product_id"]), int(saved.get("size") or 0),
                                     opt_type, owned_symbol)
-            log.warning("ThreeCandle reconcile: position not returned by exchange — preserving "
+            log.warning("TCP reconcile: position not returned by exchange — preserving "
                         "tracked/state position, will NOT open new trades. If it was closed "
                         "manually, clear the state file and restart.",
                         extra={"extra": {"owned": owned_symbol}})
@@ -522,7 +522,7 @@ class ThreeCandleEngine:
         if self.strategy.position_state != PositionState.FLAT:
             self.strategy.force_flat()
         self._closing = False
-        log.info("ThreeCandle reconcile: no owned position — state FLAT")
+        log.info("TCP reconcile: no owned position — state FLAT")
 
     # ------------------------------------------------------------------ #
     # Daily 17:25 square-off + optional weekend-flat; 17:30 rollover is in the
@@ -554,7 +554,7 @@ class ThreeCandleEngine:
             if now >= target:
                 target += timedelta(days=1)
             wait_s = (target - now).total_seconds()
-            log.info("ThreeCandle: next 17:25 square-off",
+            log.info("TCP: next 17:25 square-off",
                      extra={"extra": {"at": target.isoformat(), "in_s": int(wait_s)}})
             try:
                 await asyncio.sleep(wait_s)
@@ -563,7 +563,7 @@ class ThreeCandleEngine:
             try:
                 await self._square_off()
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: square-off failed", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: square-off failed", extra={"extra": {"error": str(exc)}})
             await asyncio.sleep(60)
 
     async def _square_off(self) -> None:
@@ -573,7 +573,7 @@ class ThreeCandleEngine:
         still_open = self.strategy.position_state != PositionState.FLAT
         continuous_roll = self.settings.dcv2_continuous_roll and not weekend_flat and still_open
         reason = "WEEKEND" if weekend_flat else ("ROLL" if continuous_roll else "EOD")
-        log.info("ThreeCandle: 17:25 square-off firing",
+        log.info("TCP: 17:25 square-off firing",
                  extra={"extra": {"date": str(self._sq_off_date), "weekend_flat": weekend_flat,
                                   "continuous_roll": continuous_roll}})
         if self.executor.has_open_position:
@@ -593,20 +593,20 @@ class ThreeCandleEngine:
                     side="buy",
                 )
             except Exception as exc:  # noqa: BLE001
-                log.error("ThreeCandle: square-off close failed", extra={"extra": {"error": str(exc)}})
+                log.error("TCP: square-off close failed", extra={"extra": {"error": str(exc)}})
                 await self._sync_options_to_exchange()
                 return
         if weekend_flat:
             self.strategy.force_flat()
-            log.info("ThreeCandle: weekend-flat — directional trade closed, no rollover")
+            log.info("TCP: weekend-flat — directional trade closed, no rollover")
             return
         if continuous_roll:
             state = self.strategy.position_state
             if state == PositionState.FLAT:
-                log.warning("ThreeCandle: continuous-roll skipped — strategy went FLAT "
+                log.warning("TCP: continuous-roll skipped — strategy went FLAT "
                             "during square-off (candle-close race)")
                 return
             signal_dir = SignalDir.LONG.value if state == PositionState.LONG else SignalDir.SHORT.value
             btc_price = self._last_btc_close if self._last_btc_close is not None else 0.0
-            log.info("ThreeCandle: continuous-roll — immediately re-buying at square-off")
+            log.info("TCP: continuous-roll — immediately re-buying at square-off")
             await self._open_entry(signal_dir, self.strategy.sl_level, btc_price, tag="ROLL")
