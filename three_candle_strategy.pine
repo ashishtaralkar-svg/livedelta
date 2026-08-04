@@ -1,0 +1,286 @@
+//@version=5
+// ============================================================================
+// THREE CANDLE PATTERN — TradingView port of
+//   src/deltabot/strategy/three_candle.py (2026-08-03)
+//
+// Pure price-action pattern on synthetic Heikin Ashi. NO EMA gate -- sell
+// pattern and buy pattern are both independently hunted at all times. Must be
+// 3 EXACT consecutive bars (no gaps); a shape mismatch at B or C resets the
+// hunt, EXCEPT a bar that fails B but is itself a fresh valid A re-anchors
+// immediately instead of being discarded.
+//
+// SELL pattern (sell a CALL):
+//   A: HA open == HA low, AND HA high touches/exceeds the Donchian(20) upper
+//      band (highest high of the PRIOR 20 closed HA bars).
+//   B (the bar immediately after A): ONLY requirement is a wick on BOTH
+//      sides (not open==high, not open==low) -- no constraint relative to
+//      A's high/low. RE-ANCHOR: if this bar fails B but is itself a fresh
+//      valid A, it becomes the new candle 1 immediately.
+//   C (the bar immediately after B): HA open == HA high; C.low < B.low AND
+//      C.low < A.low (must trend lower than where the pattern started, not
+//      just lower than B).
+//   Pattern complete on C -> ARM a pending SELL:
+//      trigger = min(A.low, B.low, C.low)   (= C.low by construction)
+//      sl      = max(A.high, B.high, C.high)
+//   ENTRY: REAL price breaks below the trigger (ASAP, stop order) -> SELL.
+//      Pre-entry invalidation: if real price touches the SL side FIRST, the
+//      armed setup is discarded untraded (conservative, same as DCv2).
+//   EXIT: fixed SL only (real price back up to the pattern high). No TP/EOD
+//      on this chart -- the live bot's 70% premium-decay TP is an OPTION-side
+//      event with no equivalent on a directional BTC chart (see the TP-proxy
+//      note in dcv2_cooldown_strategy.pine for the same caveat).
+//
+// BUY pattern is the exact mirror (Donchian LOWER band, open==high touch,
+// open==low confirm; trigger = pattern high, sl = pattern low; sell a PUT).
+// ============================================================================
+strategy("Three Candle Pattern (bot-faithful)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpDC = "Donchian / Heikin Ashi"
+dcPeriod = input.int(20, "Donchian Period", minval=2, group=grpDC)
+
+grpFilter = "Day-of-Week Filter"
+skipSat = input.bool(false, "Block new entries on Saturday (IST)", group=grpFilter)
+skipSun = input.bool(true,  "Block new entries on Sunday (IST)",   group=grpFilter)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (matches the Python formula exactly).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// Tolerant equality for HA open==extreme checks.
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+// A candle has a wick on BOTH sides (not open==high, not open==low).
+wickBothSides(o, h, l, c) =>
+    bodyTop = math.max(o, c)
+    bodyBot = math.min(o, c)
+    h > bodyTop and l < bodyBot
+
+// ============================================================
+// Donchian(20) on HA, PRIOR closed bars only (current bar excluded via [1]).
+// ============================================================
+dcUpper = ta.highest(haHigh[1], dcPeriod)
+dcLower = ta.lowest(haLow[1], dcPeriod)
+plot(dcUpper, "Donchian Upper (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+plot(dcLower, "Donchian Lower (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+
+// ============================================================
+// Day-of-week block (gates only the trade itself; pattern still forms).
+// ============================================================
+dow = dayofweek(time, "Asia/Kolkata")
+dayBlocked = (skipSat and dow == dayofweek.saturday) or (skipSun and dow == dayofweek.sunday)
+
+// ============================================================
+// Pattern state machines -- independent per direction.
+// sellState/buyState: 0=idle, 1=got_a, 2=got_ab (armed happens inside state 2)
+// ============================================================
+var int   sellState = 0
+var float sellA_hi = na
+var float sellA_lo = na
+var float sellB_hi = na
+var float sellB_lo = na
+
+var int   buyState = 0
+var float buyA_hi = na
+var float buyA_lo = na
+var float buyB_hi = na
+var float buyB_lo = na
+
+var bool  pendingShort = false
+var bool  pendingLong  = false
+var float pendingTrigger = na
+var float pendingSL = na
+
+var float shortStop = na
+var float longStop = na
+
+flatNow = strategy.position_size == 0
+
+// ----- 1/2. Exits: fixed SL only. -----
+justArmed = false   // unused placeholder to mirror python's "always clear" flow
+if strategy.position_size > 0
+    if low <= longStop
+        strategy.close("Long", comment="SL")
+if strategy.position_size < 0
+    if high >= shortStop
+        strategy.close("Short", comment="SL")
+
+// ----- 3. Breakout trigger for an armed pending setup (REAL price). -----
+buyFired = false
+sellFired = false
+if flatNow and pendingShort
+    if high >= pendingSL
+        pendingShort := false
+    else if low <= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Short", strategy.short, stop=pendingTrigger)
+            shortStop := pendingSL
+            sellFired := true
+        pendingShort := false   // consumed (traded or blocked) either way
+else if flatNow and pendingLong
+    if low <= pendingSL
+        pendingLong := false
+    else if high >= pendingTrigger
+        if not dayBlocked
+            strategy.entry("Long", strategy.long, stop=pendingTrigger)
+            longStop := pendingSL
+            buyFired := true
+        pendingLong := false
+
+// ----- 4. Pattern progression (HA-based), only while flat and no pending. -----
+canHunt = flatNow and not pendingShort and not pendingLong
+
+// --- SELL pattern state machine ---
+sellAEvent = false   // fires every time a candle 1 is (re-)anchored
+sellBEvent = false
+if canHunt
+    if sellState == 0
+        if not na(dcUpper) and eq(haOpen, haLow) and haHigh >= dcUpper
+            sellA_hi := haHigh
+            sellA_lo := haLow
+            sellState := 1
+            sellAEvent := true
+    else if sellState == 1
+        if wickBothSides(haOpen, haHigh, haLow, haClose)
+            sellB_hi := haHigh
+            sellB_lo := haLow
+            sellState := 2
+            sellBEvent := true
+        else if not na(dcUpper) and eq(haOpen, haLow) and haHigh >= dcUpper
+            // This bar failed as B, but it's ITSELF a fresh valid A (e.g. an
+            // open==low bar can never have a lower wick, so it always fails
+            // B) -- re-anchor to THIS bar as the new candle 1 instead of
+            // discarding it and waiting for a separate future bar.
+            sellA_hi := haHigh
+            sellA_lo := haLow
+            sellAEvent := true
+        else
+            sellState := 0
+    else if sellState == 2
+        if eq(haOpen, haHigh) and haLow < sellB_lo and haLow < sellA_lo
+            patLow  = math.min(math.min(sellA_lo, sellB_lo), haLow)
+            patHigh = math.max(math.max(sellA_hi, sellB_hi), haHigh)
+            pendingShort := true
+            pendingTrigger := patLow
+            pendingSL := patHigh
+        sellState := 0
+
+// --- BUY pattern state machine (mirror) ---
+buyAEvent = false
+buyBEvent = false
+if canHunt
+    if buyState == 0
+        if not na(dcLower) and eq(haOpen, haHigh) and haLow <= dcLower
+            buyA_hi := haHigh
+            buyA_lo := haLow
+            buyState := 1
+            buyAEvent := true
+    else if buyState == 1
+        if wickBothSides(haOpen, haHigh, haLow, haClose)
+            buyB_hi := haHigh
+            buyB_lo := haLow
+            buyState := 2
+            buyBEvent := true
+        else if not na(dcLower) and eq(haOpen, haHigh) and haLow <= dcLower
+            // Same re-anchor as the sell side.
+            buyA_hi := haHigh
+            buyA_lo := haLow
+            buyAEvent := true
+        else
+            buyState := 0
+    else if buyState == 2
+        if eq(haOpen, haLow) and haHigh > buyB_hi and haHigh > buyA_hi
+            patHigh = math.max(math.max(buyA_hi, buyB_hi), haHigh)
+            patLow  = math.min(math.min(buyA_lo, buyB_lo), haLow)
+            pendingLong := true
+            pendingTrigger := patHigh
+            pendingSL := patLow
+        buyState := 0
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+// Mark EVERY stage of the pattern, every time it happens -- independent of
+// whether it later fires as a real trade (blocked days / SL-first invalidation
+// still show up here, so you can see pattern frequency vs. actual fill rate).
+// Uses the explicit sellAEvent/buyAEvent flags (not a state-transition
+// inference) so a RE-ANCHORED candle 1 (state stays at 1, anchor changes)
+// still gets marked every time, not just on the first 0->1 transition.
+plotshape(sellAEvent, title="Sell A (candle 1)", style=shape.circle, location=location.abovebar,
+     color=color.new(color.orange, 0), size=size.tiny, text="A")
+plotshape(buyAEvent, title="Buy A (candle 1)", style=shape.circle, location=location.belowbar,
+     color=color.new(color.teal, 0), size=size.tiny, text="A")
+
+plotshape(sellBEvent, title="Sell B (candle 2)", style=shape.circle, location=location.abovebar,
+     color=color.new(color.orange, 0), size=size.tiny, text="B")
+plotshape(buyBEvent, title="Buy B (candle 2)", style=shape.circle, location=location.belowbar,
+     color=color.new(color.teal, 0), size=size.tiny, text="B")
+
+// PATTERN COMPLETE (candle 3 confirmed, setup armed) -- fires EVERY time the
+// full 3-candle pattern completes, regardless of whether it goes on to fire
+// as an actual trade.
+armedSell = pendingShort and pendingShort[1] != pendingShort
+armedBuy  = pendingLong and pendingLong[1] != pendingLong
+plotshape(armedSell, title="PATTERN COMPLETE (Sell)", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.maroon, 0), textcolor=color.white, size=size.small, text="PATTERN")
+plotshape(armedBuy, title="PATTERN COMPLETE (Buy)", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.teal, 0), textcolor=color.white, size=size.small, text="PATTERN")
+
+plotshape(sellFired, title="SELL SIGNAL", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0), textcolor=color.white, size=size.small, text="SELL")
+plotshape(buyFired, title="BUY SIGNAL", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.green, 0), textcolor=color.white, size=size.small, text="BUY")
+
+slHitShort = strategy.position_size == 0 and strategy.position_size[1] < 0 and not na(shortStop[1]) and high[1] >= shortStop[1]
+slHitLong  = strategy.position_size == 0 and strategy.position_size[1] > 0 and not na(longStop[1]) and low[1] <= longStop[1]
+plotshape(slHitShort or slHitLong, title="SL HIT", style=shape.xcross, location=location.abovebar,
+     color=color.new(color.maroon, 0), size=size.tiny, text="SL")
+
+bgcolor(dayBlocked ? color.new(color.blue, 92) : na, title="Weekend block")
+
+inPos = strategy.position_size != 0
+activeSL = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+armedNow = (pendingShort or pendingLong) and not inPos
+plot(armedNow ? pendingTrigger : na, "Pending Trigger", color=color.new(color.aqua, 0), style=plot.style_circles, linewidth=2)
+plot(armedNow ? pendingSL : na, "Pending SL", color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2)
+
+// ============================================================
+// DIAGNOSTIC (separate pane): watch sellState/buyState (0=idle, 1=got A,
+// waiting on B; 2=got A+B, waiting on C) to see exactly where the BUY (or
+// SELL) hunt is getting stuck. Also plots dcLower/dcUpper touch markers so
+// you can confirm candle A itself is even occurring.
+// ============================================================
+plot(sellState, "Sell state (0/1/2)", color=color.new(color.red, 0), display=display.pane)
+plot(buyState, "Buy state (0/1/2)", color=color.new(color.green, 0), display=display.pane)
+
+touchLower = low <= dcLower
+touchUpper = high >= dcUpper
+plotshape(touchLower, title="Touched DC Lower", style=shape.triangleup, location=location.bottom,
+     color=color.new(color.blue, 60), size=size.tiny)
+plotshape(touchUpper, title="Touched DC Upper", style=shape.triangledown, location=location.top,
+     color=color.new(color.fuchsia, 60), size=size.tiny)

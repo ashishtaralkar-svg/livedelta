@@ -1,0 +1,155 @@
+//@version=5
+// ============================================================================
+// THREE CANDLE PATTERN — SIGNAL ONLY (no trade execution)
+//
+// Pure pattern-detection indicator. Shows a "PATTERN" label the instant a
+// 3-candle sequence completes -- SELL pattern (bearish) or BUY pattern
+// (bullish) -- with NO strategy.entry/close, no SL, no trigger-breakout
+// tracking. Just: does the pattern exist right here, yes/no.
+//
+// SELL pattern (three EXACT consecutive HA bars; any mismatch resets):
+//   A: HA open == HA low, AND HA high touches/exceeds the Donchian(20) upper
+//      band (highest high of the PRIOR 20 closed HA bars).
+//   B (immediate next bar): wick on BOTH sides (not open==high, not
+//      open==low) -- no other constraint. RE-ANCHOR: if this bar fails B but
+//      is itself a valid fresh A, it becomes the new candle 1 immediately
+//      (e.g. an open==low bar always fails B, since it has no lower wick --
+//      it's tried as a fresh A instead of being discarded).
+//   C (immediate next bar after B): HA open == HA high; C.low < B.low AND
+//      C.low < A.low (must trend lower than where the pattern started, not
+//      just lower than B).
+//   -> "PATTERN" signal fires on C. Hunting immediately resumes for the next
+//      pattern (no waiting on a trigger/breakout -- this script does not
+//      trade, so there's nothing to wait to resolve).
+//
+// BUY pattern is the exact mirror (Donchian LOWER band, open==high touch,
+// open==low confirm).
+//
+// See three_candle_strategy.pine for the full tradeable version (entries,
+// fixed SL, weekend block, option-sell backtest wiring).
+// ============================================================================
+indicator("Three Candle Pattern — Signal Only", overlay=true, max_labels_count=500)
+
+// ============================================================
+// Inputs
+// ============================================================
+dcPeriod = input.int(20, "Donchian Period", minval=2)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (matches the Python formula exactly).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+wickBothSides(o, h, l, c) =>
+    bodyTop = math.max(o, c)
+    bodyBot = math.min(o, c)
+    h > bodyTop and l < bodyBot
+
+// ============================================================
+// Donchian(20) on HA, PRIOR closed bars only.
+// ============================================================
+dcUpper = ta.highest(haHigh[1], dcPeriod)
+dcLower = ta.lowest(haLow[1], dcPeriod)
+plot(dcUpper, "Donchian Upper (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+plot(dcLower, "Donchian Lower (prior 20)", color=color.new(color.purple, 0), linewidth=1)
+
+// ============================================================
+// Pattern state machines -- independent per direction. No trade tracking:
+// as soon as a pattern completes (or a bar mismatches), the hunt resets and
+// keeps scanning immediately.
+// ============================================================
+var int   sellState = 0
+var float sellA_lo = na
+var float sellB_lo = na
+
+var int   buyState = 0
+var float buyA_hi = na
+var float buyB_hi = na
+
+sellPattern = false
+buyPattern = false
+sellAEvent = false   // fires every time a candle 1 is (re-)anchored
+sellBEvent = false
+buyAEvent = false
+buyBEvent = false
+
+// --- SELL pattern ---
+if sellState == 0
+    if not na(dcUpper) and eq(haOpen, haLow) and haHigh >= dcUpper
+        sellA_lo := haLow
+        sellState := 1
+        sellAEvent := true
+else if sellState == 1
+    if wickBothSides(haOpen, haHigh, haLow, haClose)
+        sellB_lo := haLow
+        sellState := 2
+        sellBEvent := true
+    else if not na(dcUpper) and eq(haOpen, haLow) and haHigh >= dcUpper
+        // This bar failed as B, but it's ITSELF a fresh valid A (e.g. an
+        // open==low bar can never have a lower wick, so it always fails B)
+        // -- re-anchor to THIS bar as the new candle 1 instead of discarding
+        // it and waiting for a separate future bar.
+        sellA_lo := haLow
+        sellAEvent := true
+    else
+        sellState := 0
+else if sellState == 2
+    if eq(haOpen, haHigh) and haLow < sellB_lo and haLow < sellA_lo
+        sellPattern := true
+    sellState := 0
+
+// --- BUY pattern (mirror) ---
+if buyState == 0
+    if not na(dcLower) and eq(haOpen, haHigh) and haLow <= dcLower
+        buyA_hi := haHigh
+        buyState := 1
+        buyAEvent := true
+else if buyState == 1
+    if wickBothSides(haOpen, haHigh, haLow, haClose)
+        buyB_hi := haHigh
+        buyState := 2
+        buyBEvent := true
+    else if not na(dcLower) and eq(haOpen, haHigh) and haLow <= dcLower
+        // Same re-anchor as the sell side.
+        buyA_hi := haHigh
+        buyAEvent := true
+    else
+        buyState := 0
+else if buyState == 2
+    if eq(haOpen, haLow) and haHigh > buyB_hi and haHigh > buyA_hi
+        buyPattern := true
+    buyState := 0
+
+// ============================================================
+// Plotting -- pattern stages + the final signal. NO buy/sell trade markers.
+// Uses the explicit sellAEvent/buyAEvent flags (not a state-transition
+// inference) so a RE-ANCHORED candle 1 (state stays at 1, anchor changes)
+// still gets marked every time, not just on the first 0->1 transition.
+// ============================================================
+plotshape(sellAEvent, title="Sell candle 1", style=shape.circle, location=location.abovebar,
+     color=color.new(color.orange, 0), size=size.tiny, text="1")
+plotshape(buyAEvent, title="Buy candle 1", style=shape.circle, location=location.belowbar,
+     color=color.new(color.teal, 0), size=size.tiny, text="1")
+
+plotshape(sellBEvent, title="Sell candle 2", style=shape.circle, location=location.abovebar,
+     color=color.new(color.orange, 0), size=size.tiny, text="2")
+plotshape(buyBEvent, title="Buy candle 2", style=shape.circle, location=location.belowbar,
+     color=color.new(color.teal, 0), size=size.tiny, text="2")
+
+plotshape(sellPattern, title="SELL PATTERN (3 candles complete)", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.maroon, 0), textcolor=color.white, size=size.normal, text="PATTERN")
+plotshape(buyPattern, title="BUY PATTERN (3 candles complete)", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.teal, 0), textcolor=color.white, size=size.normal, text="PATTERN")
+
+alertcondition(sellPattern, title="Sell Pattern", message="Three Candle Pattern: SELL setup complete")
+alertcondition(buyPattern, title="Buy Pattern", message="Three Candle Pattern: BUY setup complete")

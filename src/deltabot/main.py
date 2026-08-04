@@ -11,6 +11,7 @@ from .core.dcv2_trader import DCv2Engine
 from .core.dcv3_trader import DCv3Engine
 from .core.heikin_ashi_trader import HeikinAshiEngine
 from .core.revbreak_trader import RevBreakSellEngine
+from .core.three_candle_trader import ThreeCandleEngine
 from .enums import NotifyEvent
 from .exchange.rest_client import RestClient
 from .logging_setup import get_logger, setup_logging
@@ -37,6 +38,8 @@ async def run(settings: Settings) -> None:
         engine = DCv2Engine(settings, rest, notifier)
     elif settings.strategy == "dcv3":
         engine = DCv3Engine(settings, rest, notifier)
+    elif settings.strategy == "three_candle":
+        engine = ThreeCandleEngine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)
