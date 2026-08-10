@@ -196,6 +196,14 @@ class Settings(BaseSettings):
     # window too (matches the backtest's --continuous-roll, validated +14-51%
     # over the gapped version). False (default) = today's live behavior unchanged.
     dcv2_continuous_roll: bool = False
+    # A setup that fully arms (pending, waiting for its trigger) is NOT cleared
+    # by an EMA flip in the meantime -- only in-progress range-forming state
+    # resets on a flip. On: re-verify EMA(trend)-vs-EMA(long) still agrees
+    # with the trade direction AT THE TRIGGER bar itself; disagreeing consumes
+    # the setup untraded. Backtested +5.0% net over 3mo on the live config
+    # (269 vs 275 legs, $930.07 vs $886.16) -- a small, real improvement, not
+    # dramatic. False (default) = today's live behavior unchanged.
+    dcv2_require_ema_direction_at_trigger: bool = False
     # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
     # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
     # missed/unexpected signal be reconstructed minute-by-minute from the live

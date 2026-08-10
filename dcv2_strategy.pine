@@ -42,6 +42,13 @@
 //     state, blocks entries -- but NEVER closes an open position.
 //   * WEEKEND BLOCK (Sat/Sun IST, on by default): a trigger hit on a blocked
 //     day consumes the pending setup without placing a trade.
+//   * OPTIONAL "require EMA direction still agrees at trigger" (off by
+//     default): a fully-armed pending setup is normally NOT cleared by an EMA
+//     flip while it waits for its trigger -- only in-progress range-forming
+//     state resets on a flip. With this on, the resting stop order is only
+//     kept live on bars where EMA(trend)-vs-EMA(long) still agrees with the
+//     setup's direction; it suspends (not discards) on bars where it
+//     disagrees, and resumes if EMA realigns before the trigger is hit.
 //
 // HONESTY CHECK: backtested (scripts/backtest_dcv2.py, 30d, 5m, 1 BTC):
 //   -$87 total; 49 closed trades, 24.5% win rate; SL -$10,873 / EMA_CROSS
@@ -70,6 +77,18 @@ dcPeriod = input.int(20, "Donchian Period", minval=2, group=grpDC)
 grpEMA = "EMA Gate"
 emaTrendLen = input.int(50,  "EMA trend length (50)",  minval=1, group=grpEMA)
 emaLongLen  = input.int(200, "EMA long length (200)", minval=1, group=grpEMA)
+// A setup that fully arms (pendingLong/pendingShort) is NOT cleared by an EMA
+// flip in the meantime -- only in-progress range-forming state resets on a
+// flip (see section 0.5). So a setup armed during a bullish EMA phase can
+// still fire later even if EMA(50) has since crossed back below EMA(200) by
+// the time price hits the trigger. On: re-verify the EMA(trend)-vs-EMA(long)
+// relationship still agrees with the trade direction AT THE TRIGGER, checked
+// every bar the setup is still pending -- disagreeing suspends the resting
+// stop order (bar-by-bar) without discarding the setup, so it can still fire
+// once EMA direction is favorable again, right up until the trigger is
+// actually crossed (which consumes the setup either way, same as the other
+// trigger-time filters).
+requireEmaDirTrigger = input.bool(false, "Require EMA direction still agrees at trigger", group=grpEMA)
 
 grpDay = "Session (IST)"
 dayTZ       = input.string("Asia/Kolkata", "Timezone", group=grpDay)
@@ -240,34 +259,45 @@ if strategy.position_size < 0
 buyFired = false
 sellFired = false
 flatNow = strategy.position_size == 0
+emaDirOkLong  = not requireEmaDirTrigger or (emaTrend > emaLong)
+emaDirOkShort = not requireEmaDirTrigger or (emaTrend < emaLong)
+
 if flatNow and not squareOff and not inGap and pendingLong
     if low <= pendingSL
         strategy.cancel("Long")   // SL side hit first: dead setup (conservative order)
         pendingLong := false
     else if high >= pendingTrigger
-        if not dayBlocked
+        if not dayBlocked and emaDirOkLong
             strategy.entry("Long", strategy.long, stop=pendingTrigger)
             longStop := pendingSL
             trailModeLong := emaTrend > pendingTrigger and emaLong > pendingTrigger
             trailArmedLong := false
             buyFired := true
+        else
+            strategy.cancel("Long")   // blocked (day/EMA-direction) -- consumed untraded
         pendingLong := false
-    else if not dayBlocked
+    else if not dayBlocked and emaDirOkLong
         strategy.entry("Long", strategy.long, stop=pendingTrigger)   // resting order
+    else
+        strategy.cancel("Long")   // EMA direction currently disagrees -- suspend the resting order (setup stays pending)
 else if flatNow and not squareOff and not inGap and pendingShort
     if high >= pendingSL
         strategy.cancel("Short")
         pendingShort := false
     else if low <= pendingTrigger
-        if not dayBlocked
+        if not dayBlocked and emaDirOkShort
             strategy.entry("Short", strategy.short, stop=pendingTrigger)
             shortStop := pendingSL
             trailModeShort := emaTrend < pendingTrigger and emaLong < pendingTrigger
             trailArmedShort := false
             sellFired := true
+        else
+            strategy.cancel("Short")
         pendingShort := false
-    else if not dayBlocked
+    else if not dayBlocked and emaDirOkShort
         strategy.entry("Short", strategy.short, stop=pendingTrigger)
+    else
+        strategy.cancel("Short")
 
 // ----- 4. Hunt progression (HA-based), only while flat/no pending/gates ok.
 //          justClosedSL: after an SL OR TRAIL exit, that exit bar never counts

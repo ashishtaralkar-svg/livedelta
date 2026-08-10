@@ -92,6 +92,21 @@ class _Ema:
         return self._value
 
 
+class _Sma:
+    """Simple moving average over the last ``length`` values."""
+
+    def __init__(self, length: int) -> None:
+        self._window: deque[float] = deque(maxlen=length)
+
+    def update(self, x: float) -> float:
+        self._window.append(x)
+        return sum(self._window) / len(self._window)
+
+    @property
+    def value(self) -> float | None:
+        return sum(self._window) / len(self._window) if self._window else None
+
+
 class _Donchian:
     """Highest-high / lowest-low over the PRIOR ``period`` closed bars --
     the current bar is excluded until pushed at the end of ``update()``."""
@@ -147,13 +162,18 @@ class DCv2Strategy:
         dc_period: int = 20,
         ema_trend_length: int = 50,
         ema_long_length: int = 200,
+        long_ma_kind: str = "ema",
         ema_filter_fast: int = 0,
         ema_filter_slow: int = 0,
+        ema_filter_gate: bool = True,
+        tp_cooldown_until_cross: bool = False,
+        entry_above_ema_long: bool = False,
         use_heikin_ashi: bool = True,
         confirm_mode: str = "open_extreme",
         direction_gate: str = "ema",
         no_settlement_gap: bool = False,
         ema_exit: bool = True,
+        disable_trail: bool = False,
         target_rr: float = 0.0,
         target_pct: float = 0.0,
         skip_weekdays: frozenset[int] = frozenset({5, 6}),  # Mon=0 .. Sat=5, Sun=6 (IST)
@@ -162,10 +182,19 @@ class DCv2Strategy:
         day_start_minute: int = 30,
         square_off_hour: int = 17,
         square_off_minute: int = 25,
+        entry_start_hour: int = 0,
+        entry_end_hour: int = 24,
+        require_ema_direction_at_trigger: bool = False,
     ) -> None:
         self.dc_period = dc_period
         self.ema_trend_length = ema_trend_length
         self.ema_long_length = ema_long_length
+        # long_ma_kind: which MA the "long"/reference line uses for the hunt
+        # direction gate + EMA-reversal/trail exits. "ema" (default) = the
+        # classic EMA(ema_long_length) (e.g. 200). "sma" = a Simple MA of the
+        # same length -- e.g. ema_long_length=50 gives the EMA(50)-vs-SMA(50)
+        # gate: BUY hunts when EMA(50) > SMA(50), SELL when EMA(50) < SMA(50).
+        self.long_ma_kind = long_ma_kind
         # Optional second EMA trend filter (0/0 = off). When both > 0, an entry
         # is gated: BUY needs EMA(fast) > EMA(slow), SELL needs EMA(fast) <
         # EMA(slow), on HA close. Layered ON TOP of the existing EMA(50)/(200)
@@ -173,11 +202,36 @@ class DCv2Strategy:
         self.ema_filter_fast = ema_filter_fast
         self.ema_filter_slow = ema_filter_slow
         self._ema_filter_on = ema_filter_fast > 0 and ema_filter_slow > 0
+        # ema_filter_gate: True (default) -> the EMA(fast)/(slow) pair GATES
+        # entries. False -> the pair is still COMPUTED (for ema_filter_relation,
+        # e.g. trend-based position sizing) but does NOT block any entry.
+        self.ema_filter_gate = ema_filter_gate
+        # tp_cooldown_until_cross: after a 70% TP is booked (signalled from the
+        # runner/engine via enter_tp_cooldown()), STOP hunting/entering new
+        # trades until the NEXT EMA crossover -- either EMA(50)/(200) OR
+        # EMA(fast)/(slow) crossing in EITHER direction. First crossover lifts
+        # the pause; hunting then resumes normally. Reduces repeated re-entries
+        # in the same trend leg after a win. Only a TP arms this (SL/EMA-cross/
+        # TRAIL exits do not). Off by default -- existing behavior unchanged.
+        self.tp_cooldown_until_cross = tp_cooldown_until_cross
+        # entry_above_ema_long: at the breakout trigger, require the entry price
+        # to sit on the trend side of EMA(200) -- a BUY only fires if trig >
+        # EMA(200), a SELL only if trig < EMA(200). Blocks counter-trend
+        # breakouts that cross back through the 200 EMA. Consumes the setup
+        # untraded when it disagrees (same as the weekend/EMA-filter gates).
+        self.entry_above_ema_long = entry_above_ema_long
         # ema_exit=False: disable BOTH EMA-based exits (the "cross" EMA-reversal
         # exit AND the two-stage "trail" exit) -- a position then closes ONLY on
         # its fixed range SL (or an external administrative close: square-off/
         # rollover/weekend/TP, handled outside the strategy).
         self.ema_exit = ema_exit
+        # disable_trail=True: force EVERY trade to use the plain "cross" EMA
+        # exit (close when EMA(50) crosses to the unfavorable side of
+        # EMA(200)), even the subset that would normally get the two-stage
+        # "trail" exit (entries that triggered from the wrong side of BOTH
+        # EMAs -- see _exit_mode_for). No-op if ema_exit=False (no EMA-based
+        # exit at all either way).
+        self.disable_trail = disable_trail
         # target_rr > 0: on entry, set a fixed profit target at
         # entry +/- risk*target_rr, where risk = |entry - sl_level| (the SAME
         # distance as the fixed SL, just on the profitable side). 1.0 = a 1:1
@@ -217,13 +271,34 @@ class DCv2Strategy:
         self._tz = ZoneInfo(day_tz)
         self._sess_mins = day_start_hour * 60 + day_start_minute
         self._sq_mins = square_off_hour * 60 + square_off_minute
+        # entry_start_hour/entry_end_hour: gate the TRADE itself to an IST hour
+        # window [start, end) -- e.g. 7/17 = only 07:00-16:59 entries. Same
+        # convention as skip_weekdays: pattern hunting/arming continues outside
+        # the window regardless; a trigger hit outside it just consumes the
+        # pending setup untraded. Default 0/24 = no restriction (unchanged).
+        self.entry_start_hour = entry_start_hour
+        self.entry_end_hour = entry_end_hour
+        # require_ema_direction_at_trigger: a pending setup that fully arms
+        # (touched + confirmed -> _pending_long/_pending_short) is NOT cleared
+        # by an EMA flip in the meantime -- _reset_ranges() (called on every
+        # hunt-direction change) only clears in-progress range-forming state,
+        # never an already-armed pending trigger/SL. So a setup armed during a
+        # bullish EMA phase can still fire its entry later even if EMA(50) has
+        # since crossed back below EMA(200) by the time price hits the
+        # trigger. On: re-verify the EMA(trend)-vs-EMA(long) relationship
+        # still agrees with the trade direction AT THE TRIGGER BAR itself
+        # (BUY needs ema_trend > ema_long, SELL needs ema_trend < ema_long);
+        # disagreeing consumes the setup untraded, same convention as the
+        # other trigger-time filters. Off (default) = unchanged behavior.
+        self.require_ema_direction_at_trigger = require_ema_direction_at_trigger
         self.reset()
 
     # ------------------------------------------------------------------ #
     def reset(self) -> None:
         self._dc = _Donchian(self.dc_period)
         self._ema_trend = _Ema(self.ema_trend_length)
-        self._ema_long = _Ema(self.ema_long_length)
+        self._ema_long = (_Sma(self.ema_long_length) if self.long_ma_kind == "sma"
+                          else _Ema(self.ema_long_length))
         self._ema_filt_fast = _Ema(self.ema_filter_fast) if self._ema_filter_on else None
         self._ema_filt_slow = _Ema(self.ema_filter_slow) if self._ema_filter_on else None
         self._warmup_bars = 0
@@ -260,6 +335,13 @@ class DCv2Strategy:
         # entry side of both EMAs exits ("TRAIL").
         self._exit_mode = "cross"
         self._trail_armed = False
+
+        # TP cooldown: True after a booked TP, cleared on the next EMA crossover.
+        # _prev_sign_*: last bar's sign of (fast - slow) for each EMA pair, used
+        # to detect a crossover (sign flip). 0 = not yet determined.
+        self._tp_cooldown = False
+        self._prev_sign_5020 = 0
+        self._prev_sign_150600 = 0
 
     @property
     def position_state(self) -> PositionState:
@@ -311,15 +393,42 @@ class DCv2Strategy:
         self._clear_pending()
         self._clear_hunts()
 
+    def enter_tp_cooldown(self) -> None:
+        """Called by the runner/engine right after a 70% TP is booked. Arms the
+        wait-for-crossover pause (no-op unless tp_cooldown_until_cross is on)."""
+        if self.tp_cooldown_until_cross:
+            self._tp_cooldown = True
+
     def _ema_filter_ok(self, is_long: bool) -> bool:
-        """Optional EMA(fast)/(slow) trend filter. Off -> always True. On:
-        a BUY needs EMA(fast) > EMA(slow), a SELL needs EMA(fast) < EMA(slow)."""
-        if not self._ema_filter_on:
+        """Optional EMA(fast)/(slow) trend filter. Off, or gate disabled -> always
+        True. On+gated: a BUY needs EMA(fast) > EMA(slow), a SELL needs <."""
+        if not self._ema_filter_on or not self.ema_filter_gate:
             return True
         f, s = self._ema_filt_fast.value, self._ema_filt_slow.value
         if f is None or s is None:
             return False   # not warm yet -> don't enter
         return f > s if is_long else f < s
+
+    @property
+    def ema_filter_relation(self) -> int:
+        """+1 if EMA(fast) > EMA(slow), -1 if <, 0 if off/not-warm. Read for
+        trend-based position sizing (not gating)."""
+        if not self._ema_filter_on:
+            return 0
+        f, s = self._ema_filt_fast.value, self._ema_filt_slow.value
+        if f is None or s is None:
+            return 0
+        return 1 if f > s else -1 if f < s else 0
+
+    def _entry_ema_long_ok(self, is_long: bool, price: float) -> bool:
+        """Optional EMA(200)-side entry filter. Off -> always True. On: a BUY
+        needs the trigger price ABOVE EMA(200), a SELL needs it BELOW."""
+        if not self.entry_above_ema_long:
+            return True
+        el = self._ema_long.value
+        if el is None:
+            return False   # not warm yet -> don't enter
+        return price > el if is_long else price < el
 
     def _exit_mode_for(self, trig: float, is_long: bool) -> str:
         """session_line mode: no EMA/trail exit at all ("none" -> SL / 17:25
@@ -328,6 +437,8 @@ class DCv2Strategy:
         otherwise the normal EMA-relationship "cross" exit."""
         if self.direction_gate == "session_line":
             return "none"
+        if self.disable_trail:
+            return "cross"
         et, el = self._ema_trend.value, self._ema_long.value
         if et is None or el is None:
             return "cross"
@@ -377,8 +488,8 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open >= trig or candle.high >= trig:
-                if not self._ema_filter_ok(is_long=True):
-                    self._clear_pending()   # trend filter blocks -> consume, no entry
+                if not self._ema_filter_ok(is_long=True) or not self._entry_ema_long_ok(True, trig):
+                    self._clear_pending()   # trend/EMA200 filter blocks -> consume, no entry
                     return False, False, 0.0
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
@@ -393,7 +504,7 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open <= trig or candle.low <= trig:
-                if not self._ema_filter_ok(is_long=False):
+                if not self._ema_filter_ok(is_long=False) or not self._entry_ema_long_ok(False, trig):
                     self._clear_pending()
                     return False, False, 0.0
                 self._in_short, self._in_long = True, False
@@ -432,6 +543,27 @@ class DCv2Strategy:
         dc_upper, dc_lower = self._dc.upper, self._dc.lower
         self._warmup_bars += 1
 
+        # TP cooldown: after a booked TP, wait for the NEXT crossover of either
+        # EMA pair -- EMA(50)/(200) OR EMA(fast)/(slow) -- in EITHER direction,
+        # then resume hunting. Track each pair's sign and clear on a flip.
+        if self.tp_cooldown_until_cross:
+            crossed = False
+            s1 = (1 if ema_trend > ema_long else -1 if ema_trend < ema_long else 0)
+            if s1 != 0 and self._prev_sign_5020 != 0 and s1 != self._prev_sign_5020:
+                crossed = True
+            if s1 != 0:
+                self._prev_sign_5020 = s1
+            if self._ema_filter_on:
+                ff, fs = self._ema_filt_fast.value, self._ema_filt_slow.value
+                if ff is not None and fs is not None:
+                    s2 = (1 if ff > fs else -1 if ff < fs else 0)
+                    if s2 != 0 and self._prev_sign_150600 != 0 and s2 != self._prev_sign_150600:
+                        crossed = True
+                    if s2 != 0:
+                        self._prev_sign_150600 = s2
+            if crossed and self._tp_cooldown:
+                self._tp_cooldown = False
+
         # Diagnostic snapshot of the values the strategy USED this bar (DC bands
         # are the prior-20 exclusion, before this bar is pushed). Read by
         # debug_state() for the engine's optional per-candle state log.
@@ -457,14 +589,17 @@ class DCv2Strategy:
         if self.no_settlement_gap:
             square_off = in_gap = False
         day_blocked = local.weekday() in self.skip_weekdays
+        hour_blocked = not (self.entry_start_hour <= local.hour < self.entry_end_hour)
         # session_line mode: (re)draw the session line at 17:30 each day.
         session_start = (self._prev_now_mins is not None
                          and now_mins >= self._sess_mins and self._prev_now_mins < self._sess_mins)
         if self.direction_gate == "session_line" and session_start:
             self._session_line = candle.open
 
-        # --- 0. Settlement gap: cancel pending + clear hunts (never closes a position) ---
-        if square_off or in_gap:
+        # --- 0. Settlement gap OR TP cooldown: cancel pending + clear hunts
+        #     (never closes a position). During cooldown we stay fully idle until
+        #     the next crossover clears it above. ---
+        if square_off or in_gap or self._tp_cooldown:
             self._clear_pending()
             self._clear_hunts()
 
@@ -472,8 +607,8 @@ class DCv2Strategy:
         #     (the "not already armed" guard fires the reset only on the
         #     transition). session_line mode: EMAs ignored -> BOTH directions
         #     always hunt; the session-line filter decides which range is taken
-        #     (in _arm_long/_arm_short). ---
-        if not square_off and not in_gap and self.ready:
+        #     (in _arm_long/_arm_short). Suppressed while a TP cooldown is active. ---
+        if not square_off and not in_gap and not self._tp_cooldown and self.ready:
             if self.direction_gate == "session_line":
                 if not self._hunt_bull:
                     self._hunt_bull = True
@@ -554,7 +689,9 @@ class DCv2Strategy:
             if sl is not None and candle.low <= sl:
                 self._clear_pending()   # invalidated before the trigger (SL side first, conservative)
             elif trig is not None and candle.high >= trig:
-                if not day_blocked and self._ema_filter_ok(is_long=True):
+                ema_dir_ok = (not self.require_ema_direction_at_trigger) or (ema_trend > ema_long)
+                if (not day_blocked and not hour_blocked and ema_dir_ok and self._ema_filter_ok(is_long=True)
+                        and self._entry_ema_long_ok(is_long=True, price=trig)):
                     buy_signal, entry_price, new_sl = True, trig, sl
                     self._in_long, self._sl_level = True, sl
                     self._target_level = self._target_for(trig, sl, is_long=True)
@@ -566,7 +703,9 @@ class DCv2Strategy:
             if sl is not None and candle.high >= sl:
                 self._clear_pending()
             elif trig is not None and candle.low <= trig:
-                if not day_blocked and self._ema_filter_ok(is_long=False):
+                ema_dir_ok = (not self.require_ema_direction_at_trigger) or (ema_trend < ema_long)
+                if (not day_blocked and not hour_blocked and ema_dir_ok and self._ema_filter_ok(is_long=False)
+                        and self._entry_ema_long_ok(is_long=False, price=trig)):
                     sell_signal, entry_price, new_sl = True, trig, sl
                     self._in_short, self._sl_level = True, sl
                     self._target_level = self._target_for(trig, sl, is_long=False)

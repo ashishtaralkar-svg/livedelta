@@ -76,6 +76,7 @@ class DCv2Engine:
             square_off_hour=settings.square_off_hour,
             square_off_minute=settings.square_off_minute,
             no_settlement_gap=settings.dcv2_continuous_roll,
+            require_ema_direction_at_trigger=settings.dcv2_require_ema_direction_at_trigger,
         )
         self.executor = (PaperExecutor(rest, settings) if settings.paper_mode
                          else OptionsExecutor(rest, settings))
