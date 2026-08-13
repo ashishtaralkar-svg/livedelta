@@ -286,10 +286,13 @@ class DCv2Strategy:
         # bullish EMA phase can still fire its entry later even if EMA(50) has
         # since crossed back below EMA(200) by the time price hits the
         # trigger. On: re-verify the EMA(trend)-vs-EMA(long) relationship
-        # still agrees with the trade direction AT THE TRIGGER BAR itself
-        # (BUY needs ema_trend > ema_long, SELL needs ema_trend < ema_long);
-        # disagreeing consumes the setup untraded, same convention as the
-        # other trigger-time filters. Off (default) = unchanged behavior.
+        # still agrees with the trade direction AT THE TRIGGER MOMENT itself
+        # (BUY needs ema_trend > ema_long, SELL needs ema_trend < ema_long) --
+        # checked in BOTH the closed-bar trigger (update()) and the ASAP
+        # intracandle trigger (apply_intracandle_pending(), what live actually
+        # uses by default); disagreeing consumes the setup untraded, same
+        # convention as the other trigger-time filters. Off (default) =
+        # unchanged behavior.
         self.require_ema_direction_at_trigger = require_ema_direction_at_trigger
         self.reset()
 
@@ -430,6 +433,20 @@ class DCv2Strategy:
             return False   # not warm yet -> don't enter
         return price > el if is_long else price < el
 
+    def _ema_direction_ok(self, is_long: bool) -> bool:
+        """require_ema_direction_at_trigger gate: re-verify EMA(trend) vs
+        EMA(long) still agrees with the trade direction AT THE TRIGGER MOMENT
+        -- shared by the closed-bar trigger (update()) and the ASAP intracandle
+        trigger (apply_intracandle_pending()), so a setup armed while e.g.
+        EMA(50) > EMA(200) but triggering after EMA(50) has since crossed
+        below EMA(200) gets cancelled either way. Off (default) -> always True."""
+        if not self.require_ema_direction_at_trigger:
+            return True
+        et, el = self._ema_trend.value, self._ema_long.value
+        if et is None or el is None:
+            return False   # not warm yet -> don't enter
+        return et > el if is_long else et < el
+
     def _exit_mode_for(self, trig: float, is_long: bool) -> str:
         """session_line mode: no EMA/trail exit at all ("none" -> SL / 17:25
         only). EMA mode: a trade triggering from the wrong side of BOTH EMAs
@@ -488,8 +505,9 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open >= trig or candle.high >= trig:
-                if not self._ema_filter_ok(is_long=True) or not self._entry_ema_long_ok(True, trig):
-                    self._clear_pending()   # trend/EMA200 filter blocks -> consume, no entry
+                if (not self._ema_filter_ok(is_long=True) or not self._entry_ema_long_ok(True, trig)
+                        or not self._ema_direction_ok(is_long=True)):
+                    self._clear_pending()   # trend/EMA200/direction filter blocks -> consume, no entry
                     return False, False, 0.0
                 self._in_long, self._in_short = True, False
                 self._sl_level = sl
@@ -504,7 +522,8 @@ class DCv2Strategy:
                 self._clear_pending()
                 return False, True, 0.0
             if candle.open <= trig or candle.low <= trig:
-                if not self._ema_filter_ok(is_long=False) or not self._entry_ema_long_ok(False, trig):
+                if (not self._ema_filter_ok(is_long=False) or not self._entry_ema_long_ok(False, trig)
+                        or not self._ema_direction_ok(is_long=False)):
                     self._clear_pending()
                     return False, False, 0.0
                 self._in_short, self._in_long = True, False
@@ -689,7 +708,7 @@ class DCv2Strategy:
             if sl is not None and candle.low <= sl:
                 self._clear_pending()   # invalidated before the trigger (SL side first, conservative)
             elif trig is not None and candle.high >= trig:
-                ema_dir_ok = (not self.require_ema_direction_at_trigger) or (ema_trend > ema_long)
+                ema_dir_ok = self._ema_direction_ok(is_long=True)
                 if (not day_blocked and not hour_blocked and ema_dir_ok and self._ema_filter_ok(is_long=True)
                         and self._entry_ema_long_ok(is_long=True, price=trig)):
                     buy_signal, entry_price, new_sl = True, trig, sl
@@ -703,7 +722,7 @@ class DCv2Strategy:
             if sl is not None and candle.high >= sl:
                 self._clear_pending()
             elif trig is not None and candle.low <= trig:
-                ema_dir_ok = (not self.require_ema_direction_at_trigger) or (ema_trend < ema_long)
+                ema_dir_ok = self._ema_direction_ok(is_long=False)
                 if (not day_blocked and not hour_blocked and ema_dir_ok and self._ema_filter_ok(is_long=False)
                         and self._entry_ema_long_ok(is_long=False, price=trig)):
                     sell_signal, entry_price, new_sl = True, trig, sl

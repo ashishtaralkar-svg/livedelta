@@ -170,6 +170,43 @@ def test_invalidation_before_trigger_discards_setup() -> None:
     assert not s.has_pending and s.position_state == PositionState.FLAT
 
 
+def test_require_ema_direction_at_trigger_cancels_intracandle_entry_on_flip() -> None:
+    """A pending long armed while EMA(trend)>EMA(long) whose relationship has
+    since flipped bearish -- before price ever reaches the trigger -- must be
+    cancelled (not just at the closed-bar trigger, but also on the ASAP
+    intracandle path that live trading actually uses by default)."""
+    s = _strategy(require_ema_direction_at_trigger=True)
+    _bull_setup(s)
+    assert s.has_pending
+    t = _ts(10, 30, 8)
+    # Falling closes flip EMA(2) below EMA(4) without touching the pending
+    # trigger (110) or SL (95) on any closed bar.
+    for i, cl in enumerate((102.0, 100.0, 98.0, 96.0)):
+        s.update(_c(t + i * 300, cl + 0.2, cl + 0.3, cl - 0.3, cl))
+    assert s.has_pending   # untouched so far
+    assert not s._ema_direction_ok(is_long=True)   # relationship has flipped
+    forming = _c(t + 4 * 300, 96.0, 112.0, 96.0, 112.0)   # breaks the 110 trigger intracandle
+    confirmed, invalidated, entry_price = s.apply_intracandle_pending(forming)
+    assert not confirmed
+    assert not invalidated
+    assert not s.has_pending                       # consumed, not left dangling
+    assert s.position_state == PositionState.FLAT   # NOT entered
+
+
+def test_intracandle_entry_ignores_ema_direction_when_flag_off() -> None:
+    """Same flipped-EMA scenario as above, but with the flag at its default
+    (off) -- today's unchanged behavior: the intracandle trigger still fires."""
+    s = _strategy(require_ema_direction_at_trigger=False)
+    _bull_setup(s)
+    t = _ts(10, 30, 8)
+    for i, cl in enumerate((102.0, 100.0, 98.0, 96.0)):
+        s.update(_c(t + i * 300, cl + 0.2, cl + 0.3, cl - 0.3, cl))
+    forming = _c(t + 4 * 300, 96.0, 112.0, 96.0, 112.0)
+    confirmed, invalidated, entry_price = s.apply_intracandle_pending(forming)
+    assert confirmed and entry_price == 110.0
+    assert s.position_state == PositionState.LONG
+
+
 def test_trail_exit_skips_its_own_bar_like_sl() -> None:
     """After a TRAIL exit (like an SL exit), the exit bar must NOT start a new
     range even if it touches a Donchian band -- hunting resumes NEXT bar."""
