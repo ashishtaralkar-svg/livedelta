@@ -1,0 +1,270 @@
+//@version=5
+// ============================================================================
+// EMA(21) SETUP-START + WAIT-FOR-REVERSAL-COLOR — 15-minute real
+// candlesticks (no Heikin Ashi; the pattern is defined directly on raw OHLC).
+//
+// RULES (SELL side; BUY is the exact mirror):
+//   * SETUP-START (anchor): a candle whose CLOSE is below EMA(21) -- that's
+//     the whole condition, nothing about where it opened.
+//   * WAIT: up to 3 candles following the setup-start candle, waiting for a
+//     GREEN one. If ANY candle in this stretch (wait candles OR the
+//     eventual green trigger candle itself) CLOSES back ABOVE the EMA, the
+//     whole setup is discarded -- hunting restarts from scratch. If a
+//     GREEN candle never shows up within 3 tries, it also discards. The
+//     very first candle after setup-start already being green (and not
+//     closing above the EMA) qualifies immediately -- no minimum wait.
+//   * TRIGGERED CANDLE: the first GREEN candle that satisfies the above.
+//     Sets:
+//       - SELL ENTRY = this candle's LOW
+//       - SL         = the SETUP-START candle's HIGH (not the triggered
+//         candle's own high)
+//       - TARGET     = entry - 1.5 x (SL - entry)   [1.5 R]
+//   * ENTRY: real price breaking BELOW the triggered candle's low, checked
+//     on bars AFTER it completed (never the triggered bar's own bar).
+//   * SL / TARGET: both FIXED for the life of the trade -- real price
+//     touching either one closes it.
+//
+// ADDED BEYOND THE LITERAL SPEC (flagged):
+//   * Pre-entry invalidation: if real price touches the SL level BEFORE
+//     ever reaching the entry trigger, the pending setup is discarded
+//     untraded (same convention as every other strategy in this repo --
+//     entering a breakout that already touched its own stop first makes no
+//     sense). Checked SL-side first, conservative ordering.
+//   * No settlement gap / session concept -- this pattern isn't tied to a
+//     specific IST session like the other strategies in this repo, so none
+//     was added. Runs continuously.
+//
+// Intended for the 15-minute chart. No Heikin Ashi, no daily/session gating,
+// just the EMA + raw-candle pattern above.
+//
+// NOT YET BACKTESTED -- a fresh port, not a validated strategy.
+// ============================================================================
+strategy("EMA(21) Rejection + Pullback",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Inputs
+// ============================================================
+emaLen      = input.int(21, "EMA Length", minval=1)
+targetRR    = input.float(1.5, "Target (multiple of risk)", minval=0.1)
+maxPullback = input.int(3, "Max pullback candles", minval=1)
+useLongs    = input.bool(true, "Enable Buy setups")
+useShorts   = input.bool(true, "Enable Sell setups")
+
+// ============================================================
+// EMA(21) on real close.
+// ============================================================
+ema21 = ta.ema(close, emaLen)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
+
+isGreen = close > open
+isRed   = close < open
+
+// ============================================================
+// State — anchor -> (up to 3-candle) pullback -> confirm -> pending trigger,
+// per side. Pending vs ACTIVE (open-position) SL/target kept in separate
+// variables so nothing can collide across an entry.
+// ============================================================
+var bool  bearArmed = false
+var int   bearPullbackN = 0
+var float bearAnchorHigh = na   // setup-start candle's own high -- becomes the SL
+var bool  bullArmed = false
+var int   bullPullbackN = 0
+var float bullAnchorLow  = na   // setup-start candle's own low -- becomes the SL
+
+var float pendingShortTrigger = na
+var float pendingShortSL      = na
+var float pendingShortTarget  = na
+var float pendingLongTrigger  = na
+var float pendingLongSL       = na
+var float pendingLongTarget   = na
+
+var float activeShortSL     = na
+var float activeShortTarget = na
+var float activeLongSL      = na
+var float activeLongTarget  = na
+
+// ----- 1. Exits: fixed SL / TARGET only. SL checked first on a bar where
+//          both could theoretically be touched (conservative). Captured
+//          into plain vars (reason/price) so section 4 can label them. -----
+exitFired = false
+exitReason = ""
+exitPrice = 0.0
+
+if strategy.position_size < 0
+    if not na(activeShortSL) and high >= activeShortSL
+        strategy.close("Short", comment="SL")
+        exitFired := true
+        exitReason := "SL"
+        exitPrice := activeShortSL
+        activeShortSL := na
+        activeShortTarget := na
+    else if not na(activeShortTarget) and low <= activeShortTarget
+        strategy.close("Short", comment="TARGET")
+        exitFired := true
+        exitReason := "TARGET"
+        exitPrice := activeShortTarget
+        activeShortSL := na
+        activeShortTarget := na
+if strategy.position_size > 0
+    if not na(activeLongSL) and low <= activeLongSL
+        strategy.close("Long", comment="SL")
+        exitFired := true
+        exitReason := "SL"
+        exitPrice := activeLongSL
+        activeLongSL := na
+        activeLongTarget := na
+    else if not na(activeLongTarget) and high >= activeLongTarget
+        strategy.close("Long", comment="TARGET")
+        exitFired := true
+        exitReason := "TARGET"
+        exitPrice := activeLongTarget
+        activeLongSL := na
+        activeLongTarget := na
+
+// ----- 2. Entry: real-price breakout of a PRIOR-armed pending trigger --
+//          runs BEFORE pattern hunting below, so a confirm candle can only
+//          trigger starting the NEXT bar. SL-side invalidation checked
+//          first (conservative); filling promotes pending SL/target to
+//          ACTIVE. if/else-if between Short and Long. -----
+flatNow = strategy.position_size == 0
+sellFired = false
+buyFired  = false
+firedEntryPrice = 0.0
+firedTargetPrice = 0.0
+
+if flatNow and useShorts and not na(pendingShortTrigger)
+    if high >= pendingShortSL
+        strategy.cancel("Short")
+        pendingShortTrigger := na
+        pendingShortSL := na
+        pendingShortTarget := na
+    else if low <= pendingShortTrigger
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)
+        activeShortSL := pendingShortSL
+        activeShortTarget := pendingShortTarget
+        sellFired := true
+        firedEntryPrice := pendingShortTrigger
+        firedTargetPrice := pendingShortTarget
+        pendingShortTrigger := na
+        pendingShortSL := na
+        pendingShortTarget := na
+    else
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)   // resting order
+else if flatNow and useLongs and not na(pendingLongTrigger)
+    if low <= pendingLongSL
+        strategy.cancel("Long")
+        pendingLongTrigger := na
+        pendingLongSL := na
+        pendingLongTarget := na
+    else if high >= pendingLongTrigger
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)
+        activeLongSL := pendingLongSL
+        activeLongTarget := pendingLongTarget
+        buyFired := true
+        firedEntryPrice := pendingLongTrigger
+        firedTargetPrice := pendingLongTarget
+        pendingLongTrigger := na
+        pendingLongSL := na
+        pendingLongTarget := na
+    else
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)   // resting order
+
+// ----- 3. Pattern hunting -- anchor -> pullback -> confirm, only while flat
+//          and no pending setup already armed for that side. -----
+flatForHunt = strategy.position_size == 0 and not sellFired and not buyFired
+
+// SELL side
+if flatForHunt and na(pendingShortTrigger)
+    if not bearArmed
+        if close < ema21
+            bearArmed := true
+            bearPullbackN := 0
+            bearAnchorHigh := high      // remember the setup-start candle's high for SL
+    else
+        if close > ema21
+            bearArmed := false      // invalidated: closed back above the EMA
+            bearPullbackN := 0
+        else if isGreen
+            pendingShortTrigger := low
+            pendingShortSL := bearAnchorHigh
+            riskS = bearAnchorHigh - low
+            pendingShortTarget := low - targetRR * riskS
+            bearArmed := false
+        else
+            bearPullbackN := bearPullbackN + 1
+            if bearPullbackN > maxPullback
+                bearArmed := false   // green never showed up in time
+                bearPullbackN := 0
+
+// BUY side (mirror)
+if flatForHunt and na(pendingLongTrigger)
+    if not bullArmed
+        if close > ema21
+            bullArmed := true
+            bullPullbackN := 0
+            bullAnchorLow := low        // remember the setup-start candle's low for SL
+    else
+        if close < ema21
+            bullArmed := false
+            bullPullbackN := 0
+        else if isRed
+            pendingLongTrigger := high
+            pendingLongSL := bullAnchorLow
+            riskL = high - bullAnchorLow
+            pendingLongTarget := high + targetRR * riskL
+            bullArmed := false
+        else
+            bullPullbackN := bullPullbackN + 1
+            if bullPullbackN > maxPullback
+                bullArmed := false   // red never showed up in time
+                bullPullbackN := 0
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(bearArmed and not bearArmed[1], "Bear anchor seen", shape.circle, location.abovebar, color.new(color.red, 0),  size=size.tiny)
+plotshape(bullArmed and not bullArmed[1], "Bull anchor seen", shape.circle, location.belowbar, color.new(color.lime, 0), size=size.tiny)
+
+armedShort = not na(pendingShortTrigger) and flatNow
+armedLong  = not na(pendingLongTrigger)  and flatNow
+plot(armedShort ? pendingShortTrigger : na, "Pending Short Trigger", color=color.new(color.fuchsia, 0), style=plot.style_circles, linewidth=2)
+plot(armedShort ? pendingShortSL      : na, "Pending Short SL",      color=color.new(color.maroon, 0),  style=plot.style_circles, linewidth=1)
+plot(armedLong  ? pendingLongTrigger  : na, "Pending Long Trigger",  color=color.new(color.aqua, 0),    style=plot.style_circles, linewidth=2)
+plot(armedLong  ? pendingLongSL       : na, "Pending Long SL",       color=color.new(color.teal, 0),    style=plot.style_circles, linewidth=1)
+
+plotshape(buyFired,  title="BUY",  style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellFired, title="SELL", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.small, text="SELL")
+
+inPos = strategy.position_size != 0
+activeSL     = strategy.position_size < 0 ? activeShortSL     : strategy.position_size > 0 ? activeLongSL     : na
+activeTarget = strategy.position_size < 0 ? activeShortTarget : strategy.position_size > 0 ? activeLongTarget : na
+plot(inPos ? activeSL     : na, "Active SL",     color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(inPos ? activeTarget : na, "Active Target", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+// ----- 4. Labels -- ENTRY / TARGET (set) / EXIT (SL or TARGET hit). -----
+if sellFired
+    label.new(bar_index, firedEntryPrice, "SELL " + str.tostring(firedEntryPrice, format.mintick),
+         style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    label.new(bar_index, firedTargetPrice, "TARGET " + str.tostring(firedTargetPrice, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+if buyFired
+    label.new(bar_index, firedEntryPrice, "BUY " + str.tostring(firedEntryPrice, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+    label.new(bar_index, firedTargetPrice, "TARGET " + str.tostring(firedTargetPrice, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+if exitFired
+    label.new(bar_index, exitPrice, exitReason + " " + str.tostring(exitPrice, format.mintick),
+         style=label.style_label_left, color=exitReason == "TARGET" ? color.new(color.green, 0) : color.new(color.maroon, 0),
+         textcolor=color.white, size=size.small)

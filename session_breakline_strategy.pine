@@ -1,0 +1,254 @@
+//@version=5
+// ============================================================================
+// SESSION BREAKLINE — Heikin Ashi open==extreme reversal, gated by a daily
+// 05:30 PM IST session line.
+//
+// Chart basis: trades BTC directionally as a proxy (same convention as
+// dcv2_strategy.pine). Live execution (if ported to the Python engine) would
+// SELL a PUT at ~600 target premium on a BUY signal, SELL a CALL at ~600 on a
+// SELL signal — this script itself only trades the BTC proxy for
+// backtesting/visualization.
+//
+// RULES:
+//   * SESSION LINE: drawn fresh every day at the first candle whose IST time
+//     is >= 17:30, at that candle's CLOSE. Stays active (unchanged price)
+//     until the next day's 17:30 reset.
+//   * LONG setup (every pattern candle must sit STRICTLY ABOVE the line):
+//       1. ANCHOR: a Heikin Ashi candle with open == high (no upper wick).
+//       2. CONFIRM: ANY later HA candle (any gap; other candles in between
+//          are simply ignored) with open == low (no lower wick). Sets the
+//          breakout trigger at THIS candle's HA high.
+//       3. ENTRY: real BTC price breaks ABOVE the trigger -> go long.
+//   * SHORT setup: exact mirror, strictly BELOW the line —
+//       1. ANCHOR: HA open == low.
+//       2. CONFIRM: any later HA open == high. Trigger = that candle's HA low.
+//       3. ENTRY: real price breaks BELOW the trigger -> go short.
+//   * STOP LOSS: NOT a pattern-based level — exit the instant a REAL candle
+//     CLOSES back through the session line (below it for a long, above it
+//     for a short).
+//   * NO PROFIT TARGET. Only other exit: forced square-off at 05:25 PM IST
+//     (5 minutes before the line resets) — a trade can run up to ~23h55m.
+//   * TRADE CAP: at most ONE long entry and ONE short entry per session
+//     (17:30 -> next 17:25). Once a side has fired this session, that side
+//     stops hunting for the rest of the session; the other side is
+//     unaffected and can still fire once.
+//   * Only ONE position open at a time (standard single-net-position
+//     convention used by every other strategy in this project). Pattern
+//     hunting/arming for a side only runs while FLAT — this is a deliberate
+//     simplification (see note below) that also guarantees a resting
+//     opposite-side stop order can never sit live while a trade is open and
+//     silently reverse it.
+//
+// ASSUMPTIONS MADE (the spec was silent on these — flagged so they're easy
+// to revisit):
+//   * "Strictly above/below the line" is checked on EACH pattern candle (both
+//     anchor and confirm) individually, using that candle's HA low (long) /
+//     HA high (short) against the line — i.e. the WHOLE candle must sit on
+//     the correct side, not just its open. Candles in between that are ignored
+//     as "neutral" are not required to respect the line.
+//   * Once an anchor is seen, the FIRST matching confirm sets the trigger —
+//     there's no re-anchoring/widening (unlike dcv2's Donchian-touch logic).
+//     A later, fresh open==high candle while still hunting for the confirm
+//     is a no-op either way, since the anchor itself never feeds a price
+//     level — only the confirm candle's own high/low does.
+//   * The session-line SL only applies to an OPEN position; a still-pending
+//     (untriggered) setup is left alone even if a candle closes through the
+//     line before the trigger is hit — the spec's SL section reads as an
+//     exit rule for an open trade, not a pre-entry invalidation rule.
+//   * Pattern hunting/arming for a side is paused while ANY position (either
+//     side) is open, and resumes (from a fresh anchor) once flat again —
+//     the spec doesn't say whether a setup should keep forming in the
+//     background while the other side is in a trade; pausing avoids a stale
+//     pending trigger ever colliding with an open position.
+//   * Session-line value = the CLOSE of the first candle at/after 17:30 IST
+//     (per the spec: "based on the close/price at that time").
+//
+// NOT YET BACKTESTED — this is a fresh port of a hand-written spec, not a
+// validated strategy. Treat accordingly before risking anything on it.
+// ============================================================================
+strategy("Session Breakline — HA open==extreme reversal (05:30 PM IST)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0,
+     max_lines_count      = 20)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpSession = "Session (IST)"
+dayTZ    = input.string("Asia/Kolkata", "Timezone", group=grpSession)
+sessHr   = input.int(17, "Session Line Hour",   minval=0, maxval=23, group=grpSession)
+sessMin  = input.int(30, "Session Line Minute", minval=0, maxval=59, group=grpSession)
+sqOffHr  = input.int(17, "Square-off Hour",   minval=0, maxval=23, group=grpSession)
+sqOffMin = input.int(25, "Square-off Minute", minval=0, maxval=59, group=grpSession)
+
+grpVis = "Visuals"
+showLine = input.bool(true, "Draw session line", group=grpVis)
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (matches the Python ports in this repo exactly).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// Tolerant equality for HA open==extreme checks (same convention as dcv2).
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+
+// ============================================================
+// Time windows: session-line reset at sessHr:sessMin, square-off 5 minutes
+// prior EVERY day (sqOffHr:sqOffMin) — same recurring-daily convention as
+// dcv2_strategy.pine's settlement gap.
+// ============================================================
+sessMins = sessHr * 60 + sessMin
+sqMins   = sqOffHr * 60 + sqOffMin
+nowMins  = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+
+sessionStart = not na(nowMins[1]) and nowMins >= sessMins and nowMins[1] < sessMins
+squareOff    = not na(nowMins[1]) and nowMins >= sqMins   and nowMins[1] < sqMins
+
+// ============================================================
+// Session line: reset fresh each day at sessionStart, held constant until
+// the next reset. Drawn as an actual line object (deleted + recreated each
+// session, so at most one is ever alive) plus a plotted step series so the
+// level is visible on every bar even before line objects render.
+// ============================================================
+var float sessLine     = na
+var line  sessLineDraw = na
+
+if sessionStart
+    sessLine := close
+    if showLine
+        if not na(sessLineDraw)
+            line.delete(sessLineDraw)
+        sessLineDraw := line.new(x1=bar_index, y1=sessLine, x2=bar_index + 1, y2=sessLine,
+             xloc=xloc.bar_index, extend=extend.right,
+             color=color.new(color.yellow, 0), width=1, style=line.style_dashed)
+
+plot(sessLine, "Session Line (step)", color=color.new(color.yellow, 60), style=plot.style_stepline, linewidth=1)
+
+// ============================================================
+// State — anchor -> confirm -> pending-trigger hand-off per side, plus the
+// once-per-session trade cap.
+// ============================================================
+var bool  longArmed  = false   // seen a valid LONG anchor, hunting for confirm
+var bool  shortArmed = false
+var float pendingLongTrigger    = na
+var float pendingShortTrigger   = na
+var bool  longTakenThisSession  = false
+var bool  shortTakenThisSession = false
+
+// ----- 0. Session reset: only touches HUNTING state, never an open position
+//          (square-off at sqMins always closes any open trade 5 minutes
+//          earlier, so there should never be one here — guarded anyway).
+//          Explicitly cancels any still-resting stop order so it can't fill
+//          against next session's fresh state. -----
+if sessionStart and strategy.position_size == 0
+    if not na(pendingLongTrigger)
+        strategy.cancel("Long")
+    if not na(pendingShortTrigger)
+        strategy.cancel("Short")
+    longArmed := false
+    shortArmed := false
+    pendingLongTrigger := na
+    pendingShortTrigger := na
+    longTakenThisSession := false
+    shortTakenThisSession := false
+
+// ----- 1. Exits -----
+// SL: a REAL candle CLOSING through the session line (open position only).
+if strategy.position_size > 0 and not na(sessLine) and close < sessLine
+    strategy.close("Long", comment="SL: closed below session line")
+if strategy.position_size < 0 and not na(sessLine) and close > sessLine
+    strategy.close("Short", comment="SL: closed above session line")
+
+// Time exit: daily square-off, no profit target at all.
+if strategy.position_size != 0 and squareOff
+    strategy.close_all(comment="Time exit 17:25")
+
+// ----- 2. Entry: real-price breakout of a PRIOR-armed pending trigger (set
+//          on an earlier bar) — runs BEFORE pattern hunting below, so a
+//          confirm that arms a trigger THIS bar can only fire starting the
+//          NEXT bar (matches "wait for real price to break" and dcv2's own
+//          PRIOR-armed convention). if/else-if between Long and Short so at
+//          most one side is ever acted on per bar. -----
+flatNow = strategy.position_size == 0
+buyFired  = false
+sellFired = false
+
+if flatNow and not na(pendingLongTrigger)
+    if high >= pendingLongTrigger
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)
+        longTakenThisSession := true
+        buyFired := true
+        pendingLongTrigger := na
+    else
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)   // resting order
+else if flatNow and not na(pendingShortTrigger)
+    if low <= pendingShortTrigger
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)
+        shortTakenThisSession := true
+        sellFired := true
+        pendingShortTrigger := na
+    else
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)   // resting order
+
+// ----- 3. Pattern hunting — each side capped at one fire per session, and
+//          only progresses while FLAT. Recomputed (not reusing flatNow from
+//          section 2) and explicitly excludes a fill THIS bar, since Pine's
+//          strategy.position_size update timing within the same bar isn't
+//          relied upon here. -----
+flatForHunt = strategy.position_size == 0 and not buyFired and not sellFired
+
+if flatForHunt and not na(sessLine) and not longTakenThisSession and na(pendingLongTrigger)
+    if not longArmed
+        if eq(haOpen, haHigh) and haLow > sessLine
+            longArmed := true
+    else
+        if eq(haOpen, haLow) and haLow > sessLine
+            pendingLongTrigger := haHigh
+            longArmed := false
+
+if flatForHunt and not na(sessLine) and not shortTakenThisSession and na(pendingShortTrigger)
+    if not shortArmed
+        if eq(haOpen, haLow) and haHigh < sessLine
+            shortArmed := true
+    else
+        if eq(haOpen, haHigh) and haHigh < sessLine
+            pendingShortTrigger := haLow
+            shortArmed := false
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(longArmed  and not longArmed[1],  "Long anchor seen",  shape.circle, location.belowbar, color.new(color.lime, 0), size=size.tiny)
+plotshape(shortArmed and not shortArmed[1], "Short anchor seen", shape.circle, location.abovebar, color.new(color.red, 0),  size=size.tiny)
+
+armedLong  = not na(pendingLongTrigger)  and flatNow
+armedShort = not na(pendingShortTrigger) and flatNow
+plot(armedLong  ? pendingLongTrigger  : na, "Pending Long Trigger",  color=color.new(color.aqua, 0),    style=plot.style_circles, linewidth=2)
+plot(armedShort ? pendingShortTrigger : na, "Pending Short Trigger", color=color.new(color.fuchsia, 0), style=plot.style_circles, linewidth=2)
+
+plotshape(buyFired,  title="BUY SIGNAL",  style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellFired, title="SELL SIGNAL", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.small, text="SELL")
+
+bgcolor(squareOff ? color.new(color.gray, 85) : na, title="Square-off (17:25)")
+
+inPos = strategy.position_size != 0
+plot(inPos ? sessLine : na, "Active SL (session line)", color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)

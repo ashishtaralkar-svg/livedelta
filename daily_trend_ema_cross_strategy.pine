@@ -1,0 +1,290 @@
+//@version=5
+// ============================================================================
+// DAILY TREND + EMA/MA CROSS + HA SETUP — layered on the pasted "MTF Daily
+// Candle Reversal" trend logic.
+//
+// Chart basis: trades BTC directionally as a proxy (same convention as
+// dcv2_strategy.pine / session_breakline_strategy.pine). Live execution (if
+// ported to the Python engine) would SELL a CALL (CE) at ~1400 target
+// premium on a bearish setup break, SELL a PUT (PE) at ~1400 on a bullish
+// setup break, 70%-decay target — this script itself only trades the BTC
+// proxy and models the SL only (the 70% target is an option-premium concept
+// with no BTC-price equivalent, so it's not modeled here, same convention as
+// dcv2_strategy.pine which also has no TP in the Pine layer).
+//
+// RULES:
+//   * DAILY TREND (your pasted logic, ported as-is except for one fix noted
+//     below): on each new daily bar, using the JUST-COMPLETED daily candle --
+//       - BEAR TRIGGER: that candle is RED, the day before it was GREEN, and
+//         its close is below the day-before's OPEN. -> trend = DOWN,
+//         key_level = the triggering red candle's own OPEN.
+//       - While trend = DOWN: a later day's close rising back above
+//         key_level flips trend = UP (this is the ONLY way trend becomes UP
+//         in the pasted logic -- there is no symmetric "bull trigger" of its
+//         own; UP is purely "reclaimed the down-trigger's pivot." Ported
+//         faithfully, not redesigned -- flag if you actually wanted a
+//         symmetric bull trigger too.)
+//     FIX: the original used lookahead=barmerge.lookahead_on, which lets
+//     intraday bars see today's still-forming daily candle early
+//     (repainting). Changed to lookahead_off -- the [1] indexing already in
+//     your state machine is exactly the correct, non-repainting way to read
+//     "the daily candle that JUST closed" and needs no other change.
+//   * EMA/MA CROSS GATE: while trend = DOWN, wait for EMA(50) to CROSS UNDER
+//     MA/SMA(50) (a discrete event, not just "is below") -- this ARMS the
+//     bearish setup hunt. Mirror for trend = UP: EMA(50) CROSS OVER MA(50)
+//     arms the bullish hunt. Each fresh cross while still in the same trend
+//     re-arms the hunt (e.g. EMA/MA can cross more than once inside one
+//     trend leg). A trend flip clears any armed/in-progress hunt.
+//   * SETUP (Heikin Ashi, once armed): a GREEN HA candle immediately
+//     followed by a RED HA candle (bearish setup). Mirror for bullish: RED
+//     then GREEN. Setup range = the HA high/low spanning those two candles.
+//     Consumes the arm-state once found; only one setup hunted at a time.
+//   * ENTRY: real BTC price breaking BELOW the setup low (bearish) / ABOVE
+//     the setup high (bullish) -- checked on bars AFTER the setup completed
+//     (a setup can't trigger on its own completion bar).
+//   * SL: the OPPOSITE extreme of the setup range (setup HIGH for a short,
+//     setup LOW for a long) -- fixed for the life of the trade, real price
+//     touching it exits.
+//   * NO in-Pine profit target (see chart-basis note above).
+//   * Only ONE position at a time; hunting for a side is cleared entirely on
+//     any trend flip so a stale pending trigger from the old direction can
+//     never survive into the new one.
+//
+// ADDED BEYOND THE LITERAL SPEC (flagged, same as session_breakline's
+// approach):
+//   * A 17:25-17:30 IST settlement gap that blocks NEW entries (mirrors
+//     dcv2_strategy.pine's own settlement gap) -- daily BTC options need a
+//     square-off/rollover boundary somewhere if this is ever live-executed.
+//     It does NOT force-close an open position (same as dcv2_strategy.pine).
+//
+// NOT YET BACKTESTED -- a fresh port, not a validated strategy.
+// ============================================================================
+strategy("Daily Trend + EMA/MA Cross + HA Setup",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpTrend = "Daily Trend"
+htf        = input.timeframe("D", "Trend Timeframe", group=grpTrend)
+use_longs  = input.bool(true,  "Enable Long (bullish) setups",  group=grpTrend)
+use_shorts = input.bool(true,  "Enable Short (bearish) setups", group=grpTrend)
+
+grpMA = "EMA/MA Cross"
+emaLen = input.int(50, "EMA Length", minval=1, group=grpMA)
+maLen  = input.int(50, "MA (SMA) Length", minval=1, group=grpMA)
+
+grpLive = "Live-execution reference (display only, not modeled here)"
+targetPremium = input.float(1400, "Target premium (CE/PE)", group=grpLive)
+tpPct         = input.float(70,   "Target %% decay",          group=grpLive)
+
+grpSession = "Settlement Gap (IST) -- blocks new entries only"
+dayTZ    = input.string("Asia/Kolkata", "Timezone", group=grpSession)
+gapStartHr  = input.int(17, "Gap Start Hour",   minval=0, maxval=23, group=grpSession)
+gapStartMin = input.int(25, "Gap Start Minute", minval=0, maxval=59, group=grpSession)
+gapEndHr    = input.int(17, "Gap End Hour",     minval=0, maxval=23, group=grpSession)
+gapEndMin   = input.int(30, "Gap End Minute",   minval=0, maxval=59, group=grpSession)
+
+// ============================================================
+// DAILY TREND STATE MACHINE (ported from the pasted script; lookahead fixed
+// to OFF -- see header note).
+// ============================================================
+calc_daily_signals() =>
+    d_open        = open
+    d_close       = close
+    d_open_prev   = open[1]
+    d_close_prev  = close[1]
+    is_red        = d_close < d_open
+    is_prev_green = d_close_prev > d_open_prev
+    bear_trigger  = is_red and is_prev_green and (d_close < d_open_prev)
+    [bear_trigger, d_open]
+
+[daily_bear_trigger, daily_open] = request.security(syminfo.tickerid, htf, calc_daily_signals(),
+     lookahead=barmerge.lookahead_off)
+daily_close = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+
+is_new_daily_bar = ta.change(time(htf)) != 0
+
+var int   trend       = 0    // 1 = up, -1 = down, 0 = undefined
+var float key_level   = na   // pivot: the triggering red candle's own open
+
+trendChanged = false
+if is_new_daily_bar
+    prevTrend = trend
+    if daily_bear_trigger[1]
+        trend := -1
+        key_level := daily_open[1]
+    else if trend == -1 and not na(key_level) and daily_close[1] > key_level
+        trend := 1
+        key_level := na
+    trendChanged := trend != prevTrend
+
+// ============================================================
+// Synthetic Heikin Ashi OHLC (matches the Python ports in this repo).
+// ============================================================
+haData() =>
+    [open, high, low, close]
+
+[haOpen, haHigh, haLow, haClose] = request.security(ticker.heikinashi(syminfo.tickerid),
+     timeframe.period, haData(), lookahead=barmerge.lookahead_off)
+
+plotcandle(haOpen, haHigh, haLow, haClose, title="Heikin Ashi",
+     color = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0),
+     wickcolor = color.new(color.gray, 0),
+     bordercolor = haClose >= haOpen ? color.new(color.green, 0) : color.new(color.red, 0))
+
+haGreen = haClose > haOpen
+haRed   = haClose < haOpen
+
+// ============================================================
+// EMA(50) / MA(50) on the intraday HA close, plus crossunder/crossover
+// EVENTS (not just relationship).
+// ============================================================
+ema50 = ta.ema(haClose, emaLen)
+ma50  = ta.sma(haClose, maLen)
+plot(ema50, "EMA 50", color=color.new(color.aqua, 0),   linewidth=2)
+plot(ma50,  "MA 50",  color=color.new(color.orange, 0), linewidth=2)
+
+bearCross = ta.crossunder(ema50, ma50)
+bullCross = ta.crossover(ema50, ma50)
+
+// ============================================================
+// Time window: settlement gap blocks NEW entries only (never closes a
+// position), same convention as dcv2_strategy.pine.
+// ============================================================
+gapStartMins = gapStartHr * 60 + gapStartMin
+gapEndMins   = gapEndHr * 60 + gapEndMin
+nowMins      = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+inGap        = gapStartMins <= nowMins and nowMins < gapEndMins
+
+// ============================================================
+// State — EMA/MA-cross arm -> HA green/red setup -> pending trigger.
+// ============================================================
+var bool  huntingBear = false   // armed after a bearish EMA/MA cross, trend down
+var bool  huntingBull = false
+var bool  prevHaGreenBear = false   // "was the last scanned candle green?" (bear hunt)
+var bool  prevHaRedBull   = false   // "...red?" (bull hunt)
+var float setupHiBear = na
+var float setupLoBear = na
+var float setupHiBull = na
+var float setupLoBull = na
+var float pendingShortTrigger = na   // armed, not-yet-filled setup's trigger/SL
+var float pendingShortSL      = na
+var float pendingLongTrigger  = na
+var float pendingLongSL       = na
+var float activeShortSL       = na   // an OPEN position's own stop -- separate from
+var float activeLongSL        = na   // the above so a trend flip can never wipe it
+
+// ----- 0. Trend flip: clear only PENDING/unfired hunting state -- an OPEN
+//          position's own stop (activeShortSL/activeLongSL) is untouched, so
+//          a flip mid-trade can never leave a live position unprotected. -----
+if trendChanged
+    if not na(pendingShortTrigger)
+        strategy.cancel("Short")
+    if not na(pendingLongTrigger)
+        strategy.cancel("Long")
+    huntingBear := false
+    huntingBull := false
+    pendingShortTrigger := na
+    pendingShortSL := na
+    pendingLongTrigger := na
+    pendingLongSL := na
+
+// ----- 1. Exits: fixed setup-range SL only (no in-Pine target -- see header). ---
+if strategy.position_size < 0 and not na(activeShortSL) and high >= activeShortSL
+    strategy.close("Short", comment="SL: setup high")
+    activeShortSL := na
+if strategy.position_size > 0 and not na(activeLongSL) and low <= activeLongSL
+    strategy.close("Long", comment="SL: setup low")
+    activeLongSL := na
+
+// ----- 2. Entry: real-price breakout of a PRIOR-armed pending trigger --
+//          runs BEFORE setup hunting below, so a setup that completes THIS
+//          bar can only trigger starting the NEXT bar (same PRIOR-armed
+//          convention as dcv2_strategy.pine / session_breakline). Filling
+//          promotes the pending SL to the ACTIVE one. -----
+flatNow = strategy.position_size == 0
+sellFired = false
+buyFired  = false
+
+if flatNow and not inGap and use_shorts and not na(pendingShortTrigger)
+    if low <= pendingShortTrigger
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)
+        activeShortSL := pendingShortSL
+        sellFired := true
+        pendingShortTrigger := na
+        pendingShortSL := na
+    else
+        strategy.entry("Short", strategy.short, stop=pendingShortTrigger)   // resting order
+else if flatNow and not inGap and use_longs and not na(pendingLongTrigger)
+    if high >= pendingLongTrigger
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)
+        activeLongSL := pendingLongSL
+        buyFired := true
+        pendingLongTrigger := na
+        pendingLongSL := na
+    else
+        strategy.entry("Long", strategy.long, stop=pendingLongTrigger)   // resting order
+
+// ----- 3. EMA/MA cross arms the hunt (only in the matching trend). -----
+flatForHunt = strategy.position_size == 0 and not sellFired and not buyFired
+
+if flatForHunt and trend == -1 and bearCross and na(pendingShortTrigger)
+    huntingBear := true
+    prevHaGreenBear := false
+if flatForHunt and trend == 1 and bullCross and na(pendingLongTrigger)
+    huntingBull := true
+    prevHaRedBull := false
+
+// ----- 4. HA green->red / red->green setup scan, only while armed+flat. -----
+if flatForHunt and huntingBear and na(pendingShortTrigger)
+    if prevHaGreenBear and haRed
+        setupHiBear := math.max(haHigh, haHigh[1])
+        setupLoBear := math.min(haLow, haLow[1])
+        pendingShortTrigger := setupLoBear
+        pendingShortSL := setupHiBear
+        huntingBear := false
+    prevHaGreenBear := haGreen
+
+if flatForHunt and huntingBull and na(pendingLongTrigger)
+    if prevHaRedBull and haGreen
+        setupHiBull := math.max(haHigh, haHigh[1])
+        setupLoBull := math.min(haLow, haLow[1])
+        pendingLongTrigger := setupHiBull
+        pendingLongSL := setupLoBull
+        huntingBull := false
+    prevHaRedBull := haRed
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+bgcolor(trend == 1 ? color.new(color.green, 90) : trend == -1 ? color.new(color.red, 90) : na, title="Daily trend")
+plot(trend == -1 ? key_level : na, "Key pivot (down-trigger open)", color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(trend == 1  ? key_level : na, "Key pivot (reclaimed)",         color=color.green, style=plot.style_linebr, linewidth=1)
+
+armedShort = not na(pendingShortTrigger) and flatNow
+armedLong  = not na(pendingLongTrigger)  and flatNow
+plot(armedShort ? pendingShortTrigger : na, "Pending Short Trigger", color=color.new(color.fuchsia, 0), style=plot.style_circles, linewidth=2)
+plot(armedShort ? pendingShortSL      : na, "Pending Short SL",      color=color.new(color.maroon, 0),  style=plot.style_circles, linewidth=1)
+plot(armedLong  ? pendingLongTrigger  : na, "Pending Long Trigger",  color=color.new(color.aqua, 0),    style=plot.style_circles, linewidth=2)
+plot(armedLong  ? pendingLongSL       : na, "Pending Long SL",       color=color.new(color.teal, 0),    style=plot.style_circles, linewidth=1)
+
+plotshape(buyFired,  title="BUY (sell PE live)",  style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+plotshape(sellFired, title="SELL (sell CE live)", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0),   size=size.small, text="SELL")
+
+bgcolor(inGap ? color.new(color.gray, 85) : na, title="Settlement gap (17:25-17:30)")
+
+inPos = strategy.position_size != 0
+activeSL = strategy.position_size > 0 ? activeLongSL : strategy.position_size < 0 ? activeShortSL : na
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)

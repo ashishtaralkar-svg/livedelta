@@ -1,0 +1,159 @@
+//@version=5
+// ============================================================================
+// SUPERTREND FIXED-SL OPTION SELL — Supertrend(10,3) flip timing, frozen SL,
+// sell-only. Intended to run on the 5-minute BTC chart.
+//
+// Chart basis: trades BTC directionally as a PROXY for two INDEPENDENT
+// option legs (same convention as the other .pine files in this repo, but
+// with one extra wrinkle -- see the LIMITATION note below). Live execution
+// (if ported to the Python engine) would:
+//   * At 17:30 IST, snapshot the option chain ONCE and lock in the CALL
+//     (CE) and PUT (PE) whose premium is nearest --target-premium (~1000
+//     each) -- these are the ONLY two contracts traded for the rest of that
+//     session; no re-selection intraday even if premiums drift.
+//   * A bearish Supertrend flip -> SELL the locked-in CE (bearish signal ->
+//     sell CALL, same signal/direction convention as every other strategy
+//     in this repo).
+//   * A bullish Supertrend flip -> SELL the locked-in PE (mirror).
+//   * SL = the Supertrend LINE'S OWN VALUE on the flip bar, frozen at that
+//     moment -- Supertrend normally trails/updates every bar, but here it is
+//     read ONCE at the flip and never touched again for the life of that
+//     trade (a real BTC price move back through that frozen level is the
+//     only exit; there's no target modeled at all here, matching the "do
+//     only selling" instruction -- this is a pure premium-collection stop-
+//     and-hold, not a trailing-stop system).
+//   * There's no in-Pine profit target (an option-premium concept, no BTC
+//     equivalent -- same convention as the other 3 strategies here).
+//
+// RULES:
+//   * SUPERTREND(10,3) computed on the chart's own OHLC (real candles, NOT
+//     Heikin Ashi -- Supertrend is conventionally run on raw price).
+//   * FLIP (the only signal, checked on CLOSED 5-minute bars): the discrete
+//     bar where Supertrend's direction changes.
+//       - turns NEGATIVE (bearish, direction flips DOWN) -> SELL the CE,
+//         entering at THIS bar's close. SL = this bar's Supertrend value
+//         (which sits ABOVE price in a downtrend) -- frozen.
+//       - turns POSITIVE (bullish, direction flips UP) -> SELL the PE,
+//         entering at THIS bar's close. SL = this bar's Supertrend value
+//         (sits BELOW price in an uptrend) -- frozen.
+//   * SL is a REAL-price crossing of that frozen level -- NOT re-derived
+//     from Supertrend's own (still-updating) live value on later bars.
+//   * NO profit target. NO re-arming logic beyond "flat again" -- a fresh
+//     flip in the same direction later the same session re-enters using the
+//     SAME locked-in 17:30 contract (a second CE sale after the first one
+//     SL'd, for example).
+//   * Settlement gap (17:25-17:30 IST, ADDED beyond the literal spec, same
+//     convention as the other 3 strategies here): blocks NEW entries only,
+//     never closes an open position -- daily BTC options need a boundary
+//     somewhere if this is ever live-executed.
+//
+// LIMITATION (flagged, not silently glossed over): a CE-sell and a PE-sell
+// are genuinely INDEPENDENT contracts live -- both could be open at once
+// (e.g. a bearish flip sells the CE, then later the SAME day a bullish flip
+// wants to ALSO sell the PE while the CE leg is still running its own SL).
+// This Pine chart can only simulate ONE net position on ONE instrument
+// (BTC), so it treats CE/PE as mutually exclusive (an entry only fires
+// while flat) -- purely a charting/visualization limitation. The Python
+// port can and should track the two legs independently with real premium
+// data, which is where the honest P&L for this strategy actually belongs.
+//
+// NOT YET BACKTESTED -- a fresh port, not a validated strategy.
+// ============================================================================
+strategy("Supertrend Fixed-SL Option Sell",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpST = "Supertrend"
+atrPeriod = input.int(10, "ATR Period", minval=1, group=grpST)
+factor    = input.float(3.0, "Multiplier", minval=0.1, group=grpST)
+
+grpLive = "Live-execution reference (display only, not modeled here)"
+targetPremium = input.float(1000, "Target premium (CE/PE, locked at 17:30 IST)", group=grpLive)
+
+grpSession = "Settlement Gap (IST) -- blocks new entries only"
+dayTZ       = input.string("Asia/Kolkata", "Timezone", group=grpSession)
+gapStartHr  = input.int(17, "Gap Start Hour",   minval=0, maxval=23, group=grpSession)
+gapStartMin = input.int(25, "Gap Start Minute", minval=0, maxval=59, group=grpSession)
+gapEndHr    = input.int(17, "Gap End Hour",     minval=0, maxval=23, group=grpSession)
+gapEndMin   = input.int(30, "Gap End Minute",   minval=0, maxval=59, group=grpSession)
+sessHr      = input.int(17, "17:30 marker Hour",   minval=0, maxval=23, group=grpSession)
+sessMin     = input.int(30, "17:30 marker Minute", minval=0, maxval=59, group=grpSession)
+
+// ============================================================
+// Supertrend(10,3) on real (non-HA) OHLC.
+// ============================================================
+[st, dir] = ta.supertrend(factor, atrPeriod)
+plot(st, "Supertrend", color = dir < 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+bearFlip = dir > 0 and dir[1] < 0   // "turns negative" -- SELL the CE
+bullFlip = dir < 0 and dir[1] > 0   // "turns positive" -- SELL the PE
+
+// ============================================================
+// Time windows: settlement gap blocks NEW entries only. 17:30 marker is
+// purely visual (contract-lock reference -- no real option data on this
+// BTC chart, see header note).
+// ============================================================
+gapStartMins = gapStartHr * 60 + gapStartMin
+gapEndMins   = gapEndHr * 60 + gapEndMin
+sessMins     = sessHr * 60 + sessMin
+nowMins      = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+inGap        = gapStartMins <= nowMins and nowMins < gapEndMins
+sessionStart = not na(nowMins[1]) and nowMins >= sessMins and nowMins[1] < sessMins
+
+// ============================================================
+// State — frozen SL per leg, kept separate so an entry on one side can
+// never disturb the other's stop.
+// ============================================================
+var float activeShortSL = na   // CE-sell leg's frozen Supertrend-at-flip level
+var float activeLongSL  = na   // PE-sell leg's frozen Supertrend-at-flip level
+
+// ----- 1. Exits: real price crossing the FROZEN level only -- never
+//          re-derived from Supertrend's own (still-updating) current value. -----
+if strategy.position_size < 0 and not na(activeShortSL) and high >= activeShortSL
+    strategy.close("Short", comment="SL: frozen supertrend @ flip")
+    activeShortSL := na
+if strategy.position_size > 0 and not na(activeLongSL) and low <= activeLongSL
+    strategy.close("Long", comment="SL: frozen supertrend @ flip")
+    activeLongSL := na
+
+// ----- 2. Entry: the flip bar itself IS the signal -- no separate
+//          breakout/setup stage like the other strategies here. Only while
+//          flat (see the LIMITATION note on why). -----
+flatNow = strategy.position_size == 0
+sellFired = false
+buyFired  = false
+
+if flatNow and not inGap and bearFlip
+    strategy.entry("Short", strategy.short)
+    activeShortSL := st
+    sellFired := true
+else if flatNow and not inGap and bullFlip
+    strategy.entry("Long", strategy.long)
+    activeLongSL := st
+    buyFired := true
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+bgcolor(inGap ? color.new(color.gray, 85) : na, title="Settlement gap (17:25-17:30)")
+bgcolor(sessionStart ? color.new(color.yellow, 70) : na, title="17:30 contract-lock marker")
+
+plotshape(sellFired, title="SELL CE (bearish flip)", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small, text="SELL CE")
+plotshape(buyFired,  title="SELL PE (bullish flip)", style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="SELL PE")
+
+inPos = strategy.position_size != 0
+activeSL = strategy.position_size < 0 ? activeShortSL : strategy.position_size > 0 ? activeLongSL : na
+plot(inPos ? activeSL : na, "Active (frozen) SL", color=color.orange, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
