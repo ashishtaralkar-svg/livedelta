@@ -1,19 +1,25 @@
-"""Backtest: EMA(21) Breakdown -- option-SELL execution of
+"""Backtest: EMA(21) Breakdown -- option-sell OR option-buy execution of
 src/deltabot/strategy/ema21_breakdown.py (Python port of the user-supplied
 "21 EMA Breakdown Strategy (Strict Single Trade)" Pine script).
 
-Ported mirrored on both sides now (see the strategy module) -- SELL
-(bearish) signals sell a CALL (CE), BUY (bullish) signals sell a PUT (PE),
---ce-only/--pe-only to run either side alone. Buys the leg back on the
-strategy's own SL/TARGET exit, an optional --tp-decay-pct premium-decay TP,
-or the daily --square-off-hour/minute (default 17:25 IST, matching every
-other backtest in this repo) -- ADDED beyond the source script, which has no
-time exit at all. That square-off matters for correctness, not just realism:
-each option leg's premium history is only fetched for a ~3-day window around
-entry, so a trade that never hits SL/TP within that window would otherwise
-sit "open" against stale, frozen premium data for however long the backtest
-runs -- confirmed this actually happened in a 3-month test before the
-square-off was added. Intrinsic-value flooring is ON by default.
+Ported mirrored on both sides now (see the strategy module) --ce-only/
+--pe-only to run either side alone. --side sell (default): SELL (bearish)
+signals sell a CALL (CE), BUY (bullish) signals sell a PUT (PE), profit when
+the premium DECAYS (--tp-decay-pct, e.g. 70 -> buy back at 30% of entry).
+--side buy: the same BTC signals instead BUY the directional option --
+bearish -> BUY a PUT, bullish -> BUY a CALL (mirrors dcv2's --side buy
+convention) -- profit when the premium RISES (--tp-gain-pct, e.g. 200 ->
+sell once the premium triples). Either side closes on the strategy's own
+SL/TARGET exit, its own TP, or the daily --square-off-hour/minute (default
+17:25 IST, matching every other backtest in this repo) -- ADDED beyond the
+source script, which has no time exit at all. That square-off matters for
+correctness, not just realism: each option leg's premium history is only
+fetched for a ~3-day window around entry, so a trade that never hits SL/TP
+within that window would otherwise sit "open" against stale, frozen premium
+data for however long the backtest runs -- confirmed this actually happened
+in a 3-month test before the square-off was added. Intrinsic-value flooring
+is ON by default. --entry-start-hour/--entry-end-hour restrict new entries
+to a daily IST window (pattern detection still runs at all hours).
 
 Run:  python scripts/backtest_ema21_breakdown.py --days 7
 """
@@ -53,6 +59,8 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
         trade_ce=not args.pe_only, trade_pe=not args.ce_only,
         trend_filter=args.trend_filter, ema200_filter=args.ema200_filter,
         ema50_len=args.ema50_len, ema200_len=args.ema200_len,
+        ema_sl=args.ema_sl,
+        entry_start_hour=args.entry_start_hour, entry_end_hour=args.entry_end_hour,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
     interval = settings.option_strike_interval
@@ -64,6 +72,8 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
     tp_decay = args.tp_decay_pct / 100.0
+    tp_gain = args.tp_gain_pct / 100.0
+    buying = args.side == "buy"
 
     cache: dict = {}
     trades: list[dict] = []
@@ -71,8 +81,14 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
 
     def open_leg(client, ts: int, btc_px: float, is_buy: bool) -> bool:
         nonlocal pos
-        # bearish signal (sell CE) -> CALL; bullish signal (sell PE) -> PUT.
-        otype = OptionType.PUT if is_buy else OptionType.CALL
+        # --side sell (default): bearish signal (sell CE) -> CALL; bullish
+        # signal (sell PE) -> PUT. --side buy (mirrors dcv2): bearish -> BUY
+        # a PUT, bullish -> BUY a CALL -- the directional bet the signal
+        # itself implies.
+        if buying:
+            otype = OptionType.CALL if is_buy else OptionType.PUT
+        else:
+            otype = OptionType.PUT if is_buy else OptionType.CALL
         expiry = op.select_expiry_date(ts, cutoff)
         resolved = op.resolve_by_premium(
             client, underlying, otype, btc_px, expiry, interval,
@@ -87,11 +103,16 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             return False
         if floor:
             entry_prem = max(entry_prem, op.intrinsic_value(sym, btc_px))
-        # tp_price: buy back when the SOLD premium decays this %% (e.g. 70 ->
-        # 30% of entry). Independent of the strategy's own BTC-price target
-        # (which --target-rr 0 disables) -- see the module CLI help.
-        tp_price = entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None
-        pos = {"is_buy": is_buy, "sym": sym, "candles": ocandles, "entry_time": ts,
+        # tp_price: sell mode -- buy back once the SOLD premium decays this
+        # %% (e.g. 70 -> 30% of entry). buy mode -- sell once the BOUGHT
+        # premium rises this %% (e.g. 200 -> 3x entry). Independent of the
+        # strategy's own BTC-price target (--target-rr 0 disables it).
+        if buying:
+            tp_price = entry_prem * (1.0 + tp_gain) if tp_gain > 0 else None
+        else:
+            tp_price = entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None
+        pos = {"is_buy": is_buy, "sym": sym, "is_call": otype == OptionType.CALL,
+               "candles": ocandles, "entry_time": ts,
                "entry_btc": btc_px, "entry_prem": entry_prem, "tp_price": tp_price}
         return True
 
@@ -104,14 +125,23 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
         assert pos is not None
         if floor:
             exit_prem = max(exit_prem, op.intrinsic_value(pos["sym"], exit_btc))
-        entry_fill = pos["entry_prem"] * (1 - es)
-        exit_fill = exit_prem * (1 + xs)
-        gross = (entry_fill - exit_fill) * lots * lot_size
+        if buying:
+            entry_fill = pos["entry_prem"] * (1 + es)   # buying: pay slightly more
+            exit_fill = exit_prem * (1 - xs)             # selling to close: receive slightly less
+            gross = (exit_fill - entry_fill) * lots * lot_size   # profit when premium RISES
+        else:
+            entry_fill = pos["entry_prem"] * (1 - es)   # selling: receive slightly less
+            exit_fill = exit_prem * (1 + xs)             # buying back: pay slightly more
+            gross = (entry_fill - exit_fill) * lots * lot_size   # profit when premium DECAYS
         fee = (op.side_fee(pos["entry_btc"], entry_fill, lots, lot_size)
                + op.side_fee(exit_btc, exit_fill, lots, lot_size))
         trades.append({
             "entry_time": pos["entry_time"], "exit_time": exit_time, "contract": pos["sym"],
             "signal": "BUY" if pos["is_buy"] else "SELL",
+            # unambiguous action label -- what we actually DID to this
+            # contract, independent of the "signal" (BTC bull/bear trigger)
+            # column above, e.g. "BUY CE" (buy mode) or "SELL CE" (sell mode).
+            "action": f"{'BUY' if buying else 'SELL'} {'CE' if pos['is_call'] else 'PE'}",
             "btc_entry": pos["entry_btc"], "btc_exit": exit_btc,
             "opt_in": entry_fill, "opt_out": exit_fill, "reason": reason,
             "gross": gross, "fee": fee, "net": gross - fee,
@@ -133,16 +163,27 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                 exit_price = dec.long_exit_price if dec.long_exit else dec.short_exit_price
                 close(dec.exit_reason, buyback_prem(c.start_time, exit_price), c.start_time, exit_price)
 
-            # 70%-decay TP on the SOLD option premium (only if --tp-decay-pct
-            # > 0; independent of/in addition to the strategy's own SL, which
-            # always stays live off the BTC-price anchor high/low).
+            # TP on the option premium (only if a tp_price was set --
+            # sell mode: --tp-decay-pct > 0; buy mode: --tp-gain-pct > 0).
+            # Independent of/in addition to the strategy's own SL, which
+            # always stays live off the BTC-price anchor high/low (or the
+            # EMA, with --ema-sl).
             if pos is not None and pos["tp_price"] is not None:
-                can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
-                if can_decay:
+                if buying:
                     t_tp = op.premium_at(pos["candles"], c.start_time, step)
-                    if t_tp is not None and t_tp <= pos["tp_price"]:
-                        close("TP", pos["tp_price"], c.start_time, c.close)
-                        strategy.force_flat()
+                    if t_tp is not None:
+                        if floor:
+                            t_tp = max(t_tp, op.intrinsic_value(pos["sym"], c.close))
+                        if t_tp >= pos["tp_price"]:
+                            close("TP", pos["tp_price"], c.start_time, c.close)
+                            strategy.force_flat()
+                else:
+                    can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
+                    if can_decay:
+                        t_tp = op.premium_at(pos["candles"], c.start_time, step)
+                        if t_tp is not None and t_tp <= pos["tp_price"]:
+                            close("TP", pos["tp_price"], c.start_time, c.close)
+                            strategy.force_flat()
 
             # Daily square-off (default 17:25 IST, matching every other
             # backtest in this repo): force-closes any still-open position.
@@ -170,21 +211,27 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
 
 
 def report(trades: list[dict], args) -> None:
-    tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no premium TP"
+    if args.side == "buy":
+        tp_txt = f"{args.tp_gain_pct:.0f}%-gain TP" if args.tp_gain_pct > 0 else "no premium TP"
+    else:
+        tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no premium TP"
     rr_txt = f"{args.target_rr:.1f}R BTC-price target" if args.target_rr > 0 else "no BTC-price target"
     side_txt = " [CE ONLY]" if args.ce_only else " [PE ONLY]" if args.pe_only else ""
+    window_txt = f", entries {args.entry_start_hour:02d}-{args.entry_end_hour:02d}h IST" \
+        if (args.entry_start_hour, args.entry_end_hour) != (0, 24) else ""
     print(f"\n{'=' * 112}")
-    print(f"EMA(21) Breakdown [OPTION SELL]{side_txt} -- {args.days}d, {args.resolution}, "
-          f"premium ~{args.target_premium:.0f}, {args.lots} lots, {rr_txt}, {tp_txt}, "
+    print(f"EMA(21) Breakdown [OPTION {'BUY' if args.side == 'buy' else 'SELL'}]{side_txt} -- {args.days}d, {args.resolution}, "
+          f"premium ~{args.target_premium:.0f}, {args.lots} lots, {rr_txt}, {tp_txt}{window_txt}, "
           f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 112}")
     if not trades:
         print("No trades.")
         return
-    print(f"{'entry (IST)':<18}{'sig':<5}{'contract':<22}{'btc in':>9}{'btc out':>9}"
-          f"{'opt in':>8}{'opt out':>8} {'reason':<12}{'net $':>10}")
+    in_hdr, out_hdr = ("bought", "sold") if args.side == "buy" else ("sold", "bought")
+    print(f"{'entry (IST)':<18}{'action':<8}{'contract':<22}{'btc in':>9}{'btc out':>9}"
+          f"{in_hdr:>8}{out_hdr:>8} {'reason':<12}{'net $':>10}")
     for t in trades:
-        print(f"{_ist(t['entry_time']):<18}{t['signal']:<5}{t['contract']:<22}"
+        print(f"{_ist(t['entry_time']):<18}{t['action']:<8}{t['contract']:<22}"
               f"{t['btc_entry']:>9.1f}{t['btc_exit']:>9.1f}{t['opt_in']:>8.1f}{t['opt_out']:>8.1f} "
               f"{t['reason']:<12}{t['net']:>10.2f}")
     closed = [t for t in trades if t["reason"] != "OPEN_AT_END"]
@@ -207,11 +254,12 @@ def export(trades: list[dict], args, path: str) -> None:
     rows, cum = [], 0.0
     for i, t in enumerate(trades, 1):
         cum += t["net"]
+        in_col, out_col = ("opt_bought", "opt_sold") if args.side == "buy" else ("opt_sold", "opt_bought_back")
         rows.append({
             "#": i, "entry_IST": _ist(t["entry_time"]), "exit_IST": _ist(t["exit_time"]),
-            "signal": t["signal"],
+            "signal": t["signal"], "action": t["action"],
             "contract": t["contract"], "btc_entry": round(t["btc_entry"], 1), "btc_exit": round(t["btc_exit"], 1),
-            "opt_sold": round(t["opt_in"], 1), "opt_bought_back": round(t["opt_out"], 1),
+            in_col: round(t["opt_in"], 1), out_col: round(t["opt_out"], 1),
             "exit_reason": t["reason"], "gross_usd": round(t["gross"], 2),
             "fee_usd": round(t["fee"], 2), "net_usd": round(t["net"], 2),
             "cumulative_net_usd": round(cum, 2),
@@ -221,7 +269,9 @@ def export(trades: list[dict], args, path: str) -> None:
     wins = [t for t in closed if t["net"] > 0]
     srows = [
         ("days", args.days), ("ema_len", args.ema_len), ("max_wait", args.max_wait),
-        ("target_rr", args.target_rr), ("tp_decay_pct", args.tp_decay_pct),
+        ("side", args.side),
+        ("target_rr", args.target_rr), ("tp_decay_pct", args.tp_decay_pct), ("tp_gain_pct", args.tp_gain_pct),
+        ("entry_start_hour", args.entry_start_hour), ("entry_end_hour", args.entry_end_hour),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("legs_closed", len(closed)),
         ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
@@ -258,14 +308,34 @@ def main() -> None:
                         "Independent of --trend-filter -- combine both if you want both to agree.")
     p.add_argument("--ema50-len", type=int, default=50)
     p.add_argument("--ema200-len", type=int, default=200)
+    p.add_argument("--ema-sl", action="store_true",
+                   help="replace the fixed anchor-price SL with a dynamic one: exit the moment a "
+                        "candle CLOSES back through EMA(--ema-len) -- long exits on close < EMA, "
+                        "short exits on close > EMA (mirror), exit price = that candle's close. "
+                        "Pair with --target-rr 0 and --tp-decay-pct/--tp-gain-pct so profit-taking "
+                        "happens off the option premium while the stop tracks BTC trend structure.")
+    p.add_argument("--entry-start-hour", type=int, default=0,
+                   help="gate the trade itself (pattern still forms/consumes regardless) to IST "
+                        "hour >= this. 0 (default) = no restriction.")
+    p.add_argument("--entry-end-hour", type=int, default=24,
+                   help="gate the trade itself to IST hour < this (e.g. --entry-start-hour 14 "
+                        "--entry-end-hour 17 = entries only 14:00-16:59 IST). 24 (default) = no restriction.")
+    p.add_argument("--side", choices=["sell", "buy"], default="sell",
+                   help="sell (default): sell the option, profit off premium decay (--tp-decay-pct). "
+                        "buy: BUY the directional option instead (bearish->PUT, bullish->CALL, "
+                        "mirrors dcv2's --side buy), profit off premium rising (--tp-gain-pct).")
     p.add_argument("--target-rr", type=float, default=2.0,
                    help="strategy's own BTC-price target, multiple of risk (entry vs SL). "
-                        "0 disables it -- use with --tp-decay-pct for a premium-decay TP instead.")
+                        "0 disables it -- use with --tp-decay-pct/--tp-gain-pct for a premium-based "
+                        "TP instead.")
     p.add_argument("--tp-decay-pct", type=float, default=0.0,
-                   help="book profit when the SOLD premium decays this %% (e.g. 70 -> buy back at "
-                        "30%% of entry). 0 (default) = off. Independent of --target-rr -- combine "
-                        "with --target-rr 0 to make this the ONLY profit exit, or leave both on so "
-                        "whichever hits first closes the trade.")
+                   help="[--side sell] book profit when the SOLD premium decays this %% (e.g. 70 -> "
+                        "buy back at 30%% of entry). 0 (default) = off. Independent of --target-rr -- "
+                        "combine with --target-rr 0 to make this the ONLY profit exit, or leave both "
+                        "on so whichever hits first closes the trade.")
+    p.add_argument("--tp-gain-pct", type=float, default=0.0,
+                   help="[--side buy] sell once the BOUGHT premium rises this %% (e.g. 200 -> sell "
+                        "at 3x entry). 0 (default) = off. Same --target-rr interplay as --tp-decay-pct.")
     p.add_argument("--target-premium", type=float, default=400.0)
     p.add_argument("--lots", type=int, default=1)
     p.add_argument("--lot-size", type=float, default=0.0, help="0 = auto-derive from the underlying symbol")

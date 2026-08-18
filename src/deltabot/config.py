@@ -213,6 +213,34 @@ class Settings(BaseSettings):
     # bot's own data instead of REST history. Off by default (verbose).
     dcv2_debug_state: bool = False
 
+    # Ema21Breakdown (strategy="ema21"): EMA(21) anchor -> wait-for-confirmation ->
+    # breakout pattern (src/deltabot/strategy/ema21_breakdown.py), executed via
+    # option_side="buy" (bullish -> buy CALL, bearish -> buy PUT). The validated
+    # live config: 15m candles, target_premium=100, take_profit_pct=300 (rally
+    # TP -- shares the global take_profit_pct/target_premium/option_side fields
+    # above, same as dcv3), ema_sl=True, entries 12:00-17:00 IST. Best backtest
+    # (15m, buy, premium~100, 300% TP, ema_sl, 12-17h window): +$90.69 / 79 legs
+    # over 3mo at 25 lots -- the thinnest live track record of any bot in the
+    # fleet (never executed a real order); start at 1 lot.
+    ema21_ema_len: int = 21
+    ema21_max_wait: int = 3
+    # BTC-price 2R target -- 0 (default, matches the validated config) disables
+    # it entirely; profit comes from take_profit_pct (the rally TP) instead.
+    ema21_target_rr: float = 0.0
+    ema21_trade_ce: bool = True
+    ema21_trade_pe: bool = True
+    ema21_trend_filter: bool = False
+    ema21_ema200_filter: bool = False
+    ema21_ema50_len: int = 50
+    ema21_ema200_len: int = 200
+    # Dynamic SL: exit the moment a candle CLOSES back through EMA(ema21_ema_len)
+    # instead of a fixed anchor-price stop. True = the validated live config.
+    ema21_ema_sl: bool = True
+    ema21_entry_start_hour: int = 12
+    ema21_entry_end_hour: int = 17
+    ema21_tp_poll_seconds: float = 15.0   # poll option mark for the rally TP (0 = only at 15m close)
+    ema21_debug_state: bool = False       # log a full strategy-state snapshot on every closed 15m candle
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

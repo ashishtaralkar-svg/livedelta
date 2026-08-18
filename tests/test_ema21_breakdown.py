@@ -220,3 +220,68 @@ def test_trend_filter_blocks_buy_when_price_below_ema50() -> None:
     assert d is None
     assert s.position_state == PositionState.FLAT
     assert s._pending_trigger_bull is None
+
+
+# --------------------------------------------------------------------- #
+# ema_sl mode: dynamic "closed back through the EMA" SL, replacing the
+# fixed anchor-price stop.
+# --------------------------------------------------------------------- #
+
+def test_ema_sl_exits_short_when_candle_closes_above_ema() -> None:
+    s = _strategy(ema_sl=True)
+    s._in_short = True
+    s._ema._value = 100.0   # ema(3) blends toward close(104) but stays below it
+    d = s.update(_c(_ts(12, 0), 100.0, 106.0, 99.0, 104.0))
+    assert d is not None and d.short_exit and d.exit_reason == "SL"
+    assert d.short_exit_price == 104.0
+    assert s.position_state == PositionState.FLAT
+
+
+def test_ema_sl_does_not_exit_short_while_close_stays_below_ema() -> None:
+    s = _strategy(ema_sl=True)
+    s._in_short = True
+    s._ema._value = 200.0   # ema stays well above price -- close(104) never gets above it
+    d = s.update(_c(_ts(12, 0), 100.0, 106.0, 99.0, 104.0))
+    assert d is None
+    assert s.position_state == PositionState.SHORT
+
+
+def test_ema_sl_exits_long_when_candle_closes_below_ema() -> None:
+    s = _strategy(ema_sl=True)
+    s._in_long = True
+    s._ema._value = 100.0   # ema blends toward close(94) but stays above it
+    d = s.update(_c(_ts(12, 0), 100.0, 101.0, 89.0, 94.0))
+    assert d is not None and d.long_exit and d.exit_reason == "SL"
+    assert d.long_exit_price == 94.0
+    assert s.position_state == PositionState.FLAT
+
+
+def test_entry_window_blocks_trigger_outside_allowed_hours() -> None:
+    s = _strategy(entry_start_hour=14, entry_end_hour=17)
+    s._pending_trigger = 88.0
+    s._pending_sl = 105.0
+    d = s.update(_c(_ts(18, 0), 90.0, 91.0, 85.0, 86.0))   # 18:00 IST -- outside 14-17
+    assert d is None
+    assert s.position_state == PositionState.FLAT
+    assert s._pending_trigger is None   # consumed untraded, not left resting
+
+
+def test_entry_window_allows_trigger_inside_allowed_hours() -> None:
+    s = _strategy(entry_start_hour=14, entry_end_hour=17, target_rr=2.0)
+    s._pending_trigger = 88.0
+    s._pending_sl = 105.0
+    d = s.update(_c(_ts(15, 0), 90.0, 91.0, 85.0, 86.0))   # 15:00 IST -- inside 14-17
+    assert d is not None and d.sell_signal
+    assert s.position_state == PositionState.SHORT
+
+
+def test_ema_sl_ignores_the_old_fixed_anchor_sl() -> None:
+    """With ema_sl on, touching the OLD fixed active_sl must NOT exit on its
+    own -- only a close back through the EMA does."""
+    s = _strategy(ema_sl=True)
+    s._in_short = True
+    s._active_sl = 105.0   # the old-style fixed SL -- high(106) touches it
+    s._ema._value = 200.0   # but ema stays high enough that close(104) < ema -- no ema_sl exit either
+    d = s.update(_c(_ts(12, 0), 100.0, 106.0, 99.0, 104.0))
+    assert d is None
+    assert s.position_state == PositionState.SHORT

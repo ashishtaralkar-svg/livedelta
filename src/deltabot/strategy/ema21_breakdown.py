@@ -36,6 +36,18 @@ BUY side (mirror, added on request -- exact opposite of every rule above):
   below the EMA); trigger = that candle's HIGH; SL = signal-1 candle's LOW;
   target = entry + 2 x (entry - SL).
 
+ema_sl mode (added on request -- an alternate, dynamic SL for BOTH sides):
+  entry/pattern detection is unchanged. Once in a position, the fixed
+  anchor-price SL is ignored; instead the trade exits the moment a candle
+  CLOSES back through the EMA -- a LONG (PE sold) exits on close < EMA, a
+  SHORT (CE sold) exits on close > EMA (mirror), exit price = that candle's
+  close. This replaces "SL" as a concept (a BTC price level) with "close
+  back through the trend line" (a BTC price ACTION) -- there's no fixed
+  stop price at entry time in this mode, only a standing condition checked
+  every bar. Meant to pair with target_rr=0 and a premium-decay TP (the
+  backtest/live layer's own tp_decay_pct) so profit-taking happens off the
+  OPTION premium while the stop stays anchored to BTC trend structure.
+
 Execution mapping (same convention as every other strategy in this repo):
 SELL signal -> sell a CALL (CE); BUY signal -> sell a PUT (PE). "Strict
 single trade" is preserved for the COMBINED strategy, not per side: only one
@@ -44,11 +56,22 @@ matching the source script's own single-position design -- this is
 deliberately NOT the independent-legs model used by supertrend_fixed_sl.
 trade_ce/trade_pe let a caller run either side alone (e.g. to test the BUY
 side in isolation).
+
+entry_start_hour/entry_end_hour: gate the TRADE ITSELF (not pattern
+detection -- signal1/signal2 still form/re-arm regardless) to a daily IST
+time window, e.g. entry_start_hour=14, entry_end_hour=17 for "only enter
+between 2pm and 5pm". Same convention as dcv2's --entry-start-hour/--entry-
+end-hour: checked at the trigger moment, alongside trend_filter/
+ema200_filter -- a breakout outside the window is consumed untraded rather
+than held open waiting for the window to start. Default (0, 24) = no
+restriction.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from ..enums import PositionState
 from ..models import Candle
@@ -101,12 +124,26 @@ class Ema21BreakdownStrategy:
         ema200_filter: bool = False,
         ema50_len: int = 50,
         ema200_len: int = 200,
+        ema_sl: bool = False,
+        entry_start_hour: int = 0,
+        entry_end_hour: int = 24,
+        day_tz: str = "Asia/Kolkata",
     ) -> None:
         self.ema_len = ema_len
         self.max_wait = max_wait
         self.target_rr = target_rr
         self.trade_ce = trade_ce
         self.trade_pe = trade_pe
+        # ema_sl: replace the fixed anchor-price SL with a dynamic one --
+        # exit the moment a candle CLOSES back through the EMA (long: close
+        # < ema; short: close > ema), instead of price crossing a frozen
+        # level. See the module docstring's "ema_sl mode" section.
+        self.ema_sl = ema_sl
+        # entry_start_hour/entry_end_hour: gate the trade itself to a daily
+        # IST window -- see module docstring.
+        self.entry_start_hour = entry_start_hour
+        self.entry_end_hour = entry_end_hour
+        self._tz = ZoneInfo(day_tz)
         # trend_filter: an ADDITIONAL gate on top of the signal1/signal2
         # pattern, checked AT THE TRIGGER (the moment real price would
         # otherwise fire the entry) -- BUY only fires if close > EMA(50) >
@@ -207,20 +244,29 @@ class Ema21BreakdownStrategy:
         entry_price = candle.close
         new_sl: float | None = None
 
-        # --- 1. Exit: fixed SL / TARGET bracket per side (SL checked first,
-        #     same conservative convention as every other strategy here). ---
+        # --- 1. Exit: SL / TARGET bracket per side (SL checked first, same
+        #     conservative convention as every other strategy here). SL is
+        #     either the fixed anchor price (default) or, with ema_sl on, a
+        #     dynamic "closed back through the EMA" condition -- see the
+        #     module docstring's "ema_sl mode" section. ---
         if self._in_short:
-            if self._active_sl is not None and candle.high >= self._active_sl:
+            if self.ema_sl:
+                if candle.close > ema:
+                    short_exit, short_exit_price, exit_reason = True, candle.close, "SL"
+            elif self._active_sl is not None and candle.high >= self._active_sl:
                 short_exit, short_exit_price, exit_reason = True, self._active_sl, "SL"
-            elif self._active_target is not None and candle.low <= self._active_target:
+            if not short_exit and self._active_target is not None and candle.low <= self._active_target:
                 short_exit, short_exit_price, exit_reason = True, self._active_target, "TARGET"
             if short_exit:
                 self._in_short = False
                 self._active_sl = self._active_target = None
         elif self._in_long:
-            if self._active_sl_bull is not None and candle.low <= self._active_sl_bull:
+            if self.ema_sl:
+                if candle.close < ema:
+                    long_exit, long_exit_price, exit_reason = True, candle.close, "SL"
+            elif self._active_sl_bull is not None and candle.low <= self._active_sl_bull:
                 long_exit, long_exit_price, exit_reason = True, self._active_sl_bull, "SL"
-            elif self._active_target_bull is not None and candle.high >= self._active_target_bull:
+            if not long_exit and self._active_target_bull is not None and candle.high >= self._active_target_bull:
                 long_exit, long_exit_price, exit_reason = True, self._active_target_bull, "TARGET"
             if long_exit:
                 self._in_long = False
@@ -230,13 +276,18 @@ class Ema21BreakdownStrategy:
         #     -- runs BEFORE pattern detection below. if/elif between short
         #     and long preserves "strict single trade" (never both at once). ---
         flat = not self._in_short and not self._in_long
+        local_hour = datetime.fromtimestamp(candle.start_time, tz=self._tz).hour
+        time_ok = self.entry_start_hour <= local_hour < self.entry_end_hour
         if (flat and self.trade_ce and self._pending_trigger is not None
                 and candle.low <= self._pending_trigger):
             # trend_filter: price < EMA50 < EMA200 must ALSO hold at the
-            # trigger moment; ema200_filter: price < EMA200 alone. Both
-            # independent gates, disagreeing consumes the setup untraded.
+            # trigger moment; ema200_filter: price < EMA200 alone.
+            # entry_start_hour/entry_end_hour: the trigger bar's own IST hour
+            # must also fall in the allowed window. All independent gates,
+            # disagreeing consumes the setup untraded.
             trend_ok = ((not self.trend_filter) or (candle.close < ema50 < ema200)) \
-                and ((not self.ema200_filter) or (candle.close < ema200))
+                and ((not self.ema200_filter) or (candle.close < ema200)) \
+                and time_ok
             if trend_ok:
                 sell_signal, entry_price = True, self._pending_trigger
                 self._in_short = True
@@ -249,9 +300,10 @@ class Ema21BreakdownStrategy:
             self._tracking = False
         elif (flat and self.trade_pe and self._pending_trigger_bull is not None
                 and candle.high >= self._pending_trigger_bull):
-            # trend_filter / ema200_filter mirror.
+            # trend_filter / ema200_filter / entry-window mirror.
             trend_ok = ((not self.trend_filter) or (candle.close > ema50 > ema200)) \
-                and ((not self.ema200_filter) or (candle.close > ema200))
+                and ((not self.ema200_filter) or (candle.close > ema200)) \
+                and time_ok
             if trend_ok:
                 buy_signal, entry_price = True, self._pending_trigger_bull
                 self._in_long = True

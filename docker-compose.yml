@@ -122,3 +122,28 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # EMA21 Breakdown bot -- 15m EMA(21) anchor/breakout pattern, BUYS options
+  # (bullish -> buy CALL, bearish -> buy PUT), on its OWN Delta SUB-ACCOUNT, in
+  # parallel with the other bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/ema21_pos.json). Fill .env.ema21 first (cp
+  # .env.ema21.example .env.ema21, add the sub-account API keys). This is the
+  # newest, least-proven strategy in the fleet (backtest only, never executed a
+  # real order) -- .env.ema21.example starts DELTA_OPTION_CONTRACTS at 1.
+  # Bring it up ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build ema21bot
+  ema21bot:
+    build: .
+    image: deltabot:latest
+    container_name: ema21bot
+    restart: always
+    env_file:
+      - .env.ema21
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
