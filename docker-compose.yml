@@ -147,3 +147,29 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Supertrend Fixed-SL bot -- 5m Supertrend(10,3) flip timing, frozen SL, NO
+  # profit target, SELLS options. Unlike every other bot, holds a CE and PE
+  # leg SIMULTANEOUSLY as independent contracts. Own Delta SUB-ACCOUNT, in
+  # parallel with the other bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/supertrend_pos.json -- the engine derives two
+  # per-leg files from this). Fill .env.supertrend first (cp
+  # .env.supertrend.example .env.supertrend, add the sub-account API keys).
+  # This engine has NEVER executed a real order -- watch it closely. Bring it
+  # up ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build supertrendbot
+  supertrendbot:
+    build: .
+    image: deltabot:latest
+    container_name: supertrendbot
+    restart: always
+    env_file:
+      - .env.supertrend
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

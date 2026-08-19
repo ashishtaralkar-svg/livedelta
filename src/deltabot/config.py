@@ -241,6 +241,27 @@ class Settings(BaseSettings):
     ema21_tp_poll_seconds: float = 15.0   # poll option mark for the rally TP (0 = only at 15m close)
     ema21_debug_state: bool = False       # log a full strategy-state snapshot on every closed 15m candle
 
+    # SupertrendFixedSl (strategy="supertrend"): Supertrend(10,3) flip timing on
+    # real (non-HA) OHLC, a FROZEN stop (read once at the flip, never re-derived
+    # from Supertrend's still-updating value), sell-only, NO profit target --
+    # the only exits are that frozen SL or the daily square-off. Unlike every
+    # other bot, this one holds a CE and a PE leg SIMULTANEOUSLY as independent
+    # contracts (see src/deltabot/strategy/supertrend_fixed_sl.py's own
+    # docstring) -- the live engine tracks them via two separate
+    # OptionsExecutor instances, not the shared option_side/take_profit_pct
+    # fields (those are unused here; always sell-mode, no TP setting at all).
+    # Best backtest (5m, sell, premium~1400, 25 lots, 1 week): +$65.56/27 legs.
+    # Never executed a real order -- treat live results with real caution.
+    supertrend_atr_period: int = 10
+    supertrend_factor: float = 3.0
+    supertrend_gap_start_hour: int = 17
+    supertrend_gap_start_minute: int = 25
+    supertrend_gap_end_hour: int = 17
+    supertrend_gap_end_minute: int = 30
+    supertrend_trade_ce: bool = True
+    supertrend_trade_pe: bool = True
+    supertrend_debug_state: bool = False   # log a full strategy-state snapshot on every closed 5m candle
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position
