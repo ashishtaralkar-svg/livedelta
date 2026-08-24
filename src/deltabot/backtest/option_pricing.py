@@ -18,6 +18,8 @@ from ..models import Candle
 
 _IST = ZoneInfo("Asia/Kolkata")
 LOT_BTC = 0.001  # 1 option lot = 0.001 BTC underlying on Delta BTC options
+# Delta option contract sizes (underlying per lot). BTC = 0.001, ETH = 0.01.
+LOT_SIZE = {"BTC": 0.001, "ETH": 0.01}
 RES_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 
 # Delta options taker fee (brokerage), calibrated to actual account fills
@@ -27,9 +29,10 @@ TAKER_FEE_PCT = 0.00012
 PREMIUM_FEE_CAP_PCT = 0.10
 
 
-def side_fee(underlying_px: float, premium: float, lots: int) -> float:
-    """Per-side option brokerage in USD for ``lots`` lots."""
-    per_lot = min(TAKER_FEE_PCT * underlying_px, PREMIUM_FEE_CAP_PCT * premium) * LOT_BTC
+def side_fee(underlying_px: float, premium: float, lots: int, lot_size: float = LOT_BTC) -> float:
+    """Per-side option brokerage in USD for ``lots`` lots (``lot_size`` = the
+    underlying per lot: 0.001 for BTC, 0.01 for ETH)."""
+    per_lot = min(TAKER_FEE_PCT * underlying_px, PREMIUM_FEE_CAP_PCT * premium) * lot_size
     return per_lot * lots
 
 
@@ -96,6 +99,23 @@ def premium_at(candles: dict[int, Candle], ts: int, step: int) -> float | None:
     return max(earlier, key=lambda c: c.start_time).close if earlier else None
 
 
+def option_low_over(candles: dict[int, Candle], ts: int, window_sec: int,
+                    step: int) -> float | None:
+    """Lowest option ``.low`` over the window ``[ts, ts + window_sec)`` -- the
+    sold option's worst-case fill when BTC hits the trigger somewhere inside
+    the BTC candle. Falls back to the nearest prior candle's ``.low`` (same
+    back-search as ``premium_at``), then None."""
+    lows = [c.low for t, c in candles.items() if ts <= t < ts + window_sec]
+    if lows:
+        return min(lows)
+    for k in range(0, 12):
+        c = candles.get(ts - k * step)
+        if c is not None:
+            return c.low
+    earlier = [c for t, c in candles.items() if t <= ts]
+    return max(earlier, key=lambda c: c.start_time).low if earlier else None
+
+
 def intrinsic_value(symbol: str, underlying_px: float) -> float:
     """Intrinsic value of an option = its MINIMUM possible price (an option can
     never trade below what it's worth if exercised). ``symbol`` like
@@ -133,21 +153,64 @@ def resolve_contract(
     return None
 
 
+def resolve_atm(
+    client: httpx.Client, underlying: str, option_type: OptionType, entry_btc: float,
+    expiry: datetime, interval: int,
+    entry_ts: int, exit_ts: int, win_start: int, win_end: int,
+    resolution: str, step: int, cache: dict,
+    offset: float = 0.0,
+) -> tuple[str, int, dict[int, Candle]] | None:
+    """Pick the strike ``offset`` away from AT-THE-MONEY (nearest ``interval`` to
+    ``entry_btc``, then ``+ offset``) directly -- no premium target/search, unlike
+    ``resolve_by_premium``. ``offset`` is applied literally (same sign for calls and
+    puts) -- e.g. offset=100 always selects atm+100, whichever side is traded.
+    Returns ``(symbol, strike, candles)`` or None if that exact strike has no
+    premium data at both entry and exit. ``cache`` keyed by symbol avoids refetching
+    across trades.
+    """
+    ddmmyy = expiry.strftime("%d%m%y")
+    strike = int(round(entry_btc / interval) * interval + offset)
+    symbol = f"{option_type.value}-{underlying}-{strike}-{ddmmyy}"
+    if symbol not in cache:
+        cache[symbol] = fetch_option_candles(client, symbol, win_start, win_end, resolution)
+    candles = cache[symbol]
+    if not candles or premium_at(candles, entry_ts, step) is None \
+       or premium_at(candles, exit_ts, step) is None:
+        return None
+    return symbol, strike, candles
+
+
 def resolve_by_premium(
     client: httpx.Client, underlying: str, option_type: OptionType, entry_btc: float,
     expiry: datetime, interval: int, target_premium: float,
     entry_ts: int, exit_ts: int, win_start: int, win_end: int,
     resolution: str, step: int, cache: dict,
 ) -> tuple[str, int, dict[int, Candle]] | None:
-    """Pick the strike whose ENTRY premium is closest to ``target_premium``.
+    """Pick the strike whose ENTRY premium is closest to ``target_premium`` --
+    mirrors ``OptionsExecutor.select_by_premium``'s GLOBAL minimum over the
+    live chain (``min(chain, key=lambda c: abs(c.mark_price - target))``),
+    not just the first strike a directional walk happens to cross.
 
-    Scans from ATM toward OTM (premium falls) until it brackets the target, plus a
-    few ITM steps. Returns ``(symbol, strike, candles)`` or None. ``cache`` keyed by
-    symbol avoids refetching across trades.
+    Walks from ATM toward OTM (premium falls) and separately toward ITM
+    (premium rises), tracking the single best (closest) match seen in each
+    pass. The OTM walk does NOT stop the instant it first crosses the
+    target -- it continues ``OVERSHOOT`` more strikes past that crossing
+    before stopping, since the far side of the crossing bracket is
+    sometimes the truly closer strike (a plain "stop at first crossing"
+    search can settle for a worse strike than live's exhaustive chain scan
+    would actually pick -- this was a real, confirmed source of backtest
+    vs. live strike-selection drift, independent of the separate mark-price
+    vs. historical-trade-candle data-source gap). The ITM pass is likewise
+    widened from a fixed 6 steps to be comparably thorough, since a high
+    target_premium can genuinely sit many strikes ITM.
+
+    Returns ``(symbol, strike, candles)`` or None. ``cache`` keyed by symbol
+    avoids refetching across trades.
     """
     ddmmyy = expiry.strftime("%d%m%y")
     atm = int(round(entry_btc / interval) * interval)
     otm = interval if option_type == OptionType.CALL else -interval  # toward OTM = cheaper
+    OVERSHOOT = 3
 
     def ev(strike: int):
         symbol = f"{option_type.value}-{underlying}-{strike}-{ddmmyy}"
@@ -161,22 +224,29 @@ def resolve_by_premium(
         return (symbol, strike, candles, ein) if (ein is not None and eout is not None) else None
 
     best = None  # (abs_diff, symbol, strike, candles)
+
+    def consider(r) -> None:
+        nonlocal best
+        if r is None:
+            return
+        diff = abs(r[3] - target_premium)
+        if best is None or diff < best[0]:
+            best = (diff, r[0], r[1], r[2])
+
     strike = atm
-    for _ in range(30):
+    crossed_at: int | None = None
+    for i in range(30):
         r = ev(strike)
-        if r is not None:
-            diff = abs(r[3] - target_premium)
-            if best is None or diff < best[0]:
-                best = (diff, r[0], r[1], r[2])
-            if r[3] <= target_premium:
-                break
+        consider(r)
+        if r is not None and r[3] <= target_premium and crossed_at is None:
+            crossed_at = i
+        if crossed_at is not None and i - crossed_at >= OVERSHOOT:
+            break
         strike += otm
+
     strike = atm - otm
-    for _ in range(6):
-        r = ev(strike)
-        if r is not None:
-            diff = abs(r[3] - target_premium)
-            if best is None or diff < best[0]:
-                best = (diff, r[0], r[1], r[2])
+    for _ in range(20):
+        consider(ev(strike))
         strike -= otm
+
     return (best[1], best[2], best[3]) if best else None

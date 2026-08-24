@@ -8,7 +8,15 @@ this port tracks the two legs as the genuinely INDEPENDENT contracts they
 are live: a CE sale and a PE sale can be open AT THE SAME TIME.
 
 Rules (CE/bearish side; PE/bullish is the exact mirror):
-  * SUPERTREND(10,3) on real (non-HA) OHLC, closed 5-minute bars.
+  * SUPERTREND(10,3) on real (non-HA) OHLC, closed 5-minute bars -- unless
+    use_heikin_ashi=True, in which case Supertrend runs on synthetic
+    Heikin Ashi OHLC instead (same conversion formula used throughout this
+    repo, e.g. DCv2Strategy: ha_open = avg of the PRIOR ha_open/ha_close,
+    ha_close = avg of this bar's O/H/L/C, ha_high/ha_low widened to also
+    include ha_open/ha_close). Entry price, and the frozen SL's CROSSING
+    check, always use the REAL candle regardless of this flag -- only the
+    indicator's own OHLC feed changes; execution still happens against
+    real price/premium, matching every other HA-based strategy here.
   * FLIP: the bar where Supertrend's direction changes from up to down ->
     SELL the CE (bearish signal -> sell CALL, same convention as every
     other strategy in this repo), entering at that bar's close. Blocked
@@ -18,6 +26,25 @@ Rules (CE/bearish side; PE/bullish is the exact mirror):
   * Real price crossing that frozen level closes the leg. NO profit target.
   * A CE leg and a PE leg can be open simultaneously (independent
     contracts); each has its own frozen SL and closes independently.
+
+ema200_filter (added on request): an additional gate checked AT THE FLIP --
+a bullish flip (PE) only fires if close > EMA(200); a bearish flip (CE)
+only fires if close < EMA(200). Disagreeing simply consumes the flip
+untraded (no leg opens) -- same convention as ema21_breakdown's
+--ema200-filter. Off (default) = unchanged behavior.
+
+Rollover (a backtest/live-engine concept, NOT modeled inside this class --
+see scripts/backtest_supertrend_fixed_sl.py's --rollover / the module docs
+there): this strategy's own state already supports it for free. _in_short/
+_in_long and _active_short_sl/_active_long_sl represent the DIRECTIONAL
+commitment + its frozen SL, entirely independent of whether an OPTION
+CONTRACT is currently open -- the exit check (real price crossing the
+frozen level) runs unconditionally every bar regardless. So a caller that
+wants "the option got squared off at 17:25 but the frozen SL hasn't been
+hit yet -- keep the SAME frozen SL and sell a fresh option for the next
+day" simply must NOT call force_flat_short()/force_flat_long() at
+square-off; the frozen SL survives automatically since nothing here ever
+clears it except an actual SL cross or an explicit force_flat call.
 """
 
 from __future__ import annotations
@@ -39,6 +66,16 @@ class _Rma:
 
     def __init__(self, length: int) -> None:
         self._alpha = 1.0 / length
+        self._value: float | None = None
+
+    def update(self, x: float) -> float:
+        self._value = x if self._value is None else self._alpha * x + (1 - self._alpha) * self._value
+        return self._value
+
+
+class _Ema:
+    def __init__(self, length: int) -> None:
+        self._alpha = 2.0 / (length + 1.0)
         self._value: float | None = None
 
     def update(self, x: float) -> float:
@@ -128,6 +165,9 @@ class SupertrendFixedSlStrategy:
         gap_end_minute: int = 30,
         trade_ce: bool = True,
         trade_pe: bool = True,
+        use_heikin_ashi: bool = False,
+        ema200_filter: bool = False,
+        ema200_len: int = 200,
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
@@ -136,6 +176,13 @@ class SupertrendFixedSlStrategy:
         # is simply ignored -- no CE/PE sold, no state armed for that side.
         self.trade_ce = trade_ce
         self.trade_pe = trade_pe
+        # use_heikin_ashi: feed Supertrend synthetic HA OHLC instead of the
+        # real candle's own OHLC. See module docstring -- everything else
+        # (entry price, SL-crossing check) still uses the real candle.
+        self.use_heikin_ashi = use_heikin_ashi
+        # ema200_filter: gate checked AT THE FLIP -- see module docstring.
+        self.ema200_filter = ema200_filter
+        self.ema200_len = ema200_len
         self._tz = ZoneInfo(day_tz)
         self._gap_start_mins = gap_start_hour * 60 + gap_start_minute
         self._gap_end_mins = gap_end_hour * 60 + gap_end_minute
@@ -144,8 +191,11 @@ class SupertrendFixedSlStrategy:
     # ------------------------------------------------------------------ #
     def reset(self) -> None:
         self._st = _Supertrend(self.atr_period, self.factor)
+        self._ema200 = _Ema(self.ema200_len)
         self._prev_direction = 0
         self._warmup_bars = 0
+        self._ha_open: float | None = None
+        self._ha_close: float | None = None
 
         self._in_short = False   # CE sold (open)
         self._in_long = False    # PE sold (open)
@@ -154,7 +204,8 @@ class SupertrendFixedSlStrategy:
 
     @property
     def ready(self) -> bool:
-        return self._warmup_bars >= self.atr_period
+        need = max(self.atr_period, self.ema200_len) if self.ema200_filter else self.atr_period
+        return self._warmup_bars >= need
 
     @property
     def in_short(self) -> bool:
@@ -181,13 +232,27 @@ class SupertrendFixedSlStrategy:
             return round(x, 2) if isinstance(x, (int, float)) else None
         return {
             "st_value": r(self._st._value), "direction": self._st._direction,
+            "ema200": r(self._ema200._value),
             "in_short": self._in_short, "in_long": self._in_long,
             "active_short_sl": r(self._active_short_sl), "active_long_sl": r(self._active_long_sl),
         }
 
     # ------------------------------------------------------------------ #
     def update(self, candle: Candle) -> SupertrendFixedSlDecision | None:
-        st_value, direction = self._st.update(candle.high, candle.low, candle.close)
+        if self.use_heikin_ashi:
+            ha_open = (candle.open + candle.close) / 2.0 if self._ha_open is None \
+                else (self._ha_open + self._ha_close) / 2.0
+            ha_close = (candle.open + candle.high + candle.low + candle.close) / 4.0
+            ha_high = max(candle.high, ha_open, ha_close)
+            ha_low = min(candle.low, ha_open, ha_close)
+            self._ha_open, self._ha_close = ha_open, ha_close
+            st_high, st_low, st_close = ha_high, ha_low, ha_close
+        else:
+            st_high, st_low, st_close = candle.high, candle.low, candle.close
+        st_value, direction = self._st.update(st_high, st_low, st_close)
+        # EMA200 always tracks the REAL close, regardless of use_heikin_ashi --
+        # the trend filter reflects actual price, not a synthetic smoothed one.
+        ema200 = self._ema200.update(candle.close)
         self._warmup_bars += 1
 
         bear_flip = self._prev_direction == -1 and direction == 1
@@ -217,12 +282,19 @@ class SupertrendFixedSlStrategy:
 
         # --- Entry: the flip bar itself is the signal. Blocked while that
         #     side's OWN leg is already open (no pyramiding); the OTHER
-        #     side's state is irrelevant -- legs are independent. ---
-        if not in_gap and bear_flip and not self._in_short and self.ready and self.trade_ce:
+        #     side's state is irrelevant -- legs are independent.
+        #     ema200_filter: bearish flip (CE) only if close < EMA200;
+        #     bullish flip (PE) only if close > EMA200. Disagreeing just
+        #     consumes the flip untraded -- no leg opens. ---
+        bear_trend_ok = (not self.ema200_filter) or (candle.close < ema200)
+        bull_trend_ok = (not self.ema200_filter) or (candle.close > ema200)
+        if (not in_gap and bear_flip and not self._in_short and self.ready and self.trade_ce
+                and bear_trend_ok):
             sell_signal, entry_price = True, candle.close
             self._in_short = True
             self._active_short_sl = new_short_sl = st_value
-        if not in_gap and bull_flip and not self._in_long and self.ready and self.trade_pe:
+        if (not in_gap and bull_flip and not self._in_long and self.ready and self.trade_pe
+                and bull_trend_ok):
             buy_signal, entry_price = True, candle.close
             self._in_long = True
             self._active_long_sl = new_long_sl = st_value
