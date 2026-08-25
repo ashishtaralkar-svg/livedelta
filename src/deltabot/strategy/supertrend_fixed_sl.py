@@ -33,6 +33,30 @@ only fires if close < EMA(200). Disagreeing simply consumes the flip
 untraded (no leg opens) -- same convention as ema21_breakdown's
 --ema200-filter. Off (default) = unchanged behavior.
 
+trend_filter (added on request): a SEPARATE, independent gate, also
+checked AT THE FLIP, also combinable with ema200_filter (both must agree
+if both are on) -- but comparing TWO EMAs against each other rather than
+price against one. EMA(150) > EMA(600) -> trend is POSITIVE -> only a
+bullish Supertrend flip (PE) is allowed to fire; EMA(150) < EMA(600) ->
+trend is NEGATIVE -> only a bearish flip (CE) is allowed. The opposite
+flip is simply consumed untraded, same as ema200_filter. Off (default) =
+unchanged behavior.
+
+trend_flip_exit (added on request, a SEPARATE toggle from trend_filter --
+only takes effect when trend_filter is also on -- ported from
+supertrend_trend_filter_strategy.pine): when both are on and the
+EMA(fast)/EMA(slow) relationship itself crosses while a leg is open, that
+leg is now fighting the NEW regime -- it could only have been entered
+while agreeing with the OLD one (the entry gate above enforces that). It
+is force-closed immediately at that bar's close (short_trend_exit /
+long_trend_exit on the returned Decision, distinct from an ordinary SL
+cross), rather than being left to ride out its frozen SL. Only evaluated
+once self.ready (matching the entry gate's own warmup requirement) so a
+meaningless early divergence during EMA(600)'s warmup can't fire a flip.
+Off (default) = trend_filter still gates new entries, but an open leg
+rides on unaffected by a later regime flip -- the original combined
+behavior from before this toggle existed.
+
 Rollover (a backtest/live-engine concept, NOT modeled inside this class --
 see scripts/backtest_supertrend_fixed_sl.py's --rollover / the module docs
 there): this strategy's own state already supports it for free. _in_short/
@@ -133,10 +157,12 @@ class _Supertrend:
 @dataclass(frozen=True)
 class SupertrendFixedSlDecision:
     candle: Candle
-    short_exit: bool   # CE leg closed (SL)
-    long_exit: bool    # PE leg closed (SL)
+    short_exit: bool   # CE leg closed (SL cross OR trend flip)
+    long_exit: bool    # PE leg closed (SL cross OR trend flip)
     short_exit_price: float
     long_exit_price: float
+    short_trend_exit: bool   # True if short_exit was a trend-flip exit, not an SL cross
+    long_trend_exit: bool    # True if long_exit was a trend-flip exit, not an SL cross
     sell_signal: bool  # bearish flip -> new CE sale
     buy_signal: bool   # bullish flip -> new PE sale
     entry_price: float
@@ -168,6 +194,10 @@ class SupertrendFixedSlStrategy:
         use_heikin_ashi: bool = False,
         ema200_filter: bool = False,
         ema200_len: int = 200,
+        trend_filter: bool = False,
+        trend_fast_len: int = 150,
+        trend_slow_len: int = 600,
+        trend_flip_exit: bool = False,
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
@@ -183,6 +213,17 @@ class SupertrendFixedSlStrategy:
         # ema200_filter: gate checked AT THE FLIP -- see module docstring.
         self.ema200_filter = ema200_filter
         self.ema200_len = ema200_len
+        # trend_filter: a SEPARATE, independent gate (also checked AT THE
+        # FLIP, also combinable with ema200_filter) -- see module docstring's
+        # "trend_filter mode" section. EMA(150) vs EMA(600), not price vs a
+        # single EMA.
+        self.trend_filter = trend_filter
+        self.trend_fast_len = trend_fast_len
+        self.trend_slow_len = trend_slow_len
+        # trend_flip_exit: a SEPARATE toggle from trend_filter itself -- only
+        # takes effect when trend_filter is also on. See module docstring's
+        # "trend-flip exit" section.
+        self.trend_flip_exit = trend_flip_exit
         self._tz = ZoneInfo(day_tz)
         self._gap_start_mins = gap_start_hour * 60 + gap_start_minute
         self._gap_end_mins = gap_end_hour * 60 + gap_end_minute
@@ -192,7 +233,10 @@ class SupertrendFixedSlStrategy:
     def reset(self) -> None:
         self._st = _Supertrend(self.atr_period, self.factor)
         self._ema200 = _Ema(self.ema200_len)
+        self._ema_fast = _Ema(self.trend_fast_len)
+        self._ema_slow = _Ema(self.trend_slow_len)
         self._prev_direction = 0
+        self._prev_trend_positive: bool | None = None
         self._warmup_bars = 0
         self._ha_open: float | None = None
         self._ha_close: float | None = None
@@ -204,7 +248,11 @@ class SupertrendFixedSlStrategy:
 
     @property
     def ready(self) -> bool:
-        need = max(self.atr_period, self.ema200_len) if self.ema200_filter else self.atr_period
+        need = self.atr_period
+        if self.ema200_filter:
+            need = max(need, self.ema200_len)
+        if self.trend_filter:
+            need = max(need, self.trend_slow_len)
         return self._warmup_bars >= need
 
     @property
@@ -233,6 +281,7 @@ class SupertrendFixedSlStrategy:
         return {
             "st_value": r(self._st._value), "direction": self._st._direction,
             "ema200": r(self._ema200._value),
+            "ema_fast": r(self._ema_fast._value), "ema_slow": r(self._ema_slow._value),
             "in_short": self._in_short, "in_long": self._in_long,
             "active_short_sl": r(self._active_short_sl), "active_long_sl": r(self._active_long_sl),
         }
@@ -250,14 +299,27 @@ class SupertrendFixedSlStrategy:
         else:
             st_high, st_low, st_close = candle.high, candle.low, candle.close
         st_value, direction = self._st.update(st_high, st_low, st_close)
-        # EMA200 always tracks the REAL close, regardless of use_heikin_ashi --
-        # the trend filter reflects actual price, not a synthetic smoothed one.
+        # EMA200/trend EMAs always track the REAL close, regardless of
+        # use_heikin_ashi -- these filters reflect actual price, not a
+        # synthetic smoothed one.
         ema200 = self._ema200.update(candle.close)
+        ema_fast = self._ema_fast.update(candle.close)
+        ema_slow = self._ema_slow.update(candle.close)
         self._warmup_bars += 1
 
         bear_flip = self._prev_direction == -1 and direction == 1
         bull_flip = self._prev_direction == 1 and direction == -1
         self._prev_direction = direction
+
+        # trend-flip exit: only meaningful once warmed up (same requirement
+        # as the entry gate) so EMA(slow)'s early divergence can't fire a
+        # spurious flip.
+        trend_flip = False
+        if self.trend_filter and self.trend_flip_exit and self.ready:
+            trend_positive_now = ema_fast > ema_slow
+            if self._prev_trend_positive is not None and trend_positive_now != self._prev_trend_positive:
+                trend_flip = True
+            self._prev_trend_positive = trend_positive_now
 
         local = datetime.fromtimestamp(candle.start_time, tz=self._tz)
         now_mins = local.hour * 60 + local.minute
@@ -265,18 +327,34 @@ class SupertrendFixedSlStrategy:
 
         short_exit = long_exit = False
         short_exit_price = long_exit_price = candle.close
+        short_trend_exit = long_trend_exit = False
         sell_signal = buy_signal = False
         entry_price = candle.close
         new_short_sl: float | None = None
         new_long_sl: float | None = None
 
-        # --- Exits: real price crossing the FROZEN level (independent legs). ---
-        if self._in_short and self._active_short_sl is not None and candle.high >= self._active_short_sl:
-            short_exit, short_exit_price = True, self._active_short_sl
+        # --- Exits: real price crossing the FROZEN level (independent legs),
+        #     OR (if trend_filter) the trend regime itself flipping
+        #     underneath an open leg -- that leg could only have opened
+        #     while agreeing with the OLD regime, so it's now fighting the
+        #     new one. A bar where both coincide never double-exits. ---
+        short_sl_hit = self._in_short and self._active_short_sl is not None \
+            and candle.high >= self._active_short_sl
+        long_sl_hit = self._in_long and self._active_long_sl is not None \
+            and candle.low <= self._active_long_sl
+        short_trend_hit = trend_flip and self._in_short
+        long_trend_hit = trend_flip and self._in_long
+
+        if short_sl_hit or short_trend_hit:
+            short_exit = True
+            short_exit_price = self._active_short_sl if short_sl_hit else candle.close
+            short_trend_exit = not short_sl_hit
             self._in_short = False
             self._active_short_sl = None
-        if self._in_long and self._active_long_sl is not None and candle.low <= self._active_long_sl:
-            long_exit, long_exit_price = True, self._active_long_sl
+        if long_sl_hit or long_trend_hit:
+            long_exit = True
+            long_exit_price = self._active_long_sl if long_sl_hit else candle.close
+            long_trend_exit = not long_sl_hit
             self._in_long = False
             self._active_long_sl = None
 
@@ -284,10 +362,15 @@ class SupertrendFixedSlStrategy:
         #     side's OWN leg is already open (no pyramiding); the OTHER
         #     side's state is irrelevant -- legs are independent.
         #     ema200_filter: bearish flip (CE) only if close < EMA200;
-        #     bullish flip (PE) only if close > EMA200. Disagreeing just
-        #     consumes the flip untraded -- no leg opens. ---
-        bear_trend_ok = (not self.ema200_filter) or (candle.close < ema200)
-        bull_trend_ok = (not self.ema200_filter) or (candle.close > ema200)
+        #     bullish flip (PE) only if close > EMA200. trend_filter:
+        #     bearish flip only if EMA(fast) < EMA(slow) ("negative trend");
+        #     bullish flip only if EMA(fast) > EMA(slow) ("positive trend").
+        #     Both independent, both must agree if both are on. Disagreeing
+        #     just consumes the flip untraded -- no leg opens. ---
+        bear_trend_ok = ((not self.ema200_filter) or (candle.close < ema200)) \
+            and ((not self.trend_filter) or (ema_fast < ema_slow))
+        bull_trend_ok = ((not self.ema200_filter) or (candle.close > ema200)) \
+            and ((not self.trend_filter) or (ema_fast > ema_slow))
         if (not in_gap and bear_flip and not self._in_short and self.ready and self.trade_ce
                 and bear_trend_ok):
             sell_signal, entry_price = True, candle.close
@@ -304,6 +387,7 @@ class SupertrendFixedSlStrategy:
         return SupertrendFixedSlDecision(
             candle=candle, short_exit=short_exit, long_exit=long_exit,
             short_exit_price=short_exit_price, long_exit_price=long_exit_price,
+            short_trend_exit=short_trend_exit, long_trend_exit=long_trend_exit,
             sell_signal=sell_signal, buy_signal=buy_signal, entry_price=entry_price,
             short_sl=new_short_sl, long_sl=new_long_sl,
         )

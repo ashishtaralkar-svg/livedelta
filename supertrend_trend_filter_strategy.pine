@@ -1,0 +1,191 @@
+//@version=5
+// ============================================================================
+// SUPERTREND FIXED-SL OPTION SELL + TREND FILTER — same Supertrend(10,3)
+// flip timing and frozen SL as supertrend_fixed_sl_strategy.pine, PLUS a
+// trend regime gate: EMA(150) vs EMA(600) on the chart's own close.
+//
+//   EMA(150) > EMA(600) -> trend is POSITIVE -> only a BULLISH flip
+//     (SELL PE) is allowed to fire. A bearish flip during a positive trend
+//     is simply ignored (consumed untraded).
+//   EMA(150) < EMA(600) -> trend is NEGATIVE -> only a BEARISH flip
+//     (SELL CE) is allowed to fire. A bullish flip during a negative trend
+//     is ignored the same way.
+//
+// This is a SEPARATE, independent gate from any EMA200 price filter (not
+// modeled in this file) -- it compares the two EMAs against EACH OTHER,
+// not price against one EMA. Toggle it off (Inputs > Trend Filter > On/Off)
+// to fall back to the exact behavior of supertrend_fixed_sl_strategy.pine.
+//
+// TREND-FLIP EXIT: if the EMA150/600 relationship itself crosses while a
+// leg is open, that leg is now fighting the NEW regime (it could only have
+// been entered while agreeing with the OLD one) -- it is closed immediately
+// ("Trend flip: EMA cross", marked with an orange X on the chart) rather
+// than being left to ride out its frozen SL. The strategy then just waits
+// flat for the next Supertrend flip that agrees with the new regime.
+//
+// SQUARE-OFF (17:25 IST by default, Inputs > Settlement Gap + Square-off):
+// any leg still open at this moment is force-closed ("EOD square-off
+// (17:25)", marked with a gray square), and a fresh entry is blocked on
+// that SAME bar -- so the strategy genuinely goes flat and waits for the
+// next signal rather than risking an instant same-bar re-entry once the
+// 17:25-17:30 gap ends.
+//
+// Everything else (chart-basis proxy, the CE/PE-mutual-exclusivity chart
+// LIMITATION, frozen non-trailing SL, settlement gap, no profit target) is
+// unchanged from supertrend_fixed_sl_strategy.pine -- see that file's header
+// for the full live-execution reference notes.
+//
+// Backtested (Python port, 5m, premium~1400, 25 lots) against the unfiltered
+// baseline: beats it on both a 1-week and a 3-month window by cutting roughly
+// half the legs (the ones fighting the EMA150/600 trend) while keeping most
+// of the winners -- see the Python strategy/backtest for the validated numbers.
+// This .pine file is the charting/visualization port, not itself backtested.
+// ============================================================================
+strategy("Supertrend Fixed-SL + Trend Filter",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Inputs
+// ============================================================
+grpST = "Supertrend"
+atrPeriod = input.int(10, "ATR Period", minval=1, group=grpST)
+factor    = input.float(3.0, "Multiplier", minval=0.1, group=grpST)
+
+grpTrend = "Trend Filter"
+trendFilterOn = input.bool(true, "On/Off", group=grpTrend)
+trendFastLen  = input.int(150, "Fast EMA length", minval=1, group=grpTrend)
+trendSlowLen  = input.int(600, "Slow EMA length", minval=1, group=grpTrend)
+
+grpLive = "Live-execution reference (display only, not modeled here)"
+targetPremium = input.float(1400, "Target premium (CE/PE, locked at 17:30 IST)", group=grpLive)
+
+grpSession = "Settlement Gap + Square-off (IST)"
+dayTZ       = input.string("Asia/Kolkata", "Timezone", group=grpSession)
+gapStartHr  = input.int(17, "Gap Start Hour",   minval=0, maxval=23, group=grpSession)
+gapStartMin = input.int(25, "Gap Start Minute", minval=0, maxval=59, group=grpSession)
+gapEndHr    = input.int(17, "Gap End Hour",     minval=0, maxval=23, group=grpSession)
+gapEndMin   = input.int(30, "Gap End Minute",   minval=0, maxval=59, group=grpSession)
+sessHr      = input.int(17, "Square-off Hour",   minval=0, maxval=23, group=grpSession)
+sessMin     = input.int(25, "Square-off Minute", minval=0, maxval=59, group=grpSession)
+
+// ============================================================
+// Supertrend(10,3) on real (non-HA) OHLC.
+// ============================================================
+[st, dir] = ta.supertrend(factor, atrPeriod)
+plot(st, "Supertrend", color = dir < 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+bearFlip = dir > 0 and dir[1] < 0   // "turns negative" -- SELL the CE
+bullFlip = dir < 0 and dir[1] > 0   // "turns positive" -- SELL the PE
+
+// ============================================================
+// Trend Filter: EMA(fast) vs EMA(slow) on real close, checked AT THE FLIP.
+// ============================================================
+emaFast = ta.ema(close, trendFastLen)
+emaSlow = ta.ema(close, trendSlowLen)
+trendPositive = emaFast > emaSlow   // agrees with a BULLISH flip (SELL PE)
+trendNegative = emaFast < emaSlow   // agrees with a BEARISH flip (SELL CE)
+
+bearTrendOk = not trendFilterOn or trendNegative
+bullTrendOk = not trendFilterOn or trendPositive
+
+// A fresh EMA cross means the regime itself just flipped -- any leg open
+// right now was only ever allowed to enter because it agreed with the OLD
+// regime, so it's now fighting the new one. ta.crossover/crossunder must be
+// called unconditionally (Pine restriction), so trendFilterOn is applied
+// afterward via trendJustFlipped.
+trendCrossUp     = ta.crossover(emaFast, emaSlow)      // regime just flipped POSITIVE
+trendCrossDown   = ta.crossunder(emaFast, emaSlow)     // regime just flipped NEGATIVE
+trendJustFlipped = trendFilterOn and (trendCrossUp or trendCrossDown)
+
+plot(emaFast, "EMA Fast (trend)", color=color.new(color.aqua, 0), linewidth=1)
+plot(emaSlow, "EMA Slow (trend)", color=color.new(color.fuchsia, 0), linewidth=1)
+bgcolor(trendFilterOn ? (trendPositive ? color.new(color.green, 92) : color.new(color.red, 92)) : na,
+     title="Trend regime (green=positive/PE-only, red=negative/CE-only)")
+
+// ============================================================
+// Time windows: settlement gap blocks new entries; the square-off moment
+// (default 17:25) force-closes any open leg AND also blocks a fresh entry
+// on that same bar, so the strategy genuinely waits flat for the next
+// signal rather than risking an immediate same-bar re-entry.
+// ============================================================
+gapStartMins = gapStartHr * 60 + gapStartMin
+gapEndMins   = gapEndHr * 60 + gapEndMin
+sessMins     = sessHr * 60 + sessMin
+nowMins      = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+inGap        = gapStartMins <= nowMins and nowMins < gapEndMins
+sessionStart = not na(nowMins[1]) and nowMins >= sessMins and nowMins[1] < sessMins
+blockEntries = inGap or sessionStart
+
+// ============================================================
+// State — frozen SL per leg, kept separate so an entry on one side can
+// never disturb the other's stop.
+// ============================================================
+var float activeShortSL = na   // CE-sell leg's frozen Supertrend-at-flip level
+var float activeLongSL  = na   // PE-sell leg's frozen Supertrend-at-flip level
+
+// ----- 1. Exits: the real price crossing the FROZEN level (never
+//          re-derived from Supertrend's own still-updating current value),
+//          OR the trend regime itself flipping underneath the open leg,
+//          OR the daily square-off moment. Merged into one close per side
+//          so a bar where more than one of these coincide never double-closes. -----
+shortSLHit = strategy.position_size < 0 and not na(activeShortSL) and high >= activeShortSL
+longSLHit  = strategy.position_size > 0 and not na(activeLongSL) and low <= activeLongSL
+trendExitShort = trendJustFlipped and strategy.position_size < 0
+trendExitLong  = trendJustFlipped and strategy.position_size > 0
+squareOffShort = sessionStart and strategy.position_size < 0
+squareOffLong  = sessionStart and strategy.position_size > 0
+
+if strategy.position_size < 0 and (shortSLHit or trendExitShort or squareOffShort)
+    shortReason = squareOffShort ? "EOD square-off (17:25)" : trendExitShort ? "Trend flip: EMA cross" : "SL: frozen supertrend @ flip"
+    strategy.close("Short", comment = shortReason)
+    activeShortSL := na
+if strategy.position_size > 0 and (longSLHit or trendExitLong or squareOffLong)
+    longReason = squareOffLong ? "EOD square-off (17:25)" : trendExitLong ? "Trend flip: EMA cross" : "SL: frozen supertrend @ flip"
+    strategy.close("Long", comment = longReason)
+    activeLongSL := na
+
+// ----- 2. Entry: the flip bar itself IS the signal -- no separate
+//          breakout/setup stage like the other strategies here. Only while
+//          flat (chart-basis LIMITATION, see header), and only when the
+//          trend filter agrees (a disagreeing flip is simply consumed
+//          untraded, same as the Python strategy's ema200_filter/trend_filter). -----
+flatNow = strategy.position_size == 0
+sellFired = false
+buyFired  = false
+
+if flatNow and not blockEntries and bearFlip and bearTrendOk
+    strategy.entry("Short", strategy.short)
+    activeShortSL := st
+    sellFired := true
+else if flatNow and not blockEntries and bullFlip and bullTrendOk
+    strategy.entry("Long", strategy.long)
+    activeLongSL := st
+    buyFired := true
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+bgcolor(inGap ? color.new(color.gray, 85) : na, title="Settlement gap (17:25-17:30)")
+bgcolor(sessionStart ? color.new(color.yellow, 70) : na, title="Square-off moment (17:25)")
+
+plotshape(sellFired, title="SELL CE (bearish flip)", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small, text="SELL CE")
+plotshape(buyFired,  title="SELL PE (bullish flip)", style=shape.triangleup,   location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="SELL PE")
+plotshape(trendExitShort or trendExitLong, title="Trend flip exit", style=shape.xcross, location=location.abovebar,
+     color=color.new(color.orange, 0), size=size.tiny, text="TREND FLIP")
+plotshape(squareOffShort or squareOffLong, title="Square-off exit", style=shape.square, location=location.abovebar,
+     color=color.new(color.gray, 0), size=size.tiny, text="EOD")
+
+inPos = strategy.position_size != 0
+activeSL = strategy.position_size < 0 ? activeShortSL : strategy.position_size > 0 ? activeLongSL : na
+plot(inPos ? activeSL : na, "Active (frozen) SL", color=color.orange, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)

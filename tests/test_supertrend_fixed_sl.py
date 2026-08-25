@@ -110,6 +110,177 @@ def test_ema200_filter_off_by_default_does_not_gate() -> None:
     assert d is not None and d.sell_signal   # fires regardless of price vs EMA200
 
 
+# --------------------------------------------------------------------- #
+# trend_filter: EMA(fast) vs EMA(slow), checked AT THE FLIP -- a SEPARATE,
+# independent gate from ema200_filter (both must agree if both are on).
+# --------------------------------------------------------------------- #
+
+def test_trend_filter_blocks_bearish_flip_when_trend_is_positive() -> None:
+    s = _strategy(trend_filter=True)
+    s._st.update = lambda h, l, c: (150.0, 1)   # force a deterministic bear flip
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._ema_fast._value = 200.0   # fast > slow -- POSITIVE trend, disagrees with a bearish flip
+    s._ema_slow._value = 100.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert not s.in_short
+
+
+def test_trend_filter_allows_bearish_flip_when_trend_is_negative() -> None:
+    s = _strategy(trend_filter=True)
+    s._st.update = lambda h, l, c: (150.0, 1)
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._ema_fast._value = 100.0   # fast < slow -- NEGATIVE trend, agrees with a bearish flip
+    s._ema_slow._value = 200.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.sell_signal
+    assert s.in_short
+
+
+def test_trend_filter_blocks_bullish_flip_when_trend_is_negative() -> None:
+    s = _strategy(trend_filter=True)
+    s._st.update = lambda h, l, c: (50.0, -1)   # force a deterministic bull flip
+    s._prev_direction = 1
+    s._warmup_bars = 600
+    s._ema_fast._value = 100.0   # fast < slow -- NEGATIVE trend, disagrees with a bullish flip
+    s._ema_slow._value = 200.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert not s.in_long
+
+
+def test_trend_filter_allows_bullish_flip_when_trend_is_positive() -> None:
+    s = _strategy(trend_filter=True)
+    s._st.update = lambda h, l, c: (50.0, -1)
+    s._prev_direction = 1
+    s._warmup_bars = 600
+    s._ema_fast._value = 200.0   # fast > slow -- POSITIVE trend, agrees with a bullish flip
+    s._ema_slow._value = 100.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.buy_signal
+    assert s.in_long
+
+
+def test_trend_filter_and_ema200_filter_both_gate_independently() -> None:
+    """Both filters on: trend agrees but EMA200 disagrees -- must still block."""
+    s = _strategy(trend_filter=True, ema200_filter=True)
+    s._st.update = lambda h, l, c: (50.0, -1)
+    s._prev_direction = 1
+    s._warmup_bars = 600
+    s._ema_fast._value = 200.0    # trend: positive, agrees with bullish flip
+    s._ema_slow._value = 100.0
+    s._ema200._value = 500.0      # ema200_filter: close(100) < ema200 -- disagrees with bullish flip
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert not s.in_long
+
+
+# --------------------------------------------------------------------- #
+# trend-flip exit: closes an OPEN leg the instant the EMA(fast)/EMA(slow)
+# relationship itself crosses, independent of the frozen SL. _ema_fast/
+# _ema_slow .update() are stubbed (same technique as _st.update above) so
+# the exact post-update EMA value is deterministic; _st.update is also
+# stubbed to hold direction steady so no unrelated Supertrend flip fires.
+# --------------------------------------------------------------------- #
+
+def test_trend_flip_closes_open_short_leg_when_regime_turns_positive() -> None:
+    s = _strategy(trend_filter=True, trend_flip_exit=True)
+    s._st.update = lambda h, l, c: (150.0, -1)   # steady direction -- no fresh ST flip
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._prev_trend_positive = False   # was NEGATIVE (why the short could be open)
+    s._ema_fast.update = lambda x: 200.0   # now positive: fast(200) > slow(100)
+    s._ema_slow.update = lambda x: 100.0
+    s._in_short = True
+    s._active_short_sl = 500.0   # far away -- not an SL hit
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.short_exit and d.short_trend_exit
+    assert d.short_exit_price == 100.0   # closed at candle close, not the frozen SL
+    assert not s.in_short
+
+
+def test_trend_flip_closes_open_long_leg_when_regime_turns_negative() -> None:
+    s = _strategy(trend_filter=True, trend_flip_exit=True)
+    s._st.update = lambda h, l, c: (50.0, 1)
+    s._prev_direction = 1
+    s._warmup_bars = 600
+    s._prev_trend_positive = True   # was POSITIVE (why the long could be open)
+    s._ema_fast.update = lambda x: 100.0   # now negative: fast(100) < slow(200)
+    s._ema_slow.update = lambda x: 200.0
+    s._in_long = True
+    s._active_long_sl = 1.0   # far away -- not an SL hit
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.long_exit and d.long_trend_exit
+    assert d.long_exit_price == 100.0
+    assert not s.in_long
+
+
+def test_trend_flip_exit_is_a_noop_when_trend_filter_is_off() -> None:
+    s = _strategy(trend_flip_exit=True)   # trend_filter defaults False -- exit is inert without it
+    s._st.update = lambda h, l, c: (150.0, -1)
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._ema_fast.update = lambda x: 200.0
+    s._ema_slow.update = lambda x: 100.0
+    s._in_short = True
+    s._active_short_sl = 500.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert s.in_short   # leg rides on -- no gate means no trend-flip exit either
+
+
+def test_trend_filter_alone_does_not_exit_an_open_leg_on_a_flip() -> None:
+    """trend_flip_exit defaults False -- trend_filter alone only gates NEW
+    entries; an already-open leg is unaffected by a later regime flip. This
+    is the decoupled default (the original combined behavior before
+    trend_flip_exit existed as a separate toggle)."""
+    s = _strategy(trend_filter=True)   # trend_flip_exit defaults False
+    s._st.update = lambda h, l, c: (150.0, -1)
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._ema_fast.update = lambda x: 200.0
+    s._ema_slow.update = lambda x: 100.0
+    s._in_short = True
+    s._active_short_sl = 500.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert s.in_short
+
+
+def test_trend_flip_exit_does_not_fire_before_warmup() -> None:
+    s = _strategy(trend_filter=True, trend_flip_exit=True)
+    s._st.update = lambda h, l, c: (150.0, -1)
+    s._prev_direction = -1
+    s._warmup_bars = 100   # below trend_slow_len(600) -- not ready
+    s._prev_trend_positive = False
+    s._ema_fast.update = lambda x: 200.0
+    s._ema_slow.update = lambda x: 100.0
+    s._in_short = True
+    s._active_short_sl = 500.0
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is None
+    assert s.in_short
+
+
+def test_sl_cross_takes_priority_over_a_simultaneous_trend_flip() -> None:
+    """Both happen on the same bar -- exits once, tagged as the SL, not TREND."""
+    s = _strategy(trend_filter=True, trend_flip_exit=True)
+    s._st.update = lambda h, l, c: (150.0, -1)
+    s._prev_direction = -1
+    s._warmup_bars = 600
+    s._prev_trend_positive = False
+    s._ema_fast.update = lambda x: 200.0
+    s._ema_slow.update = lambda x: 100.0
+    s._in_short = True
+    s._active_short_sl = 100.5   # WILL be hit by this bar's high
+    d = s.update(_c(_ts(10, 0), 100.0, 101.0, 99.0, 100.0))
+    assert d is not None and d.short_exit
+    assert not d.short_trend_exit
+    assert d.short_exit_price == 100.5   # the frozen SL level, not candle close
+
+
 def _feed_uptrend_then_reversal(s: SupertrendFixedSlStrategy) -> list:
     """A steady uptrend (flips Supertrend bullish -> sells PE) followed by a
     sharp reversal down (flips bearish -> closes the PE via SL, sells CE)."""

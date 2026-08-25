@@ -107,6 +107,10 @@ class SupertrendFixedSlEngine:
             gap_end_minute=settings.supertrend_gap_end_minute,
             trade_ce=settings.supertrend_trade_ce,
             trade_pe=settings.supertrend_trade_pe,
+            trend_filter=settings.supertrend_trend_filter,
+            trend_fast_len=settings.supertrend_trend_fast_len,
+            trend_slow_len=settings.supertrend_trend_slow_len,
+            trend_flip_exit=settings.supertrend_trend_flip_exit,
         )
         self.executor_short = OptionsExecutor(rest, settings)
         self.executor_long = OptionsExecutor(rest, settings)
@@ -243,9 +247,11 @@ class SupertrendFixedSlEngine:
         # Exits and entries are INDEPENDENT per leg -- both can legitimately
         # fire on the same bar (e.g. CE stops out while PE enters).
         if dec.short_exit and self.executor_short.has_open_position:
-            await self._close_leg(self.short, "SL", dec.short_exit_price)
+            reason = "TREND" if dec.short_trend_exit else "SL"
+            await self._close_leg(self.short, reason, dec.short_exit_price)
         if dec.long_exit and self.executor_long.has_open_position:
-            await self._close_leg(self.long, "SL", dec.long_exit_price)
+            reason = "TREND" if dec.long_trend_exit else "SL"
+            await self._close_leg(self.long, reason, dec.long_exit_price)
 
         if (dec.sell_signal and not self.executor_short.has_open_position
                 and not self._entries_blocked()):

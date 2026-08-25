@@ -262,6 +262,19 @@ class Settings(BaseSettings):
     supertrend_trade_pe: bool = True
     supertrend_debug_state: bool = False   # log a full strategy-state snapshot on every closed 5m candle
 
+    # trend_filter (+ trend_flip_exit): EMA(150) vs EMA(600) regime gate on
+    # new entries, optionally also force-closing an open leg the instant the
+    # regime itself flips (tagged TREND). See supertrend_fixed_sl.py's own
+    # docstring. Backtested (5m, premium~1400, 25 lots, 3mo): gate-only
+    # +$418.55/196 legs/36.2% win; gate+flip-exit +$396.42/198 legs/35.4% win
+    # but the smallest max drawdown of any variant tested (-$91.96 vs -$98.52
+    # gate-only vs -$101.01 unfiltered baseline). Off (default) = unchanged
+    # (unfiltered) behavior.
+    supertrend_trend_filter: bool = False
+    supertrend_trend_fast_len: int = 150
+    supertrend_trend_slow_len: int = 600
+    supertrend_trend_flip_exit: bool = False
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

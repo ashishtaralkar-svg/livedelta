@@ -29,6 +29,15 @@ module's own docstring). A leg that closed via a real SL cross this same
 bar never rolls (there's nothing left to continue). Off (default) =
 unchanged behavior -- every square-off just ends the leg.
 
+--weekend-blackout: a backtest-level scheduling concept (like
+--square-off-hour/minute), NOT modeled inside the strategy class -- no NEW
+entry from Saturday 17:30 IST through Sunday 23:55 IST. The daily
+square-off already force-closes any open leg by 17:25 every day including
+Saturday, so this window never needs to force-close anything -- it only
+ever suppresses a fresh flip signal (same force_flat_short/long treatment
+already used for the pre-sim-start warmup window). Off (default) =
+unchanged behavior.
+
 Run:  python scripts/backtest_supertrend_fixed_sl.py --days 7
 """
 
@@ -61,6 +70,21 @@ def _ist_mins(ts: int) -> int:
     return d.hour * 60 + d.minute
 
 
+_SAT_BLACKOUT_START_MINS = 17 * 60 + 30   # Saturday 17:30 IST
+_SUN_BLACKOUT_END_MINS = 23 * 60 + 55     # Sunday 23:55 IST
+
+
+def _in_weekend_blackout(ts: int) -> bool:
+    d = datetime.fromtimestamp(ts, tz=_IST)
+    wd = d.weekday()   # Mon=0 ... Sat=5, Sun=6
+    mins = d.hour * 60 + d.minute
+    if wd == 5:
+        return mins >= _SAT_BLACKOUT_START_MINS
+    if wd == 6:
+        return mins <= _SUN_BLACKOUT_END_MINS
+    return False
+
+
 def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     strategy = SupertrendFixedSlStrategy(
         atr_period=args.atr_period, factor=args.factor,
@@ -69,6 +93,8 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
         trade_ce=not args.pe_only, trade_pe=not args.ce_only,
         use_heikin_ashi=args.heikin_ashi,
         ema200_filter=args.ema200_filter, ema200_len=args.ema200_len,
+        trend_filter=args.trend_filter, trend_fast_len=args.trend_fast_len,
+        trend_slow_len=args.trend_slow_len, trend_flip_exit=args.trend_flip_exit,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
     interval = settings.option_strike_interval
@@ -76,6 +102,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     lots = args.lots
     lot_size = args.lot_size if args.lot_size > 0 else op.LOT_SIZE.get(underlying, op.LOT_BTC)
     step = op.RES_SECONDS.get(args.opt_resolution, 60)
+    bar_seconds = op.RES_SECONDS.get(args.resolution, 300)
     es = args.entry_slippage_pct / 100.0
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
@@ -143,14 +170,28 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             prev_mins = mins
 
             dec = strategy.update(c)
+            # strategy.update(c) evaluates the JUST-CLOSED candle `c` -- the
+            # signal (flip / SL cross) is only genuinely KNOWN once `c`
+            # closes, i.e. at c.start_time + bar_seconds, matching when live
+            # actually acts (confirmed against real Telegram timestamps).
+            # Both the recorded time AND the option-premium lookup must use
+            # this moment, not c.start_time (the bar's OPEN) -- pricing off
+            # c.start_time was fetching the option's premium from 1 bar too
+            # early. EOD/ROLL below are different: those are scheduled
+            # wall-clock events that genuinely fire AT c.start_time (17:25),
+            # so they deliberately do NOT get this adjustment.
+            decision_ts = c.start_time + bar_seconds
+            blackout = args.weekend_blackout and _in_weekend_blackout(decision_ts)
 
             if pos_short is not None and dec is not None and dec.short_exit:
-                close(pos_short, "SL", buyback_prem(pos_short, c.start_time, dec.short_exit_price),
-                      c.start_time, dec.short_exit_price)
+                reason = "TREND" if dec.short_trend_exit else "SL"
+                close(pos_short, reason, buyback_prem(pos_short, decision_ts, dec.short_exit_price),
+                      decision_ts, dec.short_exit_price)
                 pos_short = None
             if pos_long is not None and dec is not None and dec.long_exit:
-                close(pos_long, "SL", buyback_prem(pos_long, c.start_time, dec.long_exit_price),
-                      c.start_time, dec.long_exit_price)
+                reason = "TREND" if dec.long_trend_exit else "SL"
+                close(pos_long, reason, buyback_prem(pos_long, decision_ts, dec.long_exit_price),
+                      decision_ts, dec.long_exit_price)
                 pos_long = None
 
             # Daily square-off: closes any still-open leg(s) so they never
@@ -162,11 +203,12 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             # the clock) immediately sells a fresh option for the same side,
             # keeping the SAME frozen SL (never cleared, since force_flat is
             # skipped for that side).
+            eod_blackout = args.weekend_blackout and _in_weekend_blackout(c.start_time)
             if square_off:
                 if pos_short is not None:
                     close(pos_short, "EOD", buyback_prem(pos_short, c.start_time, c.close), c.start_time, c.close)
                     pos_short = None
-                    if args.rollover and strategy.in_short:
+                    if args.rollover and strategy.in_short and not eod_blackout:
                         pos_short = open_leg(client, c.start_time, c.close, is_short=True, tag="ROLL")
                         if pos_short is None:
                             strategy.force_flat_short()
@@ -175,7 +217,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                 if pos_long is not None:
                     close(pos_long, "EOD", buyback_prem(pos_long, c.start_time, c.close), c.start_time, c.close)
                     pos_long = None
-                    if args.rollover and strategy.in_long:
+                    if args.rollover and strategy.in_long and not eod_blackout:
                         pos_long = open_leg(client, c.start_time, c.close, is_short=False, tag="ROLL")
                         if pos_long is None:
                             strategy.force_flat_long()
@@ -183,27 +225,29 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                         strategy.force_flat_long()
 
             if dec is not None and dec.sell_signal and pos_short is None:
-                if c.start_time < sim_start:
+                if c.start_time < sim_start or blackout:
                     strategy.force_flat_short()
                 else:
-                    pos_short = open_leg(client, c.start_time, c.close, is_short=True)
+                    pos_short = open_leg(client, decision_ts, c.close, is_short=True)
                     if pos_short is None:
                         strategy.force_flat_short()
             if dec is not None and dec.buy_signal and pos_long is None:
-                if c.start_time < sim_start:
+                if c.start_time < sim_start or blackout:
                     strategy.force_flat_long()
                 else:
-                    pos_long = open_leg(client, c.start_time, c.close, is_short=False)
+                    pos_long = open_leg(client, decision_ts, c.close, is_short=False)
                     if pos_long is None:
                         strategy.force_flat_long()
 
         last = candles[-1]
+        last_ts = last.start_time + bar_seconds   # "as of" the last candle's CLOSE, the most
+                                                    # recent genuinely-known moment.
         if pos_short is not None:
-            close(pos_short, "OPEN_AT_END", buyback_prem(pos_short, last.start_time, last.close),
-                  last.start_time, last.close)
+            close(pos_short, "OPEN_AT_END", buyback_prem(pos_short, last_ts, last.close),
+                  last_ts, last.close)
         if pos_long is not None:
-            close(pos_long, "OPEN_AT_END", buyback_prem(pos_long, last.start_time, last.close),
-                  last.start_time, last.close)
+            close(pos_long, "OPEN_AT_END", buyback_prem(pos_long, last_ts, last.close),
+                  last_ts, last.close)
 
     trades.sort(key=lambda t: t["entry_time"])
     return trades
@@ -213,10 +257,13 @@ def report(trades: list[dict], args) -> None:
     side_txt = " [CE ONLY]" if args.ce_only else " [PE ONLY]" if args.pe_only else ""
     ha_txt = ", Heikin Ashi" if args.heikin_ashi else ", real candles"
     ema_txt = f", EMA{args.ema200_len} filter" if args.ema200_filter else ""
+    trend_txt = f", trend EMA{args.trend_fast_len}/{args.trend_slow_len} filter" if args.trend_filter else ""
+    trend_txt += "+flip-exit" if (args.trend_filter and args.trend_flip_exit) else ""
     roll_txt = ", rollover ON" if args.rollover else ""
+    wb_txt = ", weekend blackout (Sat 17:30-Sun 23:55)" if args.weekend_blackout else ""
     print(f"\n{'=' * 118}")
     print(f"Supertrend({args.atr_period},{args.factor:.0f}) Fixed-SL [OPTION SELL]{side_txt} -- {args.days}d, "
-          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{roll_txt}, "
+          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{roll_txt}{wb_txt}, "
           f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 118}")
     if not trades:
@@ -235,7 +282,7 @@ def report(trades: list[dict], args) -> None:
                                             if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "EOD", "OPEN_AT_END"):
+    for reason in ("SL", "TREND", "EOD", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -264,7 +311,9 @@ def export(trades: list[dict], args, path: str) -> None:
     srows = [
         ("days", args.days), ("atr_period", args.atr_period), ("factor", args.factor),
         ("heikin_ashi", args.heikin_ashi), ("ema200_filter", args.ema200_filter),
-        ("rollover", args.rollover),
+        ("trend_filter", args.trend_filter), ("trend_fast_len", args.trend_fast_len),
+        ("trend_slow_len", args.trend_slow_len), ("trend_flip_exit", args.trend_flip_exit),
+        ("rollover", args.rollover), ("weekend_blackout", args.weekend_blackout),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("legs_closed", len(closed)),
         ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
@@ -316,6 +365,23 @@ def main() -> None:
                    help="additional gate at the flip: bearish (CE) only if close < EMA200, bullish (PE) "
                         "only if close > EMA200. Disagreeing consumes the flip untraded.")
     p.add_argument("--ema200-len", type=int, default=200)
+    p.add_argument("--trend-filter", action="store_true",
+                   help="separate gate at the flip, combinable with --ema200-filter (both must agree): "
+                        "EMA(trend-fast-len) > EMA(trend-slow-len) is a POSITIVE trend -- only a bullish "
+                        "flip (PE) is allowed; NEGATIVE trend -- only a bearish flip (CE) is allowed. "
+                        "Disagreeing consumes the flip untraded.")
+    p.add_argument("--trend-fast-len", type=int, default=150)
+    p.add_argument("--trend-slow-len", type=int, default=600)
+    p.add_argument("--trend-flip-exit", action="store_true",
+                   help="SEPARATE toggle from --trend-filter (only takes effect when it's also on): "
+                        "force-close an open leg the instant the trend EMA relationship itself "
+                        "crosses, tagged TREND, instead of letting it ride to its frozen SL/EOD. "
+                        "Off (default) = --trend-filter alone only gates NEW entries.")
+    p.add_argument("--weekend-blackout", action="store_true",
+                   help="no NEW entry from Saturday 17:30 IST through Sunday 23:55 IST. The daily "
+                        "square-off already flattens any open leg by 17:25 every day, so this only "
+                        "ever suppresses a fresh flip signal (and a --rollover reopen). Off (default) "
+                        "= unchanged behavior.")
     p.add_argument("--rollover", action="store_true",
                    help="if a leg is closed ONLY by the daily square-off (its frozen SL was never "
                         "crossed), immediately sell a fresh option for the SAME side, keeping the SAME "

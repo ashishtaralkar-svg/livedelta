@@ -94,12 +94,14 @@ class _Dec:
     """Minimal stand-in for SupertrendFixedSlDecision -- lets tests drive
     _handle_closed_candle without reverse-engineering real Supertrend math."""
     def __init__(self, *, short_exit=False, long_exit=False, short_exit_price=0.0,
-                 long_exit_price=0.0, sell_signal=False, buy_signal=False,
-                 short_sl=None, long_sl=None):
+                 long_exit_price=0.0, short_trend_exit=False, long_trend_exit=False,
+                 sell_signal=False, buy_signal=False, short_sl=None, long_sl=None):
         self.short_exit = short_exit
         self.long_exit = long_exit
         self.short_exit_price = short_exit_price
         self.long_exit_price = long_exit_price
+        self.short_trend_exit = short_trend_exit
+        self.long_trend_exit = long_trend_exit
         self.sell_signal = sell_signal
         self.buy_signal = buy_signal
         self.short_sl = short_sl
@@ -177,6 +179,33 @@ async def test_sl_exit_on_one_leg_does_not_touch_the_other() -> None:
     assert not engine.executor_short.has_open_position
     assert engine.executor_long.has_open_position   # untouched
     assert engine.long.entry_premium == 1400.0       # long leg's tracking intact
+
+
+async def test_trend_flip_exit_is_tagged_trend_not_sl() -> None:
+    engine = _make_engine()
+    await engine._open_leg(engine.short, SignalDir.SHORT.value, 65000.0, 64000.0)
+    engine.strategy.update = lambda candle: _Dec(
+        short_exit=True, short_exit_price=64500.0, short_trend_exit=True)
+    await engine._handle_closed_candle(_c(900))
+    exits = _exit_calls(engine.notifier)
+    assert exits and exits[-1].kwargs["reason"] == "TREND"
+
+
+def test_trend_filter_settings_propagate_to_the_strategy() -> None:
+    engine = _make_engine(
+        supertrend_trend_filter=True, supertrend_trend_fast_len=50,
+        supertrend_trend_slow_len=200, supertrend_trend_flip_exit=True,
+    )
+    assert engine.strategy.trend_filter is True
+    assert engine.strategy.trend_fast_len == 50
+    assert engine.strategy.trend_slow_len == 200
+    assert engine.strategy.trend_flip_exit is True
+
+
+def test_trend_filter_settings_default_off() -> None:
+    engine = _make_engine()
+    assert engine.strategy.trend_filter is False
+    assert engine.strategy.trend_flip_exit is False
 
 
 async def test_double_close_guard() -> None:
