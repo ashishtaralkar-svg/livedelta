@@ -243,13 +243,14 @@ class Settings(BaseSettings):
 
     # SupertrendFixedSl (strategy="supertrend"): Supertrend(10,3) flip timing on
     # real (non-HA) OHLC, a FROZEN stop (read once at the flip, never re-derived
-    # from Supertrend's still-updating value), sell-only, NO profit target --
-    # the only exits are that frozen SL or the daily square-off. Unlike every
+    # from Supertrend's still-updating value), sell-only. Exits are that frozen
+    # SL, the daily square-off, or the premium-decay TP below. Unlike every
     # other bot, this one holds a CE and a PE leg SIMULTANEOUSLY as independent
     # contracts (see src/deltabot/strategy/supertrend_fixed_sl.py's own
     # docstring) -- the live engine tracks them via two separate
     # OptionsExecutor instances, not the shared option_side/take_profit_pct
-    # fields (those are unused here; always sell-mode, no TP setting at all).
+    # fields (those are unused here; always sell-mode -- see
+    # supertrend_take_profit_pct below for this strategy's OWN TP setting).
     # Best backtest (5m, sell, premium~1400, 25 lots, 1 week): +$65.56/27 legs.
     # Never executed a real order -- treat live results with real caution.
     supertrend_atr_period: int = 10
@@ -261,6 +262,20 @@ class Settings(BaseSettings):
     supertrend_trade_ce: bool = True
     supertrend_trade_pe: bool = True
     supertrend_debug_state: bool = False   # log a full strategy-state snapshot on every closed 5m candle
+
+    # Premium-decay TP (added on request): exit a leg once its option premium
+    # DECAYS by this % of the entry fill -- e.g. 70 means sold at 100 -> buy
+    # back at 30 (same "decay %" convention as the shared take_profit_pct used
+    # by dcv2/dcv3/dchannel/ema21). 0 = disabled (ride to SL/EOD only, the
+    # original behavior). Checked on every closed 5m candle AND via a separate
+    # poll (supertrend_tp_poll_seconds) so a poll never idles for the wrong
+    # value. When EITHER leg hits this TP, BOTH legs are blocked from new
+    # entries until supertrend_tp_block_hour:minute that same day (the leg
+    # that hit TP is simply flattened, not force-closed twice).
+    supertrend_take_profit_pct: float = 70.0
+    supertrend_tp_poll_seconds: float = 15.0   # poll each open leg's option mark (0 = only at 5m close)
+    supertrend_tp_block_hour: int = 17         # after ANY leg's TP hits, block new entries (both legs) until this time
+    supertrend_tp_block_minute: int = 30
 
     # trend_filter (+ trend_flip_exit): EMA(150) vs EMA(600) regime gate on
     # new entries, optionally also force-closing an open leg the instant the

@@ -5,16 +5,19 @@ supertrend_fixed_sl_strategy.pine).
 A bearish Supertrend(10,3) flip sells a CALL (CE) near --target-premium
 (default 1000); a bullish flip sells a PUT (PE). SL = Supertrend's own value
 AT THE FLIP, frozen for the life of that leg -- never re-derived from
-Supertrend's still-updating value. No profit target. Unlike the Pine chart
-(which can only hold one net BTC position), this backtest tracks the CE and
-PE legs as the independent contracts they are -- both can be open at once.
-Daily --square-off-hour/minute (default 17:25 IST, matching every other
-backtest in this repo) force-closes any still-open leg(s) -- added because
-each leg's premium history is only fetched for a ~3-day window around entry
-(see resolve_by_premium's win_start/win_end), so with no profit target and
-only a Supertrend flip to exit, a leg that never gets an opposing flip would
-otherwise sit "open" against stale, frozen premium data for however long the
-backtest runs. Intrinsic-value flooring is ON by default.
+Supertrend's still-updating value. Exits are that frozen SL, the daily
+square-off, or the premium-decay TP (--tp-pct, default 70 -- sold at 100,
+buy back at 30; 0 disables it). When EITHER leg's TP hits, BOTH legs are
+blocked from new entries until --tp-block-hour/minute (default 17:30) that
+same day. Unlike the Pine chart (which can only hold one net BTC position),
+this backtest tracks the CE and PE legs as the independent contracts they
+are -- both can be open at once. Daily --square-off-hour/minute (default
+17:25 IST, matching every other backtest in this repo) force-closes any
+still-open leg(s) -- added because each leg's premium history is only
+fetched for a ~3-day window around entry (see resolve_by_premium's
+win_start/win_end), so a leg that never gets an opposing flip, a TP, or an
+SL would otherwise sit "open" against stale, frozen premium data for
+however long the backtest runs. Intrinsic-value flooring is ON by default.
 
 --ema200-filter: additional gate at the flip -- bearish (CE) only if
 close < EMA200, bullish (PE) only if close > EMA200. Disagreeing consumes
@@ -85,6 +88,15 @@ def _in_weekend_blackout(ts: int) -> bool:
     return False
 
 
+def _tp_block_until(ts: int, hour: int, minute: int) -> int:
+    """Epoch seconds for ``ts``'s own IST calendar day at ``hour:minute``. If
+    ``ts`` is already at/past that time (square-off already ran), returns
+    ``ts`` itself -- a no-op block, mirroring the live engine's edge case."""
+    d = datetime.fromtimestamp(ts, tz=_IST)
+    target = d.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return ts if d >= target else int(target.timestamp())
+
+
 def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     strategy = SupertrendFixedSlStrategy(
         atr_period=args.atr_period, factor=args.factor,
@@ -107,10 +119,13 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
 
+    tp_mult = 1.0 - args.tp_pct / 100.0 if args.tp_pct > 0 else None
+
     cache: dict = {}
     trades: list[dict] = []
     pos_short: dict | None = None   # CE leg
     pos_long: dict | None = None    # PE leg
+    block_until: int = 0            # epoch secs; entries blocked while ts < this
 
     def open_leg(client, ts: int, btc_px: float, is_short: bool, tag: str = "ENTRY") -> dict | None:
         # is_short (CE/bearish) -> sell CALL; else (PE/bullish) -> sell PUT.
@@ -129,8 +144,9 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             return None
         if floor:
             entry_prem = max(entry_prem, op.intrinsic_value(sym, btc_px))
+        tp_price = entry_prem * tp_mult if tp_mult is not None else None
         return {"is_short": is_short, "sym": sym, "candles": ocandles, "entry_time": ts,
-                "entry_btc": btc_px, "entry_prem": entry_prem, "tag": tag}
+                "entry_btc": btc_px, "entry_prem": entry_prem, "tp_price": tp_price, "tag": tag}
 
     def buyback_prem(pos: dict, ts: int, exit_btc: float) -> float:
         p = op.premium_at(pos["candles"], ts, step)
@@ -194,6 +210,25 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                       decision_ts, dec.long_exit_price)
                 pos_long = None
 
+            # Premium-decay TP (mark check on the closed bar, using the SAME
+            # premium history already fetched for that leg). When EITHER leg
+            # hits, BOTH legs are blocked from new entries until
+            # --tp-block-hour/minute that day (see run()'s tp_mult comment).
+            if pos_short is not None and pos_short["tp_price"] is not None:
+                p = op.premium_at(pos_short["candles"], decision_ts, step)
+                if p is not None and p <= pos_short["tp_price"]:
+                    close(pos_short, "TP", p, decision_ts, c.close)
+                    pos_short = None
+                    strategy.force_flat_short()
+                    block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
+            if pos_long is not None and pos_long["tp_price"] is not None:
+                p = op.premium_at(pos_long["candles"], decision_ts, step)
+                if p is not None and p <= pos_long["tp_price"]:
+                    close(pos_long, "TP", p, decision_ts, c.close)
+                    pos_long = None
+                    strategy.force_flat_long()
+                    block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
+
             # Daily square-off: closes any still-open leg(s) so they never
             # ride on stale premium data past resolve_by_premium's ~3-day
             # fetch window (see module docstring). Without --rollover this
@@ -224,15 +259,16 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                     else:
                         strategy.force_flat_long()
 
+            tp_blocked = decision_ts < block_until
             if dec is not None and dec.sell_signal and pos_short is None:
-                if c.start_time < sim_start or blackout:
+                if c.start_time < sim_start or blackout or tp_blocked:
                     strategy.force_flat_short()
                 else:
                     pos_short = open_leg(client, decision_ts, c.close, is_short=True)
                     if pos_short is None:
                         strategy.force_flat_short()
             if dec is not None and dec.buy_signal and pos_long is None:
-                if c.start_time < sim_start or blackout:
+                if c.start_time < sim_start or blackout or tp_blocked:
                     strategy.force_flat_long()
                 else:
                     pos_long = open_leg(client, decision_ts, c.close, is_short=False)
@@ -261,10 +297,12 @@ def report(trades: list[dict], args) -> None:
     trend_txt += "+flip-exit" if (args.trend_filter and args.trend_flip_exit) else ""
     roll_txt = ", rollover ON" if args.rollover else ""
     wb_txt = ", weekend blackout (Sat 17:30-Sun 23:55)" if args.weekend_blackout else ""
+    tp_txt = (f", TP{args.tp_pct:.0f}%->block till {args.tp_block_hour}:{args.tp_block_minute:02d}"
+              if args.tp_pct > 0 else "")
     print(f"\n{'=' * 118}")
     print(f"Supertrend({args.atr_period},{args.factor:.0f}) Fixed-SL [OPTION SELL]{side_txt} -- {args.days}d, "
-          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{roll_txt}{wb_txt}, "
-          f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
+          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{roll_txt}{wb_txt}"
+          f"{tp_txt}, floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 118}")
     if not trades:
         print("No trades.")
@@ -282,7 +320,7 @@ def report(trades: list[dict], args) -> None:
                                             if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "TREND", "EOD", "OPEN_AT_END"):
+    for reason in ("SL", "TP", "TREND", "EOD", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -314,6 +352,8 @@ def export(trades: list[dict], args, path: str) -> None:
         ("trend_filter", args.trend_filter), ("trend_fast_len", args.trend_fast_len),
         ("trend_slow_len", args.trend_slow_len), ("trend_flip_exit", args.trend_flip_exit),
         ("rollover", args.rollover), ("weekend_blackout", args.weekend_blackout),
+        ("tp_pct", args.tp_pct), ("tp_block_hour", args.tp_block_hour),
+        ("tp_block_minute", args.tp_block_minute),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("legs_closed", len(closed)),
         ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
@@ -387,6 +427,16 @@ def main() -> None:
                         "crossed), immediately sell a fresh option for the SAME side, keeping the SAME "
                         "frozen SL. A leg that closed via a real SL cross this same bar never rolls. "
                         "Off (default) = every square-off just ends the leg.")
+    p.add_argument("--tp-pct", type=float, default=70.0,
+                   help="premium-decay TP: exit a leg once its option premium decays by this %% "
+                        "of the entry fill (sold at 100, 70%% decay -> buy back at 30). Checked "
+                        "on every candle close using the same premium history already fetched "
+                        "for that leg. 0 = disabled (ride to SL/EOD only, the original behavior). "
+                        "When EITHER leg's TP hits, BOTH legs are blocked from new entries until "
+                        "--tp-block-hour/--tp-block-minute that same day -- a blocked flip is "
+                        "consumed untraded via force_flat, same treatment as --weekend-blackout.")
+    p.add_argument("--tp-block-hour", type=int, default=17)
+    p.add_argument("--tp-block-minute", type=int, default=30)
     args = p.parse_args()
     if args.ce_only and args.pe_only:
         raise SystemExit("--ce-only and --pe-only are mutually exclusive")

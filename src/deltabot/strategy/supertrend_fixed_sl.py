@@ -23,7 +23,14 @@ Rules (CE/bearish side; PE/bullish is the exact mirror):
     while a CE leg is ALREADY open (no pyramiding into the same contract).
   * SL = Supertrend's OWN VALUE on the flip bar, frozen from that point on
     -- never re-read from Supertrend's live value on later bars.
-  * Real price crossing that frozen level closes the leg. NO profit target.
+  * Real price crossing that frozen level closes the leg. This CLASS itself
+    has no profit-target concept -- it only knows BTC candles, not option
+    premiums. The premium-decay TP (exit once the sold option's premium
+    decays X%, then block new entries until a cutoff time) is a caller-side
+    concern layered on top: see supertrend_trader.py's tp_price/_tp_poll_loop
+    for live, or scripts/backtest_supertrend_fixed_sl.py's --tp-pct for
+    backtests. Both call force_flat_short()/force_flat_long() on this class
+    after a TP exit, same as any other out-of-band flatten.
   * A CE leg and a PE leg can be open simultaneously (independent
     contracts); each has its own frozen SL and closes independently.
 

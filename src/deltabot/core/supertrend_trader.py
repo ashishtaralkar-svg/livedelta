@@ -3,8 +3,12 @@
 Runs SupertrendFixedSlStrategy on 5-minute BTC candles: a bearish Supertrend
 (10,3) flip SELLS a CALL near ``target_premium``, a bullish flip SELLS a PUT.
 SL = Supertrend's own value AT THE FLIP, frozen for the life of that leg --
-never re-derived from Supertrend's still-updating value. NO profit target --
-the only exits are that frozen SL or the daily square-off.
+never re-derived from Supertrend's still-updating value. Exits are that
+frozen SL, the daily square-off, or the premium-decay TP (see
+``settings.supertrend_take_profit_pct``): once EITHER leg's option premium
+decays by that %, that leg is flattened and BOTH legs are blocked from new
+entries until ``supertrend_tp_block_hour:minute`` (default 17:30) that same
+day -- a fresh flip after that time re-arms normally.
 
 KEY DIFFERENCE FROM EVERY OTHER ENGINE IN THIS REPO (dcv2/dcv3/dchannel/
 revbreak/tcp/ema21): a CE (short) leg and a PE (long) leg can be open AT THE
@@ -19,10 +23,12 @@ instances against the same rest/settings is safe.
 OTHER DIFFERENCES FROM ema21_trader.py (which this otherwise mirrors --
 closed-bar only, no intracandle, no rollover, entry gating lives inside the
 strategy itself):
-  * NO TP POLL LOOP -- this strategy has no profit target at all, so there is
-    nothing to poll for. A dedicated periodic self-heal loop replaces it
-    (ema21bot/dcv2bot/dcv3bot piggyback self-heal on their TP-poll timer;
-    this bot has no such timer to piggyback on).
+  * TP POLL LOOP COVERS BOTH LEGS -- unlike every other bot's single-leg TP
+    poll, ``_tp_poll_loop`` here checks the short and long leg's option mark
+    independently each tick (either, both, or neither may have a tp_price
+    armed at a given moment). A separate self-heal loop still runs
+    alongside it (see ``_verify_loop``), unlike ema21bot/dcv2bot/dcv3bot
+    which piggyback self-heal on their single TP-poll timer.
   * RECONCILE must disambiguate CE vs PE by SYMBOL PREFIX, not sign -- both
     legs are short (size < 0) on the exchange, so sign alone can't tell them
     apart (every other engine only ever has one leg to find, so sign alone
@@ -82,6 +88,7 @@ class _Leg:
         self.executor = executor
         self.state_file = state_file
         self.entry_premium: float | None = None
+        self.tp_price: float | None = None
         self.entry_in_progress = False
         self.closing = False
         self.verify_misses = 0
@@ -124,7 +131,11 @@ class SupertrendFixedSlEngine:
         self._tasks: set[asyncio.Task] = set()
         self._sq_off_task: asyncio.Task | None = None
         self._verify_task: asyncio.Task | None = None
+        self._tp_poll_task: asyncio.Task | None = None
         self._sq_off_date: date | None = None
+        # Epoch seconds; new entries (both legs) blocked while time.time() is
+        # below this. Set whenever EITHER leg's premium-decay TP fires.
+        self._block_entries_until: float = 0.0
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -146,13 +157,15 @@ class SupertrendFixedSlEngine:
         self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
         if self.settings.position_verify_seconds > 0:
             self._verify_task = asyncio.create_task(self._verify_loop())
+        if self.settings.supertrend_tp_poll_seconds > 0:
+            self._tp_poll_task = asyncio.create_task(self._tp_poll_loop())
         log.info("SupertrendFixedSlEngine: starting live (dual-leg SELL)")
         await self.ws.run()
 
     async def stop(self) -> None:
         if self.ws:
             self.ws.stop()
-        for t in (self._sq_off_task, self._verify_task):
+        for t in (self._sq_off_task, self._verify_task, self._tp_poll_task):
             if t is not None:
                 t.cancel()
         if self.settings.close_on_shutdown:
@@ -253,12 +266,67 @@ class SupertrendFixedSlEngine:
             reason = "TREND" if dec.long_trend_exit else "SL"
             await self._close_leg(self.long, reason, dec.long_exit_price)
 
+        # Premium-decay TP (mark check on the closed bar; the poll also runs
+        # independently between candles). Checked before entries so a TP this
+        # same bar can't be immediately masked by a fresh flip.
+        for leg in (self.short, self.long):
+            await self._maybe_tp_leg(leg)
+
         if (dec.sell_signal and not self.executor_short.has_open_position
                 and not self._entries_blocked()):
             await self._open_leg(self.short, SignalDir.SHORT.value, dec.short_sl, candle.close)
         if (dec.buy_signal and not self.executor_long.has_open_position
                 and not self._entries_blocked()):
             await self._open_leg(self.long, SignalDir.LONG.value, dec.long_sl, candle.close)
+
+    # ------------------------------------------------------------------ #
+    async def _tp_poll_loop(self) -> None:
+        interval = self.settings.supertrend_tp_poll_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                raise
+            for leg in (self.short, self.long):
+                await self._maybe_tp_leg(leg)
+
+    async def _maybe_tp_leg(self, leg: _Leg) -> None:
+        """Premium-decay TP: if this leg's option mark has fallen to/through
+        its tp_price, flatten it and block NEW entries on BOTH legs until
+        supertrend_tp_block_hour:minute today (see module docstring)."""
+        if leg.closing or leg.tp_price is None or not leg.executor.has_open_position:
+            return
+        symbol = leg.executor.tracked_symbol
+        if not symbol:
+            return
+        try:
+            mark = await asyncio.to_thread(self.rest.get_mark_price, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supertrend: TP mark fetch failed",
+                       extra={"extra": {"leg": leg.name, "error": str(exc)}})
+            return
+        if mark is None or mark > leg.tp_price:
+            return
+        log.info("Supertrend: premium-decay TP hit",
+                 extra={"extra": {"leg": leg.name, "mark": mark, "tp": leg.tp_price}})
+        await self._close_leg(leg, "TP", mark)
+        if leg.name == "short":
+            self.strategy.force_flat_short()
+        else:
+            self.strategy.force_flat_long()
+        self._block_entries_until = self._compute_block_until()
+        log.info("Supertrend: TP hit — new entries blocked until block time",
+                 extra={"extra": {"leg": leg.name,
+                                   "until_ist": datetime.fromtimestamp(
+                                       self._block_entries_until, _IST).isoformat()}})
+
+    def _compute_block_until(self) -> float:
+        now = datetime.now(_IST)
+        target = now.replace(hour=self.settings.supertrend_tp_block_hour,
+                             minute=self.settings.supertrend_tp_block_minute, second=0, microsecond=0)
+        if now >= target:
+            return time.time()  # already past today's cutoff (square-off already ran) -- no-op block
+        return target.timestamp()
 
     # ------------------------------------------------------------------ #
     async def _verify_loop(self) -> None:
@@ -307,6 +375,7 @@ class SupertrendFixedSlEngine:
         if leg.state_file:
             position_state.clear(leg.state_file)
         leg.entry_premium = None
+        leg.tp_price = None
         leg.verify_misses = 0
         if leg.name == "short":
             self.strategy.force_flat_short()
@@ -340,6 +409,7 @@ class SupertrendFixedSlEngine:
             gross = ((entry_prem - fill) * lots * 0.001
                      if (entry_prem is not None and fill is not None) else 0.0)
             leg.entry_premium = None
+            leg.tp_price = None
             side_label = "sell CE" if leg.name == "short" else "sell PE"
             log.info("Supertrend exit", extra={"extra": {
                 "leg": leg.name, "reason": reason, "contract": contract, "btc_exit": btc_exit_price}})
@@ -393,21 +463,24 @@ class SupertrendFixedSlEngine:
                 return
 
             leg.entry_premium = fill
+            tp_pct = self.settings.supertrend_take_profit_pct
+            leg.tp_price = fill * (1.0 - tp_pct / 100.0) if tp_pct > 0 else None
             if leg.state_file:
                 position_state.save(
                     leg.state_file, symbol=symbol or "",
                     product_id=leg.executor.tracked_product_id,
                     size=self.settings.option_contracts, entry_premium=fill,
-                    direction=signal_dir,
+                    tp_price=leg.tp_price, direction=signal_dir,
                 )
             direction = "PUT" if is_buy_signal else "CALL"   # SELL side mapping
             log.info("Supertrend entry", extra={"extra": {
                 "leg": leg.name, "direction": direction, "symbol": symbol, "fill": fill,
-                "sl_level": sl_level}})
+                "sl_level": sl_level, "tp_price": leg.tp_price}})
             event = NotifyEvent.ENTRY_LONG if is_buy_signal else NotifyEvent.ENTRY_SHORT
             await self.notifier.notify(
                 event, direction=direction, contract=symbol or "?",
-                premium=fill, btc_price=btc_price, sl_level=sl_level, side="sell",
+                premium=fill, btc_price=btc_price, sl_level=sl_level,
+                tp_price=leg.tp_price, side="sell",
             )
         finally:
             leg.entry_in_progress = False
@@ -438,6 +511,7 @@ class SupertrendFixedSlEngine:
             match = next((p for p in found if p.get("symbol") == owned_symbol), found[0])
             if saved and match.get("symbol") == owned_symbol:
                 leg.entry_premium = saved.get("entry_premium")
+                leg.tp_price = saved.get("tp_price")
             leg.executor.adopt(match["product_id"], match["size"], opt_type, match.get("symbol"))
             log.info("Supertrend reconcile: adopted open leg",
                      extra={"extra": {"leg": leg.name, "symbol": match["symbol"]}})
@@ -446,6 +520,7 @@ class SupertrendFixedSlEngine:
         if believe_owned:
             if not leg.executor.has_open_position and saved and saved.get("product_id"):
                 leg.entry_premium = saved.get("entry_premium")
+                leg.tp_price = saved.get("tp_price")
                 leg.executor.adopt(int(saved["product_id"]), int(saved.get("size") or 0),
                                    opt_type, owned_symbol)
             log.warning("Supertrend reconcile: leg not returned by exchange — preserving "
@@ -456,6 +531,7 @@ class SupertrendFixedSlEngine:
 
         leg.executor.clear()
         leg.entry_premium = None
+        leg.tp_price = None
         # force_flat_short()/force_flat_long() are no-ops if that side was
         # already flat, so it's always safe to call unconditionally here.
         if leg.name == "short":
@@ -470,7 +546,9 @@ class SupertrendFixedSlEngine:
     # Daily 17:25 square-off -- plain close of both legs, no rollover.
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
-        return datetime.now(_IST).weekday() in self.settings.skip_weekday_ints
+        if datetime.now(_IST).weekday() in self.settings.skip_weekday_ints:
+            return True
+        return time.time() < self._block_entries_until
 
     async def _square_off_scheduler(self) -> None:
         while True:
