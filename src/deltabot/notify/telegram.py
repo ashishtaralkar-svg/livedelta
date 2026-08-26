@@ -53,8 +53,12 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
                 f"{prem_label}: {_num(ctx.get('premium'))}\n"
                 f"BTC: {_num(ctx.get('btc_price'))}"
             )
-            if ctx.get("sl_level") is not None:
+            if ctx.get("sl_level") is not None and ctx.get("tp_price") is not None:
                 msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
+            elif ctx.get("sl_level") is not None:
+                msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}"
+            elif ctx.get("tp_price") is not None:
+                msg += f"\nOpt TP: {_num(ctx.get('tp_price'))}"
             return msg
         return f"{emoji} <b>ENTRY {ctx.get('direction')}</b> {ctx.get('symbol')} @ {ctx.get('price'):.2f}"
     if event == NotifyEvent.SKIPPED:

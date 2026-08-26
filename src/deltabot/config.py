@@ -290,6 +290,26 @@ class Settings(BaseSettings):
     supertrend_trend_slow_len: int = 600
     supertrend_trend_flip_exit: bool = False
 
+    # Straddle4pm (strategy="straddle"): NO BTC-price signal at all -- a fixed
+    # daily entry TIME instead (default 16:00 IST). Buys a CALL and a PUT near
+    # the shared target_premium (~100 each) as two independent legs -- a
+    # classic long straddle. Whichever leg's premium first reaches
+    # straddle_exit_target (a FIXED ABSOLUTE value, e.g. 250 -- NOT a % of
+    # entry, unlike every other TP in this repo) is closed at target, and the
+    # OTHER leg is closed alongside it immediately at whatever it's currently
+    # worth. Neither leg has its own SL -- max loss per leg is capped at the
+    # premium paid (buying, not selling). If neither leg reaches target, the
+    # normal square_off_hour/minute closes both. See strategy/straddle.py's
+    # own docstring. Set option_side=buy and target_premium=~100 in this bot's
+    # own env file. Never executed a real order -- treat live results with
+    # real caution.
+    straddle_entry_hour: int = 16
+    straddle_entry_minute: int = 0
+    straddle_entry_grace_minutes: int = 15
+    straddle_exit_target: float = 250.0
+    straddle_tp_poll_seconds: float = 15.0
+    straddle_debug_state: bool = False
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

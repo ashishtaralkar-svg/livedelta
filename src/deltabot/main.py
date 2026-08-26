@@ -12,6 +12,7 @@ from .core.dcv3_trader import DCv3Engine
 from .core.ema21_trader import Ema21BreakdownEngine
 from .core.heikin_ashi_trader import HeikinAshiEngine
 from .core.revbreak_trader import RevBreakSellEngine
+from .core.straddle_trader import StraddleEngine
 from .core.supertrend_trader import SupertrendFixedSlEngine
 from .core.tcp_trader import TCPEngine
 from .enums import NotifyEvent
@@ -46,6 +47,8 @@ async def run(settings: Settings) -> None:
         engine = Ema21BreakdownEngine(settings, rest, notifier)
     elif settings.strategy == "supertrend":
         engine = SupertrendFixedSlEngine(settings, rest, notifier)
+    elif settings.strategy == "straddle":
+        engine = StraddleEngine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)
