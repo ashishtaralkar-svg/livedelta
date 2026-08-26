@@ -270,12 +270,20 @@ class Settings(BaseSettings):
     # original behavior). Checked on every closed 5m candle AND via a separate
     # poll (supertrend_tp_poll_seconds) so a poll never idles for the wrong
     # value. When EITHER leg hits this TP, BOTH legs are blocked from new
-    # entries until supertrend_tp_block_hour:minute that same day (the leg
-    # that hit TP is simply flattened, not force-closed twice).
+    # entries until EITHER supertrend_tp_block_hour:minute that same day, OR
+    # (if supertrend_tp_block_on_trend_flip=true) until the trend_filter's
+    # own EMA(fast)/EMA(slow) relationship itself reverses from whatever it
+    # was AT THE MOMENT the TP fired -- whichever mode you pick, not both;
+    # the hour:minute fields are simply ignored when trend-flip mode is on.
+    # Trend-flip mode only makes sense combined with trend_filter=true (the
+    # regime it's waiting on) -- with trend_filter off it still tracks the
+    # SAME EMA(fast)/EMA(slow) crossover, just without also gating entries
+    # on it. The leg that hit TP is simply flattened, not force-closed twice.
     supertrend_take_profit_pct: float = 70.0
     supertrend_tp_poll_seconds: float = 15.0   # poll each open leg's option mark (0 = only at 5m close)
-    supertrend_tp_block_hour: int = 17         # after ANY leg's TP hits, block new entries (both legs) until this time
+    supertrend_tp_block_hour: int = 17    # after a TP hit, block new entries (both legs) until this time
     supertrend_tp_block_minute: int = 30
+    supertrend_tp_block_on_trend_flip: bool = False  # replaces hour:minute block with "until EMA reverses"
 
     # trend_filter (+ trend_flip_exit): EMA(150) vs EMA(600) regime gate on
     # new entries, optionally also force-closing an open leg the instant the

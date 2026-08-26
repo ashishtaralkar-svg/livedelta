@@ -263,6 +263,18 @@ class SupertrendFixedSlStrategy:
         return self._warmup_bars >= need
 
     @property
+    def trend_positive(self) -> bool | None:
+        """EMA(trend_fast_len) > EMA(trend_slow_len) right now, or None
+        before either has a value yet. Always live (computed every bar
+        regardless of trend_filter), so a caller can gate on the CURRENT
+        regime -- e.g. re-arming new entries only after this flips -- even
+        when trend_filter itself is off."""
+        fv, sv = self._ema_fast._value, self._ema_slow._value
+        if fv is None or sv is None:
+            return None
+        return fv > sv
+
+    @property
     def in_short(self) -> bool:
         return self._in_short
 

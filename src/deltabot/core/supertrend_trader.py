@@ -7,8 +7,11 @@ never re-derived from Supertrend's still-updating value. Exits are that
 frozen SL, the daily square-off, or the premium-decay TP (see
 ``settings.supertrend_take_profit_pct``): once EITHER leg's option premium
 decays by that %, that leg is flattened and BOTH legs are blocked from new
-entries until ``supertrend_tp_block_hour:minute`` (default 17:30) that same
-day -- a fresh flip after that time re-arms normally.
+entries until EITHER ``supertrend_tp_block_hour:minute`` (default 17:30)
+that same day, OR (if ``supertrend_tp_block_on_trend_flip`` is on instead)
+until the trend_filter's own EMA(fast)/EMA(slow) relationship reverses from
+whatever it was at the moment the TP fired -- see ``strategy.trend_positive``
+and ``_entries_blocked()`` below.
 
 KEY DIFFERENCE FROM EVERY OTHER ENGINE IN THIS REPO (dcv2/dcv3/dchannel/
 revbreak/tcp/ema21): a CE (short) leg and a PE (long) leg can be open AT THE
@@ -134,8 +137,15 @@ class SupertrendFixedSlEngine:
         self._tp_poll_task: asyncio.Task | None = None
         self._sq_off_date: date | None = None
         # Epoch seconds; new entries (both legs) blocked while time.time() is
-        # below this. Set whenever EITHER leg's premium-decay TP fires.
+        # below this. Set whenever EITHER leg's premium-decay TP fires
+        # (ignored when supertrend_tp_block_on_trend_flip is on -- see that
+        # field below instead).
         self._block_entries_until: float = 0.0
+        # The trend_positive value AT THE MOMENT a TP fired, when
+        # supertrend_tp_block_on_trend_flip is on. New entries stay blocked
+        # while strategy.trend_positive still equals this value; None means
+        # no trend-flip block is currently armed.
+        self._block_until_trend_positive: bool | None = None
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -314,11 +324,17 @@ class SupertrendFixedSlEngine:
             self.strategy.force_flat_short()
         else:
             self.strategy.force_flat_long()
-        self._block_entries_until = self._compute_block_until()
-        log.info("Supertrend: TP hit — new entries blocked until block time",
-                 extra={"extra": {"leg": leg.name,
-                                   "until_ist": datetime.fromtimestamp(
-                                       self._block_entries_until, _IST).isoformat()}})
+        if self.settings.supertrend_tp_block_on_trend_flip:
+            self._block_until_trend_positive = self.strategy.trend_positive
+            log.info("Supertrend: TP hit — new entries blocked until EMA(fast)/EMA(slow) reverses",
+                     extra={"extra": {"leg": leg.name,
+                                       "trend_positive_now": self._block_until_trend_positive}})
+        else:
+            self._block_entries_until = self._compute_block_until()
+            log.info("Supertrend: TP hit — new entries blocked until block time",
+                     extra={"extra": {"leg": leg.name,
+                                       "until_ist": datetime.fromtimestamp(
+                                           self._block_entries_until, _IST).isoformat()}})
 
     def _compute_block_until(self) -> float:
         now = datetime.now(_IST)
@@ -548,6 +564,14 @@ class SupertrendFixedSlEngine:
     def _entries_blocked(self) -> bool:
         if datetime.now(_IST).weekday() in self.settings.skip_weekday_ints:
             return True
+        if self.settings.supertrend_tp_block_on_trend_flip:
+            if self._block_until_trend_positive is None:
+                return False
+            current = self.strategy.trend_positive
+            if current is None or current == self._block_until_trend_positive:
+                return True
+            self._block_until_trend_positive = None   # regime has reversed -- release, one-shot
+            return False
         return time.time() < self._block_entries_until
 
     async def _square_off_scheduler(self) -> None:

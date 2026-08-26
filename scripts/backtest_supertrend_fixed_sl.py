@@ -125,7 +125,8 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     trades: list[dict] = []
     pos_short: dict | None = None   # CE leg
     pos_long: dict | None = None    # PE leg
-    block_until: int = 0            # epoch secs; entries blocked while ts < this
+    block_until: int = 0            # epoch secs; entries blocked while ts<this (skipped in trend-flip mode)
+    block_trend: bool | None = None  # trend_positive AT THE TP; entries blocked while it still matches
 
     def open_leg(client, ts: int, btc_px: float, is_short: bool, tag: str = "ENTRY") -> dict | None:
         # is_short (CE/bearish) -> sell CALL; else (PE/bullish) -> sell PUT.
@@ -220,14 +221,20 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                     close(pos_short, "TP", p, decision_ts, c.close)
                     pos_short = None
                     strategy.force_flat_short()
-                    block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
+                    if args.tp_block_on_trend_flip:
+                        block_trend = strategy.trend_positive
+                    else:
+                        block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
             if pos_long is not None and pos_long["tp_price"] is not None:
                 p = op.premium_at(pos_long["candles"], decision_ts, step)
                 if p is not None and p <= pos_long["tp_price"]:
                     close(pos_long, "TP", p, decision_ts, c.close)
                     pos_long = None
                     strategy.force_flat_long()
-                    block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
+                    if args.tp_block_on_trend_flip:
+                        block_trend = strategy.trend_positive
+                    else:
+                        block_until = _tp_block_until(decision_ts, args.tp_block_hour, args.tp_block_minute)
 
             # Daily square-off: closes any still-open leg(s) so they never
             # ride on stale premium data past resolve_by_premium's ~3-day
@@ -259,7 +266,18 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                     else:
                         strategy.force_flat_long()
 
-            tp_blocked = decision_ts < block_until
+            if args.tp_block_on_trend_flip:
+                if block_trend is None:
+                    tp_blocked = False
+                else:
+                    current_trend = strategy.trend_positive
+                    if current_trend is None or current_trend == block_trend:
+                        tp_blocked = True
+                    else:
+                        block_trend = None   # regime has reversed -- release, one-shot
+                        tp_blocked = False
+            else:
+                tp_blocked = decision_ts < block_until
             if dec is not None and dec.sell_signal and pos_short is None:
                 if c.start_time < sim_start or blackout or tp_blocked:
                     strategy.force_flat_short()
@@ -297,8 +315,9 @@ def report(trades: list[dict], args) -> None:
     trend_txt += "+flip-exit" if (args.trend_filter and args.trend_flip_exit) else ""
     roll_txt = ", rollover ON" if args.rollover else ""
     wb_txt = ", weekend blackout (Sat 17:30-Sun 23:55)" if args.weekend_blackout else ""
-    tp_txt = (f", TP{args.tp_pct:.0f}%->block till {args.tp_block_hour}:{args.tp_block_minute:02d}"
-              if args.tp_pct > 0 else "")
+    tp_block_txt = ("block till trend flip" if args.tp_block_on_trend_flip
+                     else f"block till {args.tp_block_hour}:{args.tp_block_minute:02d}")
+    tp_txt = f", TP{args.tp_pct:.0f}%->{tp_block_txt}" if args.tp_pct > 0 else ""
     print(f"\n{'=' * 118}")
     print(f"Supertrend({args.atr_period},{args.factor:.0f}) Fixed-SL [OPTION SELL]{side_txt} -- {args.days}d, "
           f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{roll_txt}{wb_txt}"
@@ -354,6 +373,7 @@ def export(trades: list[dict], args, path: str) -> None:
         ("rollover", args.rollover), ("weekend_blackout", args.weekend_blackout),
         ("tp_pct", args.tp_pct), ("tp_block_hour", args.tp_block_hour),
         ("tp_block_minute", args.tp_block_minute),
+        ("tp_block_on_trend_flip", args.tp_block_on_trend_flip),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("legs_closed", len(closed)),
         ("win_rate_pct", round(100.0 * len(wins) / len(closed), 1) if closed else 0.0),
@@ -437,6 +457,12 @@ def main() -> None:
                         "consumed untraded via force_flat, same treatment as --weekend-blackout.")
     p.add_argument("--tp-block-hour", type=int, default=17)
     p.add_argument("--tp-block-minute", type=int, default=30)
+    p.add_argument("--tp-block-on-trend-flip", action="store_true",
+                   help="replace the hour:minute block above with: after a TP, block new entries "
+                        "until trend_filter's own EMA(fast)/EMA(slow) relationship reverses from "
+                        "whatever it was at the moment the TP fired. Makes most sense combined "
+                        "with --trend-filter (the regime it's waiting on); tracks the same "
+                        "EMA(fast)/EMA(slow) crossover either way. Off (default) = hour:minute block.")
     args = p.parse_args()
     if args.ce_only and args.pe_only:
         raise SystemExit("--ce-only and --pe-only are mutually exclusive")
