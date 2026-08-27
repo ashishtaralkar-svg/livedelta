@@ -1,0 +1,220 @@
+//@version=5
+// ============================================================================
+// EMA(9/15) CROSSDOWN-PULLBACK BUY — BTC, intended for the 5-minute chart.
+// BUY-ONLY (no shorts at all).
+//
+// RULES (as specified):
+//   * EMA(9) and EMA(15) on real close.
+//   * STAGE 0 -> 1: wait for EMA9 to cross DOWN below EMA15 (bearish cross).
+//     Mark "crossdownLevel" = EMA9's value on that bar (drawn as a line).
+//   * STAGE 1 -> 2 (CONDITION 1): wait for EMA9 to cross back UP above
+//     EMA15 (bullish cross). Mark "crossoverLevel" = EMA9's value on that
+//     bar. Condition 1 requires crossdownLevel > crossoverLevel (the EMAs
+//     net DECLINED across the dip -- confirms a real V, not flat chop). If
+//     it fails, DISCARD and go back to hunting a fresh crossdown (stage 0).
+//   * STAGE 2 (CONDITION 2): from the crossover bar onward, wait for a
+//     candle whose range TOUCHES EMA9 (low <= ema9 <= high). While waiting,
+//     continuously track the running highest high seen since the crossover
+//     -- that becomes CONDITION 3 the instant the touch happens. Alongside
+//     it, track the lowest low seen SINCE WHATEVER BAR MADE THAT RUNNING
+//     HIGH (reset every time a new running high is made) -- this becomes
+//     the SL basis once the touch fires (see SL below).
+//   * CONDITION 3: the running highest high described above, frozen the
+//     instant CONDITION 2 (the touch) fires.
+//   * STAGE 3: wait for a candle to CLOSE above CONDITION 3. That close is
+//     the BUY TRIGGER -- entry = this bar's close.
+//   * SL: the lowest low from wherever CONDITION 3's high was made through
+//     to the touch candle (the running low-since-high described above),
+//     frozen at the touch -- NOT extended further during stage 3's wait.
+//   * TARGET: 1:1 risk-reward -- entry + (entry - SL).
+//
+// ADDED BEYOND THE LITERAL SPEC (flagged, same convention as every other
+// strategy in this repo):
+//   * Stage 2 invalidation: if EMA9 crosses back DOWN below EMA15 before
+//     the touch ever happens, the setup's whole premise (still in the
+//     recovered uptrend) is broken -- discard, back to hunting a fresh
+//     crossdown.
+//   * Stage 3 invalidation: while waiting for the close-above trigger, (a)
+//     a fresh EMA9-under-EMA15 cross, or (b) price already touching the
+//     pending SL before ever closing above CONDITION 3, both discard the
+//     setup untraded (entering a breakout that already hit its own stop
+//     first makes no sense -- same guard ema21_rejection_pullback_strategy
+//     uses).
+//   * Single-position, BUY-only, flat-gated hunting (same convention as
+//     every other strategy here) -- no pyramiding, no shorts.
+//
+// NOT YET BACKTESTED -- a fresh port, not a validated strategy.
+// ============================================================================
+strategy("EMA(9/15) Crossdown-Pullback Buy",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Inputs
+// ============================================================
+fastLen  = input.int(9,  "Fast EMA Length", minval=1)
+slowLen  = input.int(15, "Slow EMA Length", minval=1)
+riskReward = input.float(1.0, "Target (multiple of risk)", minval=0.1)
+
+// ============================================================
+// EMA(9) / EMA(15) on real close.
+// ============================================================
+ema9  = ta.ema(close, fastLen)
+ema15 = ta.ema(close, slowLen)
+plot(ema9,  "EMA 9",  color=color.new(color.aqua, 0),   linewidth=2)
+plot(ema15, "EMA 15", color=color.new(color.orange, 0), linewidth=2)
+
+crossDown = ta.crossunder(ema9, ema15)
+crossUp   = ta.crossover(ema9, ema15)
+
+// ============================================================
+// State — a strictly sequential 4-stage machine:
+//   0 = hunting for a crossdown
+//   1 = crossdown seen, hunting for the crossover (condition 1)
+//   2 = condition 1 confirmed, hunting for the EMA9 touch (condition 2/3)
+//   3 = condition 2/3 set, hunting for the close-above trigger
+// ============================================================
+var int   stage          = 0
+var float crossdownLevel = na
+var float crossoverLevel = na
+var float rangeHigh      = na   // running high since crossover -> becomes condition 3
+var float lowSinceHigh   = na   // running low since rangeHigh's own bar -> becomes SL basis
+var float pendingSL      = na
+var float pendingEntryLevel = na   // = condition 3, frozen
+
+var float activeSL     = na
+var float activeTarget = na
+
+buyFired = false
+exitFired = false
+exitReason = ""
+exitPrice = 0.0
+firedEntryPrice = 0.0
+firedTargetPrice = 0.0
+
+// ----- 1. Exits: fixed SL / TARGET only, checked before any new hunting. -----
+if strategy.position_size > 0
+    if not na(activeSL) and low <= activeSL
+        strategy.close("Long", comment="SL")
+        exitFired := true
+        exitReason := "SL"
+        exitPrice := activeSL
+        activeSL := na
+        activeTarget := na
+    else if not na(activeTarget) and high >= activeTarget
+        strategy.close("Long", comment="TARGET")
+        exitFired := true
+        exitReason := "TARGET"
+        exitPrice := activeTarget
+        activeSL := na
+        activeTarget := na
+
+// ----- 2. Pattern hunting, only while flat. -----
+flatForHunt = strategy.position_size == 0
+
+if flatForHunt
+    if stage == 0
+        if crossDown
+            crossdownLevel := ema9
+            stage := 1
+
+    else if stage == 1
+        if crossUp
+            crossoverLevel := ema9
+            if crossdownLevel > crossoverLevel
+                stage := 2
+                rangeHigh := high
+                lowSinceHigh := low
+            else
+                // condition 1 failed -- discard, hunt a fresh crossdown
+                stage := 0
+                crossdownLevel := na
+                crossoverLevel := na
+
+    else if stage == 2
+        if crossDown
+            // trend reversed before ever touching EMA9 -- discard
+            stage := 0
+            crossdownLevel := na
+            crossoverLevel := na
+            rangeHigh := na
+            lowSinceHigh := na
+        else
+            if high > rangeHigh
+                rangeHigh := high
+                lowSinceHigh := low
+            else
+                lowSinceHigh := math.min(lowSinceHigh, low)
+            touched = low <= ema9 and high >= ema9
+            if touched
+                pendingSL := lowSinceHigh
+                pendingEntryLevel := rangeHigh
+                stage := 3
+
+    else if stage == 3
+        if crossDown or (not na(pendingSL) and low <= pendingSL)
+            // trend reversed, or price already hit the would-be SL -- discard
+            stage := 0
+            crossdownLevel := na
+            crossoverLevel := na
+            rangeHigh := na
+            lowSinceHigh := na
+            pendingSL := na
+            pendingEntryLevel := na
+        else if close > pendingEntryLevel
+            entryPrice = close
+            slPrice = pendingSL
+            risk = entryPrice - slPrice
+            targetPrice = entryPrice + riskReward * risk
+            strategy.entry("Long", strategy.long)
+            activeSL := slPrice
+            activeTarget := targetPrice
+            buyFired := true
+            firedEntryPrice := entryPrice
+            firedTargetPrice := targetPrice
+            stage := 0
+            crossdownLevel := na
+            crossoverLevel := na
+            rangeHigh := na
+            lowSinceHigh := na
+            pendingSL := na
+            pendingEntryLevel := na
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(stage == 1 and stage[1] == 0, "Crossdown seen", shape.circle, location.abovebar,
+     color.new(color.red, 0), size=size.tiny)
+plotshape(stage == 2 and stage[1] == 1, "Crossover confirmed (cond. 1)", shape.circle, location.belowbar,
+     color.new(color.lime, 0), size=size.tiny)
+plotshape(stage == 3 and stage[1] == 2, "EMA9 touch (cond. 2)", shape.circle, location.belowbar,
+     color.new(color.yellow, 0), size=size.tiny)
+
+plot(stage >= 1 ? crossdownLevel : na, "Crossdown level", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(stage == 3 ? pendingEntryLevel : na, "Condition 3 high (breakout level)", color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
+plot(stage == 3 ? pendingSL : na, "Pending SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
+
+plotshape(buyFired, title="BUY", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+
+inPos = strategy.position_size != 0
+plot(inPos ? activeSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(inPos ? activeTarget : na, "Active Target", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+if buyFired
+    label.new(bar_index, firedEntryPrice, "BUY " + str.tostring(firedEntryPrice, format.mintick),
+         style=label.style_label_down, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+    label.new(bar_index, firedTargetPrice, "TARGET " + str.tostring(firedTargetPrice, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+if exitFired
+    label.new(bar_index, exitPrice, exitReason + " " + str.tostring(exitPrice, format.mintick),
+         style=label.style_label_left, color=exitReason == "TARGET" ? color.new(color.green, 0) : color.new(color.maroon, 0),
+         textcolor=color.white, size=size.small)
