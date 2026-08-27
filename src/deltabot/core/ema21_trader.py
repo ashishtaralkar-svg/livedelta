@@ -405,7 +405,11 @@ class Ema21BreakdownEngine:
                 return
 
             self._entry_premium = fill
-            self._tp_price = fill * self._tp_mult
+            # take_profit_pct <= 0 means "no premium target" (matches the
+            # backtest's own --tp-gain-pct 0 convention) -- _tp_mult would
+            # otherwise be exactly 1.0, setting _tp_price to the entry fill
+            # itself and closing on the very next mark tick at or above it.
+            self._tp_price = fill * self._tp_mult if self.settings.take_profit_pct > 0 else None
             self._current_dir = signal_dir
             if self.settings.state_file:
                 position_state.save(
@@ -414,15 +418,16 @@ class Ema21BreakdownEngine:
                     size=self.settings.option_contracts, entry_premium=fill,
                     tp_price=self._tp_price, direction=signal_dir,
                 )
+            tp_display = round(self._tp_price, 1) if self._tp_price is not None else None
             direction = "CALL" if is_buy_signal else "PUT"
             log.info("Ema21 entry", extra={"extra": {
                 "direction": direction, "symbol": symbol, "fill": fill,
-                "tp_price": round(self._tp_price, 1), "sl_level": sl_level}})
+                "tp_price": tp_display, "sl_level": sl_level}})
             event = NotifyEvent.ENTRY_LONG if is_buy_signal else NotifyEvent.ENTRY_SHORT
             await self.notifier.notify(
                 event, direction=direction, contract=symbol or "?",
                 premium=fill, btc_price=btc_price, sl_level=sl_level,
-                tp_price=round(self._tp_price, 1), side="buy",
+                tp_price=tp_display, side="buy",
             )
         finally:
             self._entry_in_progress = False

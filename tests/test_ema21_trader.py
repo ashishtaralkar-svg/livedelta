@@ -103,6 +103,18 @@ async def test_bullish_signal_buys_call_and_sets_rally_tp() -> None:
     assert ev.args[0] == NotifyEvent.ENTRY_LONG and ev.kwargs["direction"] == "CALL"
 
 
+async def test_take_profit_pct_zero_disables_the_rally_target() -> None:
+    """take_profit_pct<=0 means NO premium target (matches the backtest's
+    own --tp-gain-pct 0 convention) -- _tp_price must be None, not the entry
+    fill itself (which _tp_mult=1.0 would otherwise produce, closing on the
+    very next mark tick at or above entry)."""
+    engine = _make_engine(take_profit_pct=0.0)
+    await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+    assert engine._tp_price is None
+    ev = engine.notifier.notify.await_args
+    assert ev.kwargs["tp_price"] is None
+
+
 async def test_bearish_signal_buys_put() -> None:
     engine = _make_engine()
     engine.executor._open_result = (100.0, "P-BTC-64000-070726")
