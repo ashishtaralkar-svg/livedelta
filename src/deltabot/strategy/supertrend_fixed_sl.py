@@ -1,7 +1,8 @@
 """SupertrendFixedSl Strategy -- Python port of supertrend_fixed_sl_strategy.pine.
 
-Supertrend(10,3) flip timing, a FROZEN stop (read once at the flip, never
-re-derived from Supertrend's still-updating value), sell-only. Unlike the
+Supertrend(10,3) flip timing, a FROZEN stop by default (read once at the
+flip, never re-derived from Supertrend's still-updating value) -- or a
+TRAILING stop instead when trailing_sl=True (see below), sell-only. Unlike the
 Pine chart (which can only simulate one net BTC position and so treats the
 CE and PE legs as mutually exclusive -- see that file's LIMITATION note),
 this port tracks the two legs as the genuinely INDEPENDENT contracts they
@@ -33,6 +34,16 @@ Rules (CE/bearish side; PE/bullish is the exact mirror):
     after a TP exit, same as any other out-of-band flatten.
   * A CE leg and a PE leg can be open simultaneously (independent
     contracts); each has its own frozen SL and closes independently.
+
+trailing_sl (added on request, "Selling Only" config): replaces the frozen
+SL with a TRAILING one -- every bar, an already-open leg's active stop is
+re-derived from Supertrend's own CURRENT value, but only ever TIGHTENS
+(moves toward price), never loosens -- standard trailing-stop discipline,
+not a raw "always follow the indicator" copy (which could otherwise
+temporarily loosen the stop on a wobble and give back protected profit). A
+leg's SL still starts at the flip bar's own Supertrend value either way;
+trailing vs frozen only diverges from the NEXT bar onward, once Supertrend
+itself has moved. Off (default) = original frozen behavior, unchanged.
 
 ema200_filter (added on request): an additional gate checked AT THE FLIP --
 a bullish flip (PE) only fires if close > EMA(200); a bearish flip (CE)
@@ -205,6 +216,7 @@ class SupertrendFixedSlStrategy:
         trend_fast_len: int = 150,
         trend_slow_len: int = 600,
         trend_flip_exit: bool = False,
+        trailing_sl: bool = False,
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
@@ -231,6 +243,12 @@ class SupertrendFixedSlStrategy:
         # takes effect when trend_filter is also on. See module docstring's
         # "trend-flip exit" section.
         self.trend_flip_exit = trend_flip_exit
+        # trailing_sl (added on request, "Selling Only" config): the active
+        # SL re-derives from Supertrend's own CURRENT value every bar
+        # instead of staying frozen at the flip -- tightening only, never
+        # loosening. See the trailing-SL block inside update(). Off
+        # (default) = original frozen behavior, unchanged.
+        self.trailing_sl = trailing_sl
         self._tz = ZoneInfo(day_tz)
         self._gap_start_mins = gap_start_hour * 60 + gap_start_minute
         self._gap_end_mins = gap_end_hour * 60 + gap_end_minute
@@ -376,6 +394,20 @@ class SupertrendFixedSlStrategy:
             long_trend_exit = not long_sl_hit
             self._in_long = False
             self._active_long_sl = None
+
+        # --- Trailing SL (added on request): when trailing_sl=True, a leg
+        #     that was ALREADY open coming into this bar has its active
+        #     stop re-derived from Supertrend's own CURRENT value -- but
+        #     only ever TIGHTENS (moves toward price), never loosens,
+        #     standard trailing-stop discipline. A leg that flips open THIS
+        #     bar is untouched here; it gets its own fresh SL in the entry
+        #     block below (equal to st_value on that first bar either way,
+        #     so trailing vs frozen only starts to diverge from the NEXT
+        #     bar onward). Off (default) = SL stays frozen, unchanged. ---
+        if self.trailing_sl and self._in_short and self._active_short_sl is not None:
+            self._active_short_sl = min(self._active_short_sl, st_value)
+        if self.trailing_sl and self._in_long and self._active_long_sl is not None:
+            self._active_long_sl = max(self._active_long_sl, st_value)
 
         # --- Entry: the flip bar itself is the signal. Blocked while that
         #     side's OWN leg is already open (no pyramiding); the OTHER

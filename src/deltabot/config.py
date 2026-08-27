@@ -262,6 +262,11 @@ class Settings(BaseSettings):
     supertrend_trade_ce: bool = True
     supertrend_trade_pe: bool = True
     supertrend_debug_state: bool = False   # log a full strategy-state snapshot on every closed 5m candle
+    # trailing_sl (added on request, "Selling Only" config): SL re-derives from
+    # Supertrend's own CURRENT value every bar (tightening only, never
+    # loosening) instead of staying frozen at the flip. Off (default) =
+    # original frozen behavior.
+    supertrend_trailing_sl: bool = False
 
     # Premium-decay TP (added on request): exit a leg once its option premium
     # DECAYS by this % of the entry fill -- e.g. 70 means sold at 100 -> buy

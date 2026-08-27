@@ -121,6 +121,7 @@ class SupertrendFixedSlEngine:
             trend_fast_len=settings.supertrend_trend_fast_len,
             trend_slow_len=settings.supertrend_trend_slow_len,
             trend_flip_exit=settings.supertrend_trend_flip_exit,
+            trailing_sl=settings.supertrend_trailing_sl,
         )
         self.executor_short = OptionsExecutor(rest, settings)
         self.executor_long = OptionsExecutor(rest, settings)

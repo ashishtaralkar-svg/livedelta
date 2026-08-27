@@ -107,6 +107,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
         ema200_filter=args.ema200_filter, ema200_len=args.ema200_len,
         trend_filter=args.trend_filter, trend_fast_len=args.trend_fast_len,
         trend_slow_len=args.trend_slow_len, trend_flip_exit=args.trend_flip_exit,
+        trailing_sl=args.trailing_sl,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
     interval = settings.option_strike_interval
@@ -313,6 +314,7 @@ def report(trades: list[dict], args) -> None:
     ema_txt = f", EMA{args.ema200_len} filter" if args.ema200_filter else ""
     trend_txt = f", trend EMA{args.trend_fast_len}/{args.trend_slow_len} filter" if args.trend_filter else ""
     trend_txt += "+flip-exit" if (args.trend_filter and args.trend_flip_exit) else ""
+    sl_txt = ", trailing SL" if args.trailing_sl else ""
     roll_txt = ", rollover ON" if args.rollover else ""
     wb_txt = ", weekend blackout (Sat 17:30-Sun 23:55)" if args.weekend_blackout else ""
     tp_block_txt = ("block till trend flip" if args.tp_block_on_trend_flip
@@ -320,8 +322,8 @@ def report(trades: list[dict], args) -> None:
     tp_txt = f", TP{args.tp_pct:.0f}%->{tp_block_txt}" if args.tp_pct > 0 else ""
     print(f"\n{'=' * 118}")
     print(f"Supertrend({args.atr_period},{args.factor:.0f}) Fixed-SL [OPTION SELL]{side_txt} -- {args.days}d, "
-          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{roll_txt}{wb_txt}"
-          f"{tp_txt}, floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
+          f"premium ~{args.target_premium:.0f}, {args.lots} lots{ha_txt}{ema_txt}{trend_txt}{sl_txt}{roll_txt}"
+          f"{wb_txt}{tp_txt}, floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 118}")
     if not trades:
         print("No trades.")
@@ -367,7 +369,8 @@ def export(trades: list[dict], args, path: str) -> None:
     wins = [t for t in closed if t["net"] > 0]
     srows = [
         ("days", args.days), ("atr_period", args.atr_period), ("factor", args.factor),
-        ("heikin_ashi", args.heikin_ashi), ("ema200_filter", args.ema200_filter),
+        ("heikin_ashi", args.heikin_ashi), ("trailing_sl", args.trailing_sl),
+        ("ema200_filter", args.ema200_filter),
         ("trend_filter", args.trend_filter), ("trend_fast_len", args.trend_fast_len),
         ("trend_slow_len", args.trend_slow_len), ("trend_flip_exit", args.trend_flip_exit),
         ("rollover", args.rollover), ("weekend_blackout", args.weekend_blackout),
@@ -437,6 +440,10 @@ def main() -> None:
                         "force-close an open leg the instant the trend EMA relationship itself "
                         "crosses, tagged TREND, instead of letting it ride to its frozen SL/EOD. "
                         "Off (default) = --trend-filter alone only gates NEW entries.")
+    p.add_argument("--trailing-sl", action="store_true",
+                   help="replace the frozen SL with a trailing one: every bar, an already-open leg's "
+                        "active stop is re-derived from Supertrend's own CURRENT value, tightening "
+                        "only, never loosening. Off (default) = original frozen-at-the-flip SL.")
     p.add_argument("--weekend-blackout", action="store_true",
                    help="no NEW entry from Saturday 17:30 IST through Sunday 23:55 IST. The daily "
                         "square-off already flattens any open leg by 17:25 every day, so this only "

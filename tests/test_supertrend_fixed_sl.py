@@ -331,6 +331,49 @@ def test_frozen_sl_does_not_move_on_later_bars() -> None:
     assert s._active_long_sl == frozen_sl          # but the leg's SL did NOT
 
 
+def test_trailing_sl_tightens_upward_for_a_long_leg() -> None:
+    """Same uptrend sequence as the frozen-SL test, but trailing_sl=True:
+    the long leg's SL should TRACK Supertrend's rising value instead of
+    staying pinned to the flip-bar value."""
+    s = _strategy(trailing_sl=True)
+    t = _ts(10, 0)
+    seq = [(100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103), (103, 106, 102, 105),
+           (105, 108, 104, 107), (107, 109, 106, 108)]
+    for o, h, low, cl in seq:
+        s.update(_c(t, o, h, low, cl))
+        t += 300
+    assert s.in_long
+    sl_before = s._active_long_sl
+
+    s.update(_c(t, 108, 110, 107, 109))   # one more up bar -- Supertrend rises further
+    assert s._active_long_sl > sl_before   # trailing SL tightened UPWARD with it
+
+
+def test_trailing_sl_never_loosens_on_a_pullback_bar() -> None:
+    """A bar where Supertrend's own value ticks the 'wrong' way (without a
+    full direction flip) must never loosen an already-tightened stop."""
+    s = _strategy(trailing_sl=True)
+    t = _ts(10, 0)
+    seq = [(100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103), (103, 106, 102, 105),
+           (105, 108, 104, 107), (107, 109, 106, 108), (108, 110, 107, 109)]
+    for o, h, low, cl in seq:
+        s.update(_c(t, o, h, low, cl))
+        t += 300
+    assert s.in_long
+    tightened_sl = s._active_long_sl
+
+    # A soft pullback bar -- lower highs/lows than the last bar, but not
+    # enough to cross the SL or flip direction.
+    s.update(_c(t, 108, 108.5, 107.5, 108))
+    assert s.in_long                          # still open (no SL cross, no flip)
+    assert s._active_long_sl >= tightened_sl  # never moved backward (loosened)
+
+
+def test_trailing_sl_off_by_default_matches_frozen_behavior() -> None:
+    s = _strategy()
+    assert s.trailing_sl is False
+
+
 def test_sl_exit_short() -> None:
     s = _strategy()
     s._in_short = True
