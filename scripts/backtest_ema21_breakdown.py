@@ -74,6 +74,12 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     tp_decay = args.tp_decay_pct / 100.0
     tp_gain = args.tp_gain_pct / 100.0
     buying = args.side == "buy"
+    # tp_fraction < 1.0: only THIS fraction of the lots closes at the TP
+    # price (a partial/scale-out exit) -- the remaining lots keep running
+    # with the TP check turned OFF for them (only SL/EOD can close them),
+    # matching "half out at target, the rest rides to the square-off".
+    # 1.0 (default) = unchanged behavior, the whole position closes at TP.
+    tp_fraction = max(0.0, min(1.0, args.tp_fraction))
 
     cache: dict = {}
     trades: list[dict] = []
@@ -113,28 +119,34 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             tp_price = entry_prem * (1.0 - tp_decay) if tp_decay > 0 else None
         pos = {"is_buy": is_buy, "sym": sym, "is_call": otype == OptionType.CALL,
                "candles": ocandles, "entry_time": ts,
-               "entry_btc": btc_px, "entry_prem": entry_prem, "tp_price": tp_price}
+               "entry_btc": btc_px, "entry_prem": entry_prem, "tp_price": tp_price,
+               "lots_remaining": lots}
         return True
 
     def buyback_prem(ts: int, exit_btc: float) -> float:
         p = op.premium_at(pos["candles"], ts, step)
         return p if p is not None else op.intrinsic_value(pos["sym"], exit_btc)
 
-    def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float) -> None:
+    def close(reason: str, exit_prem: float, exit_time: int, exit_btc: float,
+              close_lots: int | None = None) -> None:
         nonlocal pos
         assert pos is not None
+        # close_lots < pos["lots_remaining"]: a PARTIAL close (scale-out) --
+        # this leg's row books only that many lots and pos stays alive with
+        # the rest; None or a full-remaining amount closes everything.
+        this_lots = pos["lots_remaining"] if close_lots is None else min(close_lots, pos["lots_remaining"])
         if floor:
             exit_prem = max(exit_prem, op.intrinsic_value(pos["sym"], exit_btc))
         if buying:
             entry_fill = pos["entry_prem"] * (1 + es)   # buying: pay slightly more
             exit_fill = exit_prem * (1 - xs)             # selling to close: receive slightly less
-            gross = (exit_fill - entry_fill) * lots * lot_size   # profit when premium RISES
+            gross = (exit_fill - entry_fill) * this_lots * lot_size   # profit when premium RISES
         else:
             entry_fill = pos["entry_prem"] * (1 - es)   # selling: receive slightly less
             exit_fill = exit_prem * (1 + xs)             # buying back: pay slightly more
-            gross = (entry_fill - exit_fill) * lots * lot_size   # profit when premium DECAYS
-        fee = (op.side_fee(pos["entry_btc"], entry_fill, lots, lot_size)
-               + op.side_fee(exit_btc, exit_fill, lots, lot_size))
+            gross = (entry_fill - exit_fill) * this_lots * lot_size   # profit when premium DECAYS
+        fee = (op.side_fee(pos["entry_btc"], entry_fill, this_lots, lot_size)
+               + op.side_fee(exit_btc, exit_fill, this_lots, lot_size))
         trades.append({
             "entry_time": pos["entry_time"], "exit_time": exit_time, "contract": pos["sym"],
             "signal": "BUY" if pos["is_buy"] else "SELL",
@@ -143,10 +155,12 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             # column above, e.g. "BUY CE" (buy mode) or "SELL CE" (sell mode).
             "action": f"{'BUY' if buying else 'SELL'} {'CE' if pos['is_call'] else 'PE'}",
             "btc_entry": pos["entry_btc"], "btc_exit": exit_btc,
-            "opt_in": entry_fill, "opt_out": exit_fill, "reason": reason,
+            "opt_in": entry_fill, "opt_out": exit_fill, "reason": reason, "lots": this_lots,
             "gross": gross, "fee": fee, "net": gross - fee,
         })
-        pos = None
+        pos["lots_remaining"] -= this_lots
+        if pos["lots_remaining"] <= 0:
+            pos = None
 
     sq_mins = args.square_off_hour * 60 + args.square_off_minute
     prev_mins: int | None = None
@@ -167,7 +181,10 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             # sell mode: --tp-decay-pct > 0; buy mode: --tp-gain-pct > 0).
             # Independent of/in addition to the strategy's own SL, which
             # always stays live off the BTC-price anchor high/low (or the
-            # EMA, with --ema-sl).
+            # EMA, with --ema-sl). --tp-fraction < 1.0: only that fraction
+            # of the ORIGINAL lot count closes here (a scale-out) -- the
+            # rest keeps running with TP turned off (tp_price cleared),
+            # only SL/EOD can close it from here on.
             if pos is not None and pos["tp_price"] is not None:
                 if buying:
                     t_tp = op.premium_at(pos["candles"], c.start_time, step)
@@ -175,15 +192,25 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                         if floor:
                             t_tp = max(t_tp, op.intrinsic_value(pos["sym"], c.close))
                         if t_tp >= pos["tp_price"]:
-                            close("TP", pos["tp_price"], c.start_time, c.close)
-                            strategy.force_flat()
+                            partial = 0 < tp_fraction < 1.0
+                            tp_lots = max(1, round(lots * tp_fraction)) if partial else None
+                            close("TP", pos["tp_price"], c.start_time, c.close, close_lots=tp_lots)
+                            if partial and pos is not None:
+                                pos["tp_price"] = None
+                            else:
+                                strategy.force_flat()
                 else:
                     can_decay = (not floor) or op.intrinsic_value(pos["sym"], c.close) <= pos["tp_price"]
                     if can_decay:
                         t_tp = op.premium_at(pos["candles"], c.start_time, step)
                         if t_tp is not None and t_tp <= pos["tp_price"]:
-                            close("TP", pos["tp_price"], c.start_time, c.close)
-                            strategy.force_flat()
+                            partial = 0 < tp_fraction < 1.0
+                            tp_lots = max(1, round(lots * tp_fraction)) if partial else None
+                            close("TP", pos["tp_price"], c.start_time, c.close, close_lots=tp_lots)
+                            if partial and pos is not None:
+                                pos["tp_price"] = None
+                            else:
+                                strategy.force_flat()
 
             # Daily square-off (default 17:25 IST, matching every other
             # backtest in this repo): force-closes any still-open position.
@@ -215,6 +242,8 @@ def report(trades: list[dict], args) -> None:
         tp_txt = f"{args.tp_gain_pct:.0f}%-gain TP" if args.tp_gain_pct > 0 else "no premium TP"
     else:
         tp_txt = f"{args.tp_decay_pct:.0f}%-decay TP" if args.tp_decay_pct > 0 else "no premium TP"
+    if 0 < args.tp_fraction < 1.0 and (args.tp_gain_pct > 0 or args.tp_decay_pct > 0):
+        tp_txt += f" ({args.tp_fraction * 100:.0f}% of lots, remainder rides to SL/EOD)"
     rr_txt = f"{args.target_rr:.1f}R BTC-price target" if args.target_rr > 0 else "no BTC-price target"
     side_txt = " [CE ONLY]" if args.ce_only else " [PE ONLY]" if args.pe_only else ""
     window_txt = f", entries {args.entry_start_hour:02d}-{args.entry_end_hour:02d}h IST" \
@@ -229,11 +258,11 @@ def report(trades: list[dict], args) -> None:
         return
     in_hdr, out_hdr = ("bought", "sold") if args.side == "buy" else ("sold", "bought")
     print(f"{'entry (IST)':<18}{'action':<8}{'contract':<22}{'btc in':>9}{'btc out':>9}"
-          f"{in_hdr:>8}{out_hdr:>8} {'reason':<12}{'net $':>10}")
+          f"{in_hdr:>8}{out_hdr:>8} {'reason':<12}{'lots':>6}{'net $':>10}")
     for t in trades:
         print(f"{_ist(t['entry_time']):<18}{t['action']:<8}{t['contract']:<22}"
               f"{t['btc_entry']:>9.1f}{t['btc_exit']:>9.1f}{t['opt_in']:>8.1f}{t['opt_out']:>8.1f} "
-              f"{t['reason']:<12}{t['net']:>10.2f}")
+              f"{t['reason']:<12}{t['lots']:>6}{t['net']:>10.2f}")
     closed = [t for t in trades if t["reason"] != "OPEN_AT_END"]
     wins = [t for t in closed if t["net"] > 0]
     print(f"{'-' * 112}")
@@ -260,7 +289,7 @@ def export(trades: list[dict], args, path: str) -> None:
             "signal": t["signal"], "action": t["action"],
             "contract": t["contract"], "btc_entry": round(t["btc_entry"], 1), "btc_exit": round(t["btc_exit"], 1),
             in_col: round(t["opt_in"], 1), out_col: round(t["opt_out"], 1),
-            "exit_reason": t["reason"], "gross_usd": round(t["gross"], 2),
+            "exit_reason": t["reason"], "lots": t["lots"], "gross_usd": round(t["gross"], 2),
             "fee_usd": round(t["fee"], 2), "net_usd": round(t["net"], 2),
             "cumulative_net_usd": round(cum, 2),
         })
@@ -271,6 +300,7 @@ def export(trades: list[dict], args, path: str) -> None:
         ("days", args.days), ("ema_len", args.ema_len), ("max_wait", args.max_wait),
         ("side", args.side),
         ("target_rr", args.target_rr), ("tp_decay_pct", args.tp_decay_pct), ("tp_gain_pct", args.tp_gain_pct),
+        ("tp_fraction", args.tp_fraction),
         ("entry_start_hour", args.entry_start_hour), ("entry_end_hour", args.entry_end_hour),
         ("premium_target", args.target_premium), ("lots", args.lots),
         ("legs_closed", len(closed)),
@@ -336,6 +366,11 @@ def main() -> None:
     p.add_argument("--tp-gain-pct", type=float, default=0.0,
                    help="[--side buy] sell once the BOUGHT premium rises this %% (e.g. 200 -> sell "
                         "at 3x entry). 0 (default) = off. Same --target-rr interplay as --tp-decay-pct.")
+    p.add_argument("--tp-fraction", type=float, default=1.0,
+                   help="fraction of the lots that close at the TP price (0 < f < 1 = a partial "
+                        "scale-out, e.g. 0.5 -> half the lots close at target, the rest rides with "
+                        "TP turned OFF -- only SL/EOD can close it from there). 1.0 (default) = the "
+                        "whole position closes at TP, unchanged behavior. No effect if TP is off.")
     p.add_argument("--target-premium", type=float, default=400.0)
     p.add_argument("--lots", type=int, default=1)
     p.add_argument("--lot-size", type=float, default=0.0, help="0 = auto-derive from the underlying symbol")
