@@ -240,6 +240,15 @@ class Settings(BaseSettings):
     ema21_entry_end_hour: int = 17
     ema21_tp_poll_seconds: float = 15.0   # poll option mark for the rally TP (0 = only at 15m close)
     ema21_debug_state: bool = False       # log a full strategy-state snapshot on every closed 15m candle
+    # Balance-based position sizing (added on request): 0 (default) = use the
+    # static option_contracts lot count, unchanged behavior. > 0 (e.g. 10.0
+    # for 10%) = spend that %% of current available balance on each entry's
+    # premium instead -- lots are computed fresh per trade from the real
+    # selected contract's mark price (see OptionsExecutor.
+    # open_option_by_balance_fraction), NOT from option_contracts. If the
+    # computed lot count is 0 (balance too small), the entry is skipped
+    # entirely rather than forcing a minimum size.
+    ema21_balance_pct: float = 0.0
 
     # SupertrendFixedSl (strategy="supertrend"): Supertrend(10,3) flip timing on
     # real (non-HA) OHLC, a FROZEN stop (read once at the flip, never re-derived

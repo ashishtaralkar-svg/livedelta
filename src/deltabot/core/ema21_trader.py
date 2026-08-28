@@ -134,11 +134,11 @@ class Ema21BreakdownEngine:
                 t.cancel()
         if self.settings.close_on_shutdown and self.executor.has_open_position:
             try:
+                lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
                 await self.executor.close_option()
                 if self.settings.state_file:
                     position_state.clear(self.settings.state_file)
-                await self.notifier.notify(NotifyEvent.EXIT, reason="shutdown",
-                                           size=self.settings.option_contracts)
+                await self.notifier.notify(NotifyEvent.EXIT, reason="shutdown", size=lots)
                 log.info("Ema21: closed option on shutdown")
             except Exception as exc:  # noqa: BLE001
                 log.error("Ema21: failed to close on shutdown", extra={"extra": {"error": str(exc)}})
@@ -304,6 +304,7 @@ class Ema21BreakdownEngine:
                         extra={"extra": {"contract": self.executor.tracked_symbol}})
             return
         contract = self.executor.tracked_symbol
+        lots = self.executor.tracked_size   # captured BEFORE executor.clear() wipes tracked state
         log.warning("Ema21: position closed OUTSIDE the bot — self-healing to FLAT",
                     extra={"extra": {"contract": contract}})
         self.executor.clear()
@@ -314,7 +315,7 @@ class Ema21BreakdownEngine:
         self.strategy.force_flat()
         await self.notifier.notify(
             NotifyEvent.EXIT, reason="closed outside the bot (self-healed)",
-            contract=contract or "?", size=self.settings.option_contracts, side="buy",
+            contract=contract or "?", size=lots, side="buy",
         )
 
     # ------------------------------------------------------------------ #
@@ -324,6 +325,7 @@ class Ema21BreakdownEngine:
         self._closing = True
         try:
             contract = self.executor.tracked_symbol
+            lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
@@ -334,7 +336,6 @@ class Ema21BreakdownEngine:
                 position_state.clear(self.settings.state_file)
             exit_prem = fill if fill is not None else mark
             entry_prem = self._entry_premium
-            lots = self.settings.option_contracts
             gross = (exit_prem - entry_prem) * lots * 0.001 if entry_prem is not None else 0.0
             self.strategy.force_flat()
             self._entry_premium = self._tp_price = self._current_dir = None
@@ -353,6 +354,7 @@ class Ema21BreakdownEngine:
         self._closing = True
         try:
             contract = self.executor.tracked_symbol
+            lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
@@ -362,7 +364,6 @@ class Ema21BreakdownEngine:
             if self.settings.state_file:
                 position_state.clear(self.settings.state_file)
             entry_prem = self._entry_premium
-            lots = self.settings.option_contracts
             gross = ((fill - entry_prem) * lots * 0.001
                      if (entry_prem is not None and fill is not None) else 0.0)
             self._entry_premium = self._tp_price = self._current_dir = None
@@ -386,9 +387,19 @@ class Ema21BreakdownEngine:
         try:
             is_buy_signal = signal_dir == SignalDir.LONG.value
             try:
-                fill, symbol = await self.executor.open_option_by_premium(
-                    signal_dir, self.settings.target_premium
-                )
+                if self.settings.ema21_balance_pct > 0:
+                    # returns (None, None, 0) if sizing computed 0 lots
+                    # (balance too small) -- fill stays None either way,
+                    # matching open_option_by_premium's own failure shape.
+                    fill, symbol, _ = await self.executor.open_option_by_balance_fraction(
+                        signal_dir, self.settings.target_premium,
+                        self.settings.ema21_balance_pct / 100.0,
+                        self.settings.option_margin_asset,
+                    )
+                else:
+                    fill, symbol = await self.executor.open_option_by_premium(
+                        signal_dir, self.settings.target_premium
+                    )
             except OptionsMarginError as exc:
                 log.error("Ema21: margin/balance error", extra={"extra": {"error": str(exc)}})
                 await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"Balance: {exc}")
@@ -415,7 +426,10 @@ class Ema21BreakdownEngine:
                 position_state.save(
                     self.settings.state_file, symbol=symbol or "",
                     product_id=self.executor.tracked_product_id,
-                    size=self.settings.option_contracts, entry_premium=fill,
+                    # tracked_size is the ACTUAL lots used -- for a
+                    # balance-fraction entry this differs from
+                    # settings.option_contracts (which is unused then).
+                    size=self.executor.tracked_size, entry_premium=fill,
                     tp_price=self._tp_price, direction=signal_dir,
                 )
             tp_display = round(self._tp_price, 1) if self._tp_price is not None else None
@@ -524,11 +538,11 @@ class Ema21BreakdownEngine:
         if self.executor.has_open_position:
             try:
                 contract = self.executor.tracked_symbol
+                lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
                 fill = await self.executor.close_option()
                 if self.settings.state_file:
                     position_state.clear(self.settings.state_file)
                 entry_prem = self._entry_premium
-                lots = self.settings.option_contracts
                 gross = ((fill - entry_prem) * lots * 0.001
                          if (entry_prem is not None and fill is not None) else 0.0)
                 self._entry_premium = self._tp_price = self._current_dir = None

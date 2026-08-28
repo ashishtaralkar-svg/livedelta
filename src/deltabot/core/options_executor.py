@@ -33,6 +33,13 @@ log = get_logger(__name__)
 
 _IST = ZoneInfo("Asia/Kolkata")
 
+# Contract multiplier: 1 option lot = this much of the underlying. Duplicated
+# from backtest/option_pricing.py's own LOT_SIZE/LOT_BTC (not imported --
+# same convention as this repo's indicator helper classes, which are also
+# duplicated per-file rather than shared between the backtest and live layers).
+_LOT_SIZE = {"BTC": 0.001, "ETH": 0.01}
+_LOT_DEFAULT = 0.001
+
 
 class OptionsMarginError(RuntimeError):
     """Raised when available balance is below the configured floor to sell options."""
@@ -87,6 +94,12 @@ class OptionsExecutor:
     def tracked_symbol(self) -> str | None:
         """Human-readable contract symbol of the tracked leg (e.g. C-BTC-61400-250626)."""
         return self._symbol
+
+    @property
+    def tracked_size(self) -> int:
+        """Lot count of the tracked leg -- the ACTUAL size used, which for a
+        balance-fraction entry differs from settings.option_contracts."""
+        return self._size
 
     @property
     def tracked_strike(self) -> float | None:
@@ -196,6 +209,80 @@ class OptionsExecutor:
             }},
         )
         return result.average_fill_price, best["symbol"]
+
+    async def open_option_by_balance_fraction(
+        self, signal_dir: int, target_premium: float, balance_fraction: float,
+        margin_asset: str | None = None,
+    ) -> tuple[float | None, str | None, int]:
+        """Like :meth:`open_option_by_premium`, but the lot count is computed
+        from a FRACTION of current available balance instead of the static
+        ``settings.option_contracts`` -- e.g. balance_fraction=0.10 spends up
+        to 10% of the account's available balance on this entry's premium.
+
+        Selects the contract ONCE (via :meth:`select_by_premium`, same as the
+        static path) so its real mark_price sizes the trade -- lots =
+        floor(balance_fraction * available_balance / (mark_price * lot_size)).
+        If that computes to 0 (balance too small for even 1 lot), the trade
+        is SKIPPED entirely rather than forcing a minimum -- the whole point
+        of balance-based sizing is never risking more than the fraction
+        allows. Returns ``(fill_price, symbol, lots)``; ``lots`` is 0 on any
+        failure (chain empty, margin error, balance too small, etc.) and the
+        caller should treat that exactly like a failed entry.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_balance_fraction called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None, 0
+
+        best = await self.select_by_premium(signal_dir, target_premium)
+        if best is None:
+            return None, None, 0
+
+        try:
+            balance = await asyncio.to_thread(self._rest.get_available_balance, margin_asset)
+        except Exception as exc:  # noqa: BLE001
+            log.error("get_available_balance failed in open_option_by_balance_fraction",
+                     extra={"extra": {"error": str(exc)}})
+            return None, None, 0
+
+        lot_size = _LOT_SIZE.get(self.underlying, _LOT_DEFAULT)
+        cost_per_lot = best["mark_price"] * lot_size
+        lots = int((balance_fraction * balance) // cost_per_lot) if cost_per_lot > 0 else 0
+        if lots <= 0:
+            log.warning(
+                "Balance-fraction sizing produced 0 lots — skipping entry",
+                extra={"extra": {"balance": balance, "balance_fraction": balance_fraction,
+                                  "mark_price": best["mark_price"], "cost_per_lot": cost_per_lot}},
+            )
+            return None, None, 0
+
+        option_type = self._option_type_for(signal_dir)
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
+
+        await self._check_balance()
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(best["product_id"])
+
+        result = await asyncio.to_thread(
+            self._rest.place_market_order, best["product_id"], lots, open_side
+        )
+
+        self._product_id = best["product_id"]
+        self._size = lots
+        self._option_type = option_type
+        self._symbol = best["symbol"]
+        self._strike = best["strike"]
+
+        log.info(
+            f"Option {open_side.value.upper()} (by balance fraction) placed",
+            extra={"extra": {
+                "product_id": best["product_id"], "size": lots, "balance": balance,
+                "fill_price": result.average_fill_price, "mark_price": best["mark_price"],
+            }},
+        )
+        return result.average_fill_price, best["symbol"], lots
 
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
         """Open a short option position from the strategy signal direction.

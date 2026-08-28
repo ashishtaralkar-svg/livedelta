@@ -89,3 +89,56 @@ async def test_sell_side_still_sets_leverage_when_configured() -> None:
     ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell", option_leverage=5))
     await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
     ex._rest.set_leverage.assert_called_once()
+
+
+# --------------------------------------------------------------------- #
+# open_option_by_balance_fraction: lot count computed from a FRACTION of
+# available balance instead of the static settings.option_contracts.
+# mark_price=900.0 (from _fake_rest's default), BTC lot_size=0.001 ->
+# cost_per_lot = 0.9. balance=100.0, fraction=0.10 -> target=$10 ->
+# lots = int(10.0 // 0.9) = 11.
+# --------------------------------------------------------------------- #
+def _fake_rest_with_balance(fill_price=900.0, balance=100.0):
+    rest = _fake_rest(fill_price)
+    rest.get_available_balance = MagicMock(return_value=balance)
+    return rest
+
+
+async def test_balance_fraction_computes_lots_from_real_mark_price_not_settings() -> None:
+    ex = OptionsExecutor(_fake_rest_with_balance(fill_price=900.0, balance=100.0),
+                         _settings(option_side="buy", option_contracts=25))
+    fill, symbol, lots = await ex.open_option_by_balance_fraction(
+        SignalDir.LONG.value, 500.0, 0.10, None)
+    assert lots == 11   # NOT settings.option_contracts (25)
+    assert symbol == "C-BTC-64000-180726"
+    assert ex.tracked_size == 11
+    order_size = ex._rest.place_market_order.call_args.args[1]
+    assert order_size == 11
+
+
+async def test_balance_fraction_zero_lots_places_no_order_and_stays_flat() -> None:
+    """Balance too small for even 1 lot -- must skip the trade entirely, not
+    force a minimum size."""
+    ex = OptionsExecutor(_fake_rest_with_balance(fill_price=900.0, balance=0.05),
+                         _settings(option_side="buy"))
+    fill, symbol, lots = await ex.open_option_by_balance_fraction(
+        SignalDir.LONG.value, 500.0, 0.10, None)
+    assert (fill, symbol, lots) == (None, None, 0)
+    ex._rest.place_market_order.assert_not_called()
+    assert not ex.has_open_position
+
+
+async def test_balance_fraction_passes_margin_asset_through() -> None:
+    ex = OptionsExecutor(_fake_rest_with_balance(), _settings(option_side="buy"))
+    await ex.open_option_by_balance_fraction(SignalDir.LONG.value, 500.0, 0.10, "USDT")
+    ex._rest.get_available_balance.assert_called_once_with("USDT")
+
+
+async def test_balance_fraction_guarded_when_already_open() -> None:
+    ex = OptionsExecutor(_fake_rest_with_balance(), _settings(option_side="buy"))
+    await ex.open_option_by_balance_fraction(SignalDir.LONG.value, 500.0, 0.10, None)
+    ex._rest.place_market_order.reset_mock()
+    fill, symbol, lots = await ex.open_option_by_balance_fraction(
+        SignalDir.LONG.value, 500.0, 0.10, None)
+    assert (fill, symbol, lots) == (None, None, 0)
+    ex._rest.place_market_order.assert_not_called()

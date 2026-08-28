@@ -27,11 +27,15 @@ class FakeExecutor:
         self.has_open_position = False
         self.tracked_symbol: str | None = None
         self.tracked_product_id: int | None = None
+        self.tracked_size: int = 0
         self.underlying = "BTC"
         self.is_buy_side = True
         self.open_calls: list[tuple[int, float]] = []
+        self.balance_fraction_calls: list[tuple[int, float, float, str | None]] = []
         self.close_calls = 0
         self._open_result: tuple[float | None, str | None] = (100.0, "C-BTC-64000-070726")
+        self._open_size = 25   # lots for the static open_option_by_premium path
+        self._balance_fraction_result: tuple[float | None, str | None, int] = (100.0, "C-BTC-64000-070726", 7)
         self._close_result: float | None = 400.0   # 4x, for TP tests
 
     async def open_option_by_premium(self, signal_dir: int, target_premium: float):
@@ -41,23 +45,37 @@ class FakeExecutor:
             self.has_open_position = True
             self.tracked_symbol = symbol
             self.tracked_product_id = 123
+            self.tracked_size = self._open_size
         return fill, symbol
+
+    async def open_option_by_balance_fraction(self, signal_dir, target_premium, balance_fraction, margin_asset):
+        self.balance_fraction_calls.append((signal_dir, target_premium, balance_fraction, margin_asset))
+        fill, symbol, lots = self._balance_fraction_result
+        if fill is not None and lots > 0:
+            self.has_open_position = True
+            self.tracked_symbol = symbol
+            self.tracked_product_id = 123
+            self.tracked_size = lots
+        return fill, symbol, lots
 
     async def close_option(self):
         self.close_calls += 1
         self.has_open_position = False
         self.tracked_symbol = None
+        self.tracked_size = 0
         return self._close_result
 
     def clear(self) -> None:
         self.has_open_position = False
         self.tracked_symbol = None
         self.tracked_product_id = None
+        self.tracked_size = 0
 
     def adopt(self, product_id, size, option_type, symbol=None) -> None:
         self.has_open_position = True
         self.tracked_product_id = product_id
         self.tracked_symbol = symbol
+        self.tracked_size = size
 
 
 class FakeRest:
@@ -113,6 +131,63 @@ async def test_take_profit_pct_zero_disables_the_rally_target() -> None:
     assert engine._tp_price is None
     ev = engine.notifier.notify.await_args
     assert ev.kwargs["tp_price"] is None
+
+
+async def test_ema21_balance_pct_zero_uses_the_static_lot_path() -> None:
+    """Default (0) -- unchanged behavior: open_option_by_premium is used,
+    open_option_by_balance_fraction is never called."""
+    engine = _make_engine()
+    await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+    assert engine.executor.open_calls == [(SignalDir.LONG.value, 100.0)]
+    assert engine.executor.balance_fraction_calls == []
+    assert engine.executor.tracked_size == 25
+
+
+async def test_ema21_balance_pct_nonzero_uses_the_dynamic_lot_path() -> None:
+    engine = _make_engine(ema21_balance_pct=10.0)
+    await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+    assert engine.executor.open_calls == []   # static path never called
+    assert engine.executor.balance_fraction_calls == [(SignalDir.LONG.value, 100.0, 0.10, None)]
+    assert engine.executor.tracked_size == 7   # FakeExecutor's _balance_fraction_result lots
+    assert engine._entry_premium == 100.0
+
+
+async def test_ema21_balance_pct_zero_lots_flattens_strategy() -> None:
+    """open_option_by_balance_fraction returning (None, None, 0) (balance too
+    small for even 1 lot) must be treated exactly like a failed static entry."""
+    engine = _make_engine(ema21_balance_pct=10.0)
+    engine.executor._balance_fraction_result = (None, None, 0)
+    await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+    assert engine._entry_premium is None
+    assert not engine.executor.has_open_position
+
+
+async def test_dynamic_lots_are_recorded_correctly_in_saved_state() -> None:
+    """position_state must save the ACTUAL tracked size (7), not the static
+    settings.option_contracts (25) -- this was a real bug: size was hardcoded
+    to settings.option_contracts even on the dynamic-sizing path."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        state_file = str(Path(d) / "pos.json")
+        engine = _make_engine(ema21_balance_pct=10.0, state_file=state_file)
+        await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+        saved = json.loads(Path(state_file).read_text())
+        assert saved["size"] == 7
+
+
+async def test_close_leg_uses_actual_tracked_size_not_static_config() -> None:
+    """_close_leg's P&L/notify 'size' must reflect the REAL lots that were
+    open (captured before close_option() clears tracked state), not
+    settings.option_contracts -- same bug class as the state-save one above."""
+    engine = _make_engine(ema21_balance_pct=10.0)
+    await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
+    assert engine.executor.tracked_size == 7
+    await engine._close_leg("SL", btc_exit_price=64500.0)
+    ev = _exit_calls(engine.notifier)[-1]
+    assert ev.kwargs["size"] == 7
 
 
 async def test_bearish_signal_buys_put() -> None:
