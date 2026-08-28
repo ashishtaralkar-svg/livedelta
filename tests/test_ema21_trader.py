@@ -33,11 +33,13 @@ class FakeExecutor:
         self.open_calls: list[tuple[int, float]] = []
         self.balance_fraction_calls: list[tuple[int, float, float, str | None]] = []
         self.trade_price_calls: list[tuple[int, float]] = []
+        self.trade_price_balance_calls: list[tuple[int, float, float, str | None]] = []
         self.close_calls = 0
         self._open_result: tuple[float | None, str | None] = (100.0, "C-BTC-64000-070726")
         self._open_size = 25   # lots for the static open_option_by_premium path
         self._balance_fraction_result: tuple[float | None, str | None, int] = (100.0, "C-BTC-64000-070726", 7)
         self._trade_price_result: tuple[float | None, str | None] = (100.0, "C-BTC-64000-070726")
+        self._trade_price_balance_result: tuple[float | None, str | None, int] = (100.0, "C-BTC-64000-070726", 9)
         self._close_result: float | None = 400.0   # 4x, for TP tests
 
     async def open_option_by_premium(self, signal_dir: int, target_premium: float):
@@ -69,6 +71,17 @@ class FakeExecutor:
             self.tracked_product_id = 123
             self.tracked_size = self._open_size
         return fill, symbol
+
+    async def open_option_by_trade_price_and_balance_fraction(self, signal_dir, target_premium,
+                                                                balance_fraction, margin_asset):
+        self.trade_price_balance_calls.append((signal_dir, target_premium, balance_fraction, margin_asset))
+        fill, symbol, lots = self._trade_price_balance_result
+        if fill is not None and lots > 0:
+            self.has_open_position = True
+            self.tracked_symbol = symbol
+            self.tracked_product_id = 123
+            self.tracked_size = lots
+        return fill, symbol, lots
 
     async def close_option(self):
         self.close_calls += 1
@@ -182,13 +195,18 @@ async def test_ema21_use_trade_price_uses_the_trade_price_path() -> None:
     assert engine.executor.balance_fraction_calls == []  # balance path never called
 
 
-async def test_ema21_use_trade_price_takes_priority_over_balance_pct() -> None:
-    """Both set: trade-price mode wins, balance-fraction sizing is ignored
-    (lot sizing stays static in that case)."""
+async def test_ema21_use_trade_price_and_balance_pct_combine() -> None:
+    """Both set: strike SELECTION and lot SIZING are independent toggles --
+    the combined open_option_by_trade_price_and_balance_fraction path is
+    used, and neither of the two single-purpose paths fires."""
     engine = _make_engine(ema21_use_trade_price=True, ema21_balance_pct=10.0)
     await engine._open_entry(SignalDir.LONG.value, sl_level=63000.0, btc_price=64000.0)
-    assert engine.executor.trade_price_calls == [(SignalDir.LONG.value, 100.0)]
+    assert engine.executor.trade_price_balance_calls == [
+        (SignalDir.LONG.value, 100.0, 0.10, None)]
+    assert engine.executor.trade_price_calls == []
     assert engine.executor.balance_fraction_calls == []
+    assert engine.executor.open_calls == []
+    assert engine.executor.tracked_size == 9   # FakeExecutor's _trade_price_balance_result lots
 
 
 async def test_dynamic_lots_are_recorded_correctly_in_saved_state() -> None:

@@ -387,16 +387,25 @@ class Ema21BreakdownEngine:
         try:
             is_buy_signal = signal_dir == SignalDir.LONG.value
             try:
-                # Mutually exclusive, trade-price mode takes priority if
-                # both are set (lot sizing stays static in that case).
-                if self.settings.ema21_use_trade_price:
+                # Both toggles are independent and combine freely: strike
+                # SELECTION (trade-price vs mark-price) and lot SIZING
+                # (balance-fraction vs static) are orthogonal choices.
+                use_trade_price = self.settings.ema21_use_trade_price
+                use_balance_pct = self.settings.ema21_balance_pct > 0
+                if use_trade_price and use_balance_pct:
+                    # (None, None, 0) if sizing computed 0 lots (balance too
+                    # small) -- fill stays None either way, matching
+                    # open_option_by_premium's own failure shape.
+                    fill, symbol, _ = await self.executor.open_option_by_trade_price_and_balance_fraction(
+                        signal_dir, self.settings.target_premium,
+                        self.settings.ema21_balance_pct / 100.0,
+                        self.settings.option_margin_asset,
+                    )
+                elif use_trade_price:
                     fill, symbol = await self.executor.open_option_by_trade_price(
                         signal_dir, self.settings.target_premium
                     )
-                elif self.settings.ema21_balance_pct > 0:
-                    # returns (None, None, 0) if sizing computed 0 lots
-                    # (balance too small) -- fill stays None either way,
-                    # matching open_option_by_premium's own failure shape.
+                elif use_balance_pct:
                     fill, symbol, _ = await self.executor.open_option_by_balance_fraction(
                         signal_dir, self.settings.target_premium,
                         self.settings.ema21_balance_pct / 100.0,

@@ -245,3 +245,56 @@ async def test_open_by_trade_price_guarded_when_already_open() -> None:
     fill, symbol = await ex.open_option_by_trade_price(SignalDir.LONG.value, 102.0)
     assert (fill, symbol) == (None, None)
     ex._rest.place_market_order.assert_not_called()
+
+
+# --------------------------------------------------------------------- #
+# open_option_by_trade_price_and_balance_fraction: strike selection and
+# lot sizing are independent -- combines trade-price selection with
+# balance-fraction sizing. Sizing uses the SELECTED candidate's mark_price
+# (100.0 for 64000), not the trade price used to pick it.
+# lot_size(BTC)=0.001 -> cost_per_lot=0.1. balance=50.0, fraction=0.10 ->
+# target=$5 -> lots = int(5.0 // 0.1) = 49 (binary float: 0.1 isn't exact,
+# so 5.0 // 0.1 lands just under 50 and floors down).
+# --------------------------------------------------------------------- #
+async def test_trade_price_and_balance_fraction_combine() -> None:
+    now = int(time.time())
+    candles = {
+        "C-BTC-64000-180726": [_candle(now - 10, 100.0)],   # trade price close to target 102
+        "C-BTC-64200-180726": [_candle(now - 10, 999.0)],   # far
+    }
+    rest = _fake_rest_multi_strike(candles)
+    rest.get_available_balance = MagicMock(return_value=50.0)
+    ex = OptionsExecutor(rest, _settings(option_side="buy"))
+    fill, symbol, lots = await ex.open_option_by_trade_price_and_balance_fraction(
+        SignalDir.LONG.value, 102.0, 0.10, None)
+    assert symbol == "C-BTC-64000-180726"   # picked by trade price
+    assert lots == 49                        # sized by balance fraction, NOT settings.option_contracts
+    assert ex.tracked_size == 49
+
+
+async def test_trade_price_and_balance_fraction_zero_lots_skips_entry() -> None:
+    now = int(time.time())
+    candles = {"C-BTC-64000-180726": [_candle(now - 10, 100.0)],
+               "C-BTC-64200-180726": [_candle(now - 10, 999.0)]}
+    rest = _fake_rest_multi_strike(candles)
+    rest.get_available_balance = MagicMock(return_value=0.01)   # too small for even 1 lot
+    ex = OptionsExecutor(rest, _settings(option_side="buy"))
+    fill, symbol, lots = await ex.open_option_by_trade_price_and_balance_fraction(
+        SignalDir.LONG.value, 102.0, 0.10, None)
+    assert (fill, symbol, lots) == (None, None, 0)
+    ex._rest.place_market_order.assert_not_called()
+
+
+async def test_trade_price_and_balance_fraction_guarded_when_already_open() -> None:
+    now = int(time.time())
+    candles = {"C-BTC-64000-180726": [_candle(now - 10, 100.0)],
+               "C-BTC-64200-180726": [_candle(now - 10, 999.0)]}
+    rest = _fake_rest_multi_strike(candles)
+    rest.get_available_balance = MagicMock(return_value=50.0)
+    ex = OptionsExecutor(rest, _settings(option_side="buy"))
+    await ex.open_option_by_trade_price_and_balance_fraction(SignalDir.LONG.value, 102.0, 0.10, None)
+    ex._rest.place_market_order.reset_mock()
+    fill, symbol, lots = await ex.open_option_by_trade_price_and_balance_fraction(
+        SignalDir.LONG.value, 102.0, 0.10, None)
+    assert (fill, symbol, lots) == (None, None, 0)
+    ex._rest.place_market_order.assert_not_called()

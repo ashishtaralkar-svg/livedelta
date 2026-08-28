@@ -258,9 +258,10 @@ class Settings(BaseSettings):
     # candidate whose most recent trade is missing or older than 120s (an
     # illiquid contract that hasn't traded recently). Adds real latency
     # (several historical-candle fetches instead of one bulk chain fetch,
-    # even though they run concurrently) -- NEVER tested live. Mutually
-    # exclusive with ema21_balance_pct above (trade-price mode takes
-    # priority if both are set; lot sizing stays static in that case).
+    # even though they run concurrently) -- NEVER tested live. INDEPENDENT
+    # of ema21_balance_pct above -- strike SELECTION and lot SIZING are
+    # orthogonal; both can be on together (see OptionsExecutor.
+    # open_option_by_trade_price_and_balance_fraction).
     ema21_use_trade_price: bool = False
 
     # SupertrendFixedSl (strategy="supertrend"): Supertrend(10,3) flip timing on

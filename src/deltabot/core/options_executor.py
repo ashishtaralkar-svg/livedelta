@@ -211,40 +211,23 @@ class OptionsExecutor:
         )
         return result.average_fill_price, best["symbol"]
 
-    async def open_option_by_balance_fraction(
-        self, signal_dir: int, target_premium: float, balance_fraction: float,
-        margin_asset: str | None = None,
+    async def _open_by_balance_fraction_from_candidate(
+        self, best: dict, signal_dir: int, balance_fraction: float, margin_asset: str | None,
     ) -> tuple[float | None, str | None, int]:
-        """Like :meth:`open_option_by_premium`, but the lot count is computed
-        from a FRACTION of current available balance instead of the static
-        ``settings.option_contracts`` -- e.g. balance_fraction=0.10 spends up
-        to 10% of the account's available balance on this entry's premium.
-
-        Selects the contract ONCE (via :meth:`select_by_premium`, same as the
-        static path) so its real mark_price sizes the trade -- lots =
-        floor(balance_fraction * available_balance / (mark_price * lot_size)).
-        If that computes to 0 (balance too small for even 1 lot), the trade
-        is SKIPPED entirely rather than forcing a minimum -- the whole point
-        of balance-based sizing is never risking more than the fraction
-        allows. Returns ``(fill_price, symbol, lots)``; ``lots`` is 0 on any
-        failure (chain empty, margin error, balance too small, etc.) and the
+        """Shared tail for :meth:`open_option_by_balance_fraction` and
+        :meth:`open_option_by_trade_price_and_balance_fraction`: given an
+        ALREADY-SELECTED candidate (from either select_by_premium or
+        select_by_trade_price), fetch balance, compute lots from
+        ``best["mark_price"]`` (the real-time value, used for sizing
+        regardless of which method picked the strike), and place the order.
+        Returns ``(fill_price, symbol, lots)``; ``lots`` is 0 on any failure
+        (balance fetch error, balance too small for even 1 lot) and the
         caller should treat that exactly like a failed entry.
         """
-        if self._product_id is not None:
-            log.warning(
-                "open_option_by_balance_fraction called while position already tracked — skipping",
-                extra={"extra": {"existing_product_id": self._product_id}},
-            )
-            return None, None, 0
-
-        best = await self.select_by_premium(signal_dir, target_premium)
-        if best is None:
-            return None, None, 0
-
         try:
             balance = await asyncio.to_thread(self._rest.get_available_balance, margin_asset)
         except Exception as exc:  # noqa: BLE001
-            log.error("get_available_balance failed in open_option_by_balance_fraction",
+            log.error("get_available_balance failed in balance-fraction sizing",
                      extra={"extra": {"error": str(exc)}})
             return None, None, 0
 
@@ -284,6 +267,36 @@ class OptionsExecutor:
             }},
         )
         return result.average_fill_price, best["symbol"], lots
+
+    async def open_option_by_balance_fraction(
+        self, signal_dir: int, target_premium: float, balance_fraction: float,
+        margin_asset: str | None = None,
+    ) -> tuple[float | None, str | None, int]:
+        """Like :meth:`open_option_by_premium`, but the lot count is computed
+        from a FRACTION of current available balance instead of the static
+        ``settings.option_contracts`` -- e.g. balance_fraction=0.10 spends up
+        to 10% of the account's available balance on this entry's premium.
+
+        Selects the contract via :meth:`select_by_premium` (real-time
+        mark_price), then sizes and places via
+        :meth:`_open_by_balance_fraction_from_candidate`. If lots computes
+        to 0 (balance too small for even 1 lot), the trade is SKIPPED
+        entirely rather than forcing a minimum -- the whole point of
+        balance-based sizing is never risking more than the fraction allows.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_balance_fraction called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None, 0
+
+        best = await self.select_by_premium(signal_dir, target_premium)
+        if best is None:
+            return None, None, 0
+        return await self._open_by_balance_fraction_from_candidate(
+            best, signal_dir, balance_fraction, margin_asset
+        )
 
     async def select_by_trade_price(
         self, signal_dir: int, target_premium: float,
@@ -399,6 +412,34 @@ class OptionsExecutor:
             }},
         )
         return result.average_fill_price, best["symbol"]
+
+    async def open_option_by_trade_price_and_balance_fraction(
+        self, signal_dir: int, target_premium: float, balance_fraction: float,
+        margin_asset: str | None = None, max_candidates: int = 8, max_age_sec: int = 120,
+    ) -> tuple[float | None, str | None, int]:
+        """Combines both: selects via :meth:`select_by_trade_price` (aligns
+        the picked STRIKE with what a backtest would predict), then sizes
+        and places via :meth:`_open_by_balance_fraction_from_candidate`
+        (lots computed from a fraction of current balance, same as
+        :meth:`open_option_by_balance_fraction`). Sizing still uses the
+        selected candidate's real-time mark_price, not the historical trade
+        price used to pick it -- the trade-price preference only affects
+        WHICH strike is chosen, not the cost-per-lot math.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_trade_price_and_balance_fraction called while position "
+                "already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None, 0
+
+        best = await self.select_by_trade_price(signal_dir, target_premium, max_candidates, max_age_sec)
+        if best is None:
+            return None, None, 0
+        return await self._open_by_balance_fraction_from_candidate(
+            best, signal_dir, balance_fraction, margin_asset
+        )
 
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
         """Open a short option position from the strategy signal direction.
