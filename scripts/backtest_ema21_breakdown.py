@@ -68,6 +68,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     lots = args.lots
     lot_size = args.lot_size if args.lot_size > 0 else op.LOT_SIZE.get(underlying, op.LOT_BTC)
     step = op.RES_SECONDS.get(args.opt_resolution, 60)
+    bar_seconds = op.RES_SECONDS.get(args.resolution, 900)
     es = args.entry_slippage_pct / 100.0
     xs = args.exit_slippage_pct / 100.0
     floor = not args.no_intrinsic_floor
@@ -172,10 +173,20 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             prev_mins = mins
 
             dec = strategy.update(c)
+            # dec reflects the JUST-CLOSED candle `c` -- a signal (SL cross /
+            # pattern trigger) is only genuinely known once `c` closes, i.e.
+            # at c.start_time + bar_seconds, matching when live actually
+            # acts (confirmed against real Telegram fills). Both the
+            # recorded time AND the option-premium lookup use this moment
+            # for signal-driven entries/exits; EOD/TP-poll below are
+            # different -- those are wall-clock/continuous checks and
+            # deliberately keep using c.start_time. Same fix already applied
+            # to backtest_supertrend_fixed_sl.py earlier this session.
+            decision_ts = c.start_time + bar_seconds
 
             if pos is not None and dec is not None and dec.has_exit:
                 exit_price = dec.long_exit_price if dec.long_exit else dec.short_exit_price
-                close(dec.exit_reason, buyback_prem(c.start_time, exit_price), c.start_time, exit_price)
+                close(dec.exit_reason, buyback_prem(decision_ts, exit_price), decision_ts, exit_price)
 
             # TP on the option premium (only if a tp_price was set --
             # sell mode: --tp-decay-pct > 0; buy mode: --tp-gain-pct > 0).
@@ -227,12 +238,14 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             if pos is None and dec is not None and dec.has_entry:
                 if c.start_time < sim_start:
                     strategy.force_flat()   # warmup-window entry: don't take it
-                elif not open_leg(client, c.start_time, c.close, dec.buy_signal):
+                elif not open_leg(client, decision_ts, c.close, dec.buy_signal):
                     strategy.force_flat()   # couldn't price the contract; stay flat
 
         if pos is not None:
             last = candles[-1]
-            close("OPEN_AT_END", buyback_prem(last.start_time, last.close), last.start_time, last.close)
+            last_ts = last.start_time + bar_seconds   # "as of" the last candle's CLOSE, the most
+                                                        # recent genuinely-known moment.
+            close("OPEN_AT_END", buyback_prem(last_ts, last.close), last_ts, last.close)
 
     return trades
 
