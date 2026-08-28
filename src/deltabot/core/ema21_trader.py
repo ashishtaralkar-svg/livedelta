@@ -387,7 +387,13 @@ class Ema21BreakdownEngine:
         try:
             is_buy_signal = signal_dir == SignalDir.LONG.value
             try:
-                if self.settings.ema21_balance_pct > 0:
+                # Mutually exclusive, trade-price mode takes priority if
+                # both are set (lot sizing stays static in that case).
+                if self.settings.ema21_use_trade_price:
+                    fill, symbol = await self.executor.open_option_by_trade_price(
+                        signal_dir, self.settings.target_premium
+                    )
+                elif self.settings.ema21_balance_pct > 0:
                     # returns (None, None, 0) if sizing computed 0 lots
                     # (balance too small) -- fill stays None either way,
                     # matching open_option_by_premium's own failure shape.

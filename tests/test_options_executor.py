@@ -3,6 +3,7 @@ and close, and that default (sell) behavior is byte-for-byte unchanged."""
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -141,4 +142,106 @@ async def test_balance_fraction_guarded_when_already_open() -> None:
     fill, symbol, lots = await ex.open_option_by_balance_fraction(
         SignalDir.LONG.value, 500.0, 0.10, None)
     assert (fill, symbol, lots) == (None, None, 0)
+    ex._rest.place_market_order.assert_not_called()
+
+
+# --------------------------------------------------------------------- #
+# select_by_trade_price / open_option_by_trade_price: prefer each nearby
+# candidate's recent HISTORICAL TRADE-PRICE candle (matching backtest's own
+# data source) over mark_price, falling back to mark_price when stale.
+# --------------------------------------------------------------------- #
+def _fake_rest_multi_strike(candles_by_symbol: dict[str, list] | None = None,
+                            candles_side_effect=None):
+    chain = [
+        {"symbol": "C-BTC-64000-180726", "strike": 64000, "product_id": 111, "mark_price": 100.0},
+        {"symbol": "C-BTC-64200-180726", "strike": 64200, "product_id": 112, "mark_price": 105.0},
+    ]
+    rest = MagicMock()
+    rest.get_option_chain = MagicMock(return_value=chain)
+    rest.place_market_order = MagicMock(return_value=OrderResult(
+        order_id=1, product_id=111, side=Side.BUY, size=25, average_fill_price=100.0,
+    ))
+    if candles_side_effect is not None:
+        rest.get_candles = MagicMock(side_effect=candles_side_effect)
+    else:
+        rest.get_candles = MagicMock(side_effect=lambda sym, res, start, end:
+                                     (candles_by_symbol or {}).get(sym, []))
+    return rest
+
+
+def _candle(ts, close):
+    from deltabot.models import Candle
+    return Candle(start_time=ts, open=close, high=close, low=close, close=close, volume=1.0)
+
+
+async def test_trade_price_overrides_mark_price_ranking() -> None:
+    """mark_price alone would pick strike 64000 (|100-102|=2 < |105-102|=3),
+    but its recent trade price is actually further from target -- trade
+    price must win the ranking."""
+    now = int(time.time())
+    candles = {
+        "C-BTC-64000-180726": [_candle(now - 10, 90.0)],    # trade price 90 -- |90-102|=12
+        "C-BTC-64200-180726": [_candle(now - 10, 103.0)],   # trade price 103 -- |103-102|=1, closer
+    }
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles), _settings(option_side="buy"))
+    best = await ex.select_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert best["symbol"] == "C-BTC-64200-180726"
+
+
+async def test_trade_price_falls_back_to_mark_price_when_candle_missing() -> None:
+    now = int(time.time())
+    candles = {
+        "C-BTC-64000-180726": [],   # no recent trade -- falls back to mark_price=100.0
+        "C-BTC-64200-180726": [_candle(now - 10, 50.0)],   # far from target
+    }
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles), _settings(option_side="buy"))
+    best = await ex.select_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert best["symbol"] == "C-BTC-64000-180726"   # mark_price(100) closer to 102 than trade(50)
+
+
+async def test_trade_price_falls_back_to_mark_price_when_candle_stale() -> None:
+    now = int(time.time())
+    candles = {
+        # candle is 300s old, beyond the default 120s max_age -- stale, falls back to mark_price
+        "C-BTC-64000-180726": [_candle(now - 300, 200.0)],
+        "C-BTC-64200-180726": [_candle(now - 10, 999.0)],
+    }
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles), _settings(option_side="buy"))
+    best = await ex.select_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert best["symbol"] == "C-BTC-64000-180726"   # falls back to its mark_price(100), closest
+
+
+async def test_trade_price_falls_back_to_mark_price_on_fetch_error() -> None:
+    def side_effect(sym, res, start, end):
+        if sym == "C-BTC-64000-180726":
+            raise RuntimeError("boom")
+        return [_candle(int(time.time()) - 10, 999.0)]
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles_side_effect=side_effect), _settings(option_side="buy"))
+    best = await ex.select_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert best["symbol"] == "C-BTC-64000-180726"   # error -> falls back to mark_price(100), closest
+
+
+async def test_open_by_trade_price_uses_static_lot_count() -> None:
+    now = int(time.time())
+    candles = {
+        "C-BTC-64000-180726": [_candle(now - 10, 100.0)],
+        "C-BTC-64200-180726": [_candle(now - 10, 999.0)],
+    }
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles), _settings(option_side="buy", option_contracts=25))
+    fill, symbol = await ex.open_option_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert symbol == "C-BTC-64000-180726"
+    assert ex.tracked_size == 25   # static, unaffected by trade-price mode
+    order_size = ex._rest.place_market_order.call_args.args[1]
+    assert order_size == 25
+
+
+async def test_open_by_trade_price_guarded_when_already_open() -> None:
+    now = int(time.time())
+    candles = {"C-BTC-64000-180726": [_candle(now - 10, 100.0)],
+               "C-BTC-64200-180726": [_candle(now - 10, 999.0)]}
+    ex = OptionsExecutor(_fake_rest_multi_strike(candles), _settings(option_side="buy"))
+    await ex.open_option_by_trade_price(SignalDir.LONG.value, 102.0)
+    ex._rest.place_market_order.reset_mock()
+    fill, symbol = await ex.open_option_by_trade_price(SignalDir.LONG.value, 102.0)
+    assert (fill, symbol) == (None, None)
     ex._rest.place_market_order.assert_not_called()

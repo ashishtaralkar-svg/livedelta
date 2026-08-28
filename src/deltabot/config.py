@@ -249,6 +249,19 @@ class Settings(BaseSettings):
     # computed lot count is 0 (balance too small), the entry is skipped
     # entirely rather than forcing a minimum size.
     ema21_balance_pct: float = 0.0
+    # Strike-selection data source (added on request, to align live's picked
+    # strike with what the backtest would predict): False (default) = the
+    # existing real-time mark_price path (OptionsExecutor.select_by_premium),
+    # fastest and always-available. True = prefer each nearby candidate's
+    # most recent HISTORICAL TRADE-PRICE candle instead (the same data
+    # source backtest scripts use), falling back to mark_price for any
+    # candidate whose most recent trade is missing or older than 120s (an
+    # illiquid contract that hasn't traded recently). Adds real latency
+    # (several historical-candle fetches instead of one bulk chain fetch,
+    # even though they run concurrently) -- NEVER tested live. Mutually
+    # exclusive with ema21_balance_pct above (trade-price mode takes
+    # priority if both are set; lot sizing stays static in that case).
+    ema21_use_trade_price: bool = False
 
     # SupertrendFixedSl (strategy="supertrend"): Supertrend(10,3) flip timing on
     # real (non-HA) OHLC, a FROZEN stop (read once at the flip, never re-derived

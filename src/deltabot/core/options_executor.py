@@ -21,6 +21,7 @@ day's expiry is used so we never enter a contract that expires imminently.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -283,6 +284,121 @@ class OptionsExecutor:
             }},
         )
         return result.average_fill_price, best["symbol"], lots
+
+    async def select_by_trade_price(
+        self, signal_dir: int, target_premium: float,
+        max_candidates: int = 8, max_age_sec: int = 120,
+    ) -> dict | None:
+        """Like :meth:`select_by_premium`, but prefers each candidate's most
+        recent HISTORICAL TRADE-PRICE candle (the same data source the
+        backtest scripts use) over the live mark_price, so live strike
+        selection aligns with what a backtest would predict -- falling back
+        to that candidate's mark_price if its most recent candle is missing
+        or older than ``max_age_sec`` (an illiquid contract that hasn't
+        traded recently would otherwise be picked off a stale price).
+
+        Only checks the ``max_candidates`` strikes closest to
+        target_premium BY MARK PRICE first (one cheap bulk chain fetch),
+        then does ONE historical-candle fetch per candidate, run
+        CONCURRENTLY -- not the whole chain, to keep the added latency this
+        introduces bounded (still meaningfully slower than the pure
+        mark-price path: several historical-candle round trips instead of
+        one bulk chain fetch).
+        """
+        option_type = self._option_type_for(signal_dir)
+        expiry = self._select_expiry()
+        underlying = self.underlying
+
+        try:
+            chain = await asyncio.to_thread(
+                self._rest.get_option_chain, underlying, expiry, option_type
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("get_option_chain failed in select_by_trade_price", extra={"extra": {"error": str(exc)}})
+            return None
+
+        candidates = [c for c in chain if c.get("mark_price") is not None]
+        if not candidates:
+            log.warning("No option contracts with mark_price — cannot select by trade price")
+            return None
+
+        candidates.sort(key=lambda c: abs(c["mark_price"] - target_premium))
+        shortlist = candidates[:max_candidates]
+        now = int(time.time())
+
+        async def _trade_price(c: dict) -> float:
+            try:
+                hist = await asyncio.to_thread(
+                    self._rest.get_candles, c["symbol"], "1m", now - max_age_sec, now
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("get_candles failed in select_by_trade_price — falling back to mark_price",
+                           extra={"extra": {"symbol": c["symbol"], "error": str(exc)}})
+                return c["mark_price"]
+            if not hist:
+                return c["mark_price"]   # no recent trade -- stale, fall back
+            latest = hist[-1]
+            if now - latest.start_time > max_age_sec:
+                return c["mark_price"]   # most recent trade too old -- stale, fall back
+            return latest.close
+
+        prices = await asyncio.gather(*(_trade_price(c) for c in shortlist))
+        best, best_price = min(zip(shortlist, prices), key=lambda cp: abs(cp[1] - target_premium))
+        log.info(
+            "Selected option by trade price",
+            extra={"extra": {
+                "symbol": best["symbol"], "trade_price": best_price,
+                "mark_price": best["mark_price"], "target_premium": target_premium,
+                "strike": best["strike"],
+            }},
+        )
+        return best
+
+    async def open_option_by_trade_price(
+        self, signal_dir: int, target_premium: float,
+        max_candidates: int = 8, max_age_sec: int = 120,
+    ) -> tuple[float | None, str | None]:
+        """Like :meth:`open_option_by_premium`, but selects via
+        :meth:`select_by_trade_price` instead of :meth:`select_by_premium` --
+        lot count still comes from settings.option_contracts (unchanged),
+        only the CONTRACT SELECTED differs.
+        """
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_trade_price called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None
+
+        best = await self.select_by_trade_price(signal_dir, target_premium, max_candidates, max_age_sec)
+        if best is None:
+            return None, None
+        option_type = self._option_type_for(signal_dir)
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
+
+        await self._check_balance()
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(best["product_id"])
+
+        size = self._settings.option_contracts
+        result = await asyncio.to_thread(
+            self._rest.place_market_order, best["product_id"], size, open_side
+        )
+
+        self._product_id = best["product_id"]
+        self._size = size
+        self._option_type = option_type
+        self._symbol = best["symbol"]
+        self._strike = best["strike"]
+
+        log.info(
+            f"Option {open_side.value.upper()} (by trade price) placed",
+            extra={"extra": {
+                "product_id": best["product_id"], "size": size,
+                "fill_price": result.average_fill_price, "mark_price": best["mark_price"],
+            }},
+        )
+        return result.average_fill_price, best["symbol"]
 
     async def open_option(self, signal_dir: int, btc_price: float) -> float | None:
         """Open a short option position from the strategy signal direction.
