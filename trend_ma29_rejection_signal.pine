@@ -32,9 +32,15 @@
 // ARM/BREAK MECHANICS: only one setup can be pending (armed but not yet
 // triggered) per side at a time -- a fresh signal candle does NOT re-arm
 // over an already-pending one (it's simply ignored while one is pending).
-// No expiry/invalidation on a pending arm -- it waits indefinitely for its
-// break, however many bars that takes, unless the block conditions below
-// activate first (which only gate NEW arms, not an already-pending one).
+//
+// PENDING INVALIDATION (added on request): if the SAME condition that would
+// be this side's SL (a close back above SMA29 for a pending SELL, back
+// below SMA29 for a pending BUY) happens BEFORE the pending level ever
+// breaks, that would-be trade is invalid -- discard the pending arm
+// untraded rather than let it sit and trigger later. On a bar where both
+// the invalidation and the break condition are true at once, invalidation
+// wins (same conservative "SL checked first" convention used everywhere
+// else in this script) -- no entry that bar.
 //
 // A side only hunts for its NEXT signal once its current one has resolved
 // (SL or TARGET) -- purely so the plotted entry/target lines never overlap.
@@ -162,8 +168,18 @@ sellCrossReleased = sellBlocked and ema29AboveSma29 != sellBlockedAbove
 if sellCrossReleased
     sellBlocked := false
 
-// Trigger check FIRST, using sellPending/sellPendingLow as they stood
-// BEFORE this bar (a level armed later below can't trigger on its own bar).
+// Invalidation check BEFORE the trigger check: a pending SELL whose own
+// would-be SL condition (close back above SMA29) fires before the break
+// is a dead setup -- discard it, don't let it trigger later.
+sellPendingInvalid = sellPending and close > sma29
+if sellPendingInvalid
+    sellPending := false
+    sellPendingLow := na
+
+// Trigger check, using sellPending/sellPendingLow as they stand AFTER the
+// invalidation check above (so an invalidation this bar blocks this bar's
+// trigger too) but BEFORE this bar's own arm check below (a level armed
+// later below can't trigger on its own bar).
 sellTriggerHit = sellPending and low <= sellPendingLow
 if sellTriggerHit
     sellEntry := sellPendingLow
@@ -206,8 +222,18 @@ buyCrossReleased = buyBlocked and ema29AboveSma29 != buyBlockedAbove
 if buyCrossReleased
     buyBlocked := false
 
-// Trigger check FIRST, using buyPending/buyPendingHigh as they stood
-// BEFORE this bar (a level armed later below can't trigger on its own bar).
+// Invalidation check BEFORE the trigger check: a pending BUY whose own
+// would-be SL condition (close back below SMA29) fires before the break
+// is a dead setup -- discard it, don't let it trigger later.
+buyPendingInvalid = buyPending and close < sma29
+if buyPendingInvalid
+    buyPending := false
+    buyPendingHigh := na
+
+// Trigger check, using buyPending/buyPendingHigh as they stand AFTER the
+// invalidation check above (so an invalidation this bar blocks this bar's
+// trigger too) but BEFORE this bar's own arm check below (a level armed
+// later below can't trigger on its own bar).
 buyTriggerHit = buyPending and high >= buyPendingHigh
 if buyTriggerHit
     buyEntry := buyPendingHigh
@@ -232,6 +258,11 @@ plotshape(sellArmed, title="SELL armed", style=shape.circle, location=location.a
      color=color.new(color.maroon, 0), size=size.tiny)
 plotshape(buyArmed, title="BUY armed", style=shape.circle, location=location.belowbar,
      color=color.new(color.olive, 0), size=size.tiny)
+
+plotshape(sellPendingInvalid, title="SELL pending invalidated", style=shape.xcross, location=location.abovebar,
+     color=color.new(color.gray, 0), size=size.tiny)
+plotshape(buyPendingInvalid, title="BUY pending invalidated", style=shape.xcross, location=location.belowbar,
+     color=color.new(color.gray, 0), size=size.tiny)
 
 plotshape(sellFired, title="SELL signal", style=shape.triangledown, location=location.abovebar,
      color=color.new(color.red, 0), size=size.small, text="SELL")
