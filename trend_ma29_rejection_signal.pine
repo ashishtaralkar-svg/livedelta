@@ -56,10 +56,10 @@ emaTrendSlow = ta.ema(close, trendSlowLen)
 ema29 = ta.ema(close, maLen)
 sma29 = ta.sma(close, maLen)
 
-plot(emaTrendFast, "EMA " + str.tostring(trendFastLen), color=color.new(color.blue, 0),   linewidth=1)
-plot(emaTrendSlow, "EMA " + str.tostring(trendSlowLen), color=color.new(color.purple, 0), linewidth=1)
-plot(ema29, "EMA " + str.tostring(maLen), color=color.new(color.aqua, 0),   linewidth=2)
-plot(sma29, "SMA " + str.tostring(maLen), color=color.new(color.orange, 0), linewidth=2)
+plot(emaTrendFast, "Trend EMA Fast", color=color.new(color.blue, 0),   linewidth=1)
+plot(emaTrendSlow, "Trend EMA Slow", color=color.new(color.purple, 0), linewidth=1)
+plot(ema29, "EMA 29", color=color.new(color.aqua, 0),   linewidth=2)
+plot(sma29, "SMA 29", color=color.new(color.orange, 0), linewidth=2)
 
 eq(a, b) => math.abs(a - b) <= syminfo.mintick
 
