@@ -32,6 +32,12 @@
 // at once, though in practice the trend-regime gate (EMA150 vs EMA600)
 // makes sell and buy setups mutually exclusive at any given bar anyway.
 //
+// POST-TARGET BLOCK (added on request): a TARGET hit (NOT an SL hit) blocks
+// that side from any new entry until EMA(29) and SMA(29) cross again -- the
+// EMA29-vs-SMA29 relationship is captured the instant the target fires, and
+// the block releases the first bar that relationship flips. SL exits re-arm
+// immediately as before; only TARGET exits trigger this cooldown.
+//
 // SIGNAL ONLY -- no strategy.entry/close, no backtest equity curve. Same
 // "signal indicator" convention as tcp_pattern_signal.pine elsewhere in
 // this repo (use TradingView alerts on the alertcondition()s below if you
@@ -88,6 +94,17 @@ var bool  buyActive = false
 var float buyEntry  = na
 var float buyTarget = na
 
+// Post-TARGET block (added on request): once a side's TARGET is hit (SL
+// does NOT arm this), no new entry on that side until EMA(29) and SMA(29)
+// cross again -- i.e. their relative order flips from whatever it was
+// the instant the target fired.
+var bool sellBlocked      = false
+var bool sellBlockedAbove = false   // ema29 > sma29, captured at the TARGET hit
+var bool buyBlocked       = false
+var bool buyBlockedAbove  = false
+
+ema29AboveSma29 = ema29 > sma29
+
 sellFired = false
 buyFired  = false
 sellExitFired = false
@@ -119,8 +136,14 @@ if sellTpHit
     sellActive := false
     sellEntry := na
     sellTarget := na
+    sellBlocked := true
+    sellBlockedAbove := ema29AboveSma29
 
-if not sellActive and not sellJustExited and sellSetup
+sellCrossReleased = sellBlocked and ema29AboveSma29 != sellBlockedAbove
+if sellCrossReleased
+    sellBlocked := false
+
+if not sellActive and not sellJustExited and not sellBlocked and sellSetup
     sellEntry := close
     sellTarget := close * (1 - targetPct)
     sellActive := true
@@ -146,8 +169,14 @@ if buyTpHit
     buyActive := false
     buyEntry := na
     buyTarget := na
+    buyBlocked := true
+    buyBlockedAbove := ema29AboveSma29
 
-if not buyActive and not buyJustExited and buySetup
+buyCrossReleased = buyBlocked and ema29AboveSma29 != buyBlockedAbove
+if buyCrossReleased
+    buyBlocked := false
+
+if not buyActive and not buyJustExited and not buyBlocked and buySetup
     buyEntry := close
     buyTarget := close * (1 + targetPct)
     buyActive := true
@@ -165,6 +194,9 @@ plot(sellActive ? sellEntry  : na, "Sell entry",  color=color.new(color.gray, 0)
 plot(sellActive ? sellTarget : na, "Sell target", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
 plot(buyActive  ? buyEntry   : na, "Buy entry",   color=color.new(color.gray, 0),  style=plot.style_linebr, linewidth=1)
 plot(buyActive  ? buyTarget  : na, "Buy target",  color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+bgcolor(sellBlocked ? color.new(color.red, 90)   : na, title="Sell blocked (post-target, awaiting EMA29/SMA29 cross)")
+bgcolor(buyBlocked  ? color.new(color.green, 90) : na, title="Buy blocked (post-target, awaiting EMA29/SMA29 cross)")
 
 if sellFired
     label.new(bar_index, sellEntry, "SELL " + str.tostring(sellEntry, format.mintick),
