@@ -97,44 +97,56 @@ sellExitPrice = 0.0
 buyExitPrice  = 0.0
 
 // ----- SELL side -----
-if sellActive
-    if close > sma29
-        sellExitFired := true
-        sellExitReason := "SL"
-        sellExitPrice := close
-        sellActive := false
-        sellEntry := na
-        sellTarget := na
-    else if low <= sellTarget
-        sellExitFired := true
-        sellExitReason := "TARGET"
-        sellExitPrice := sellTarget
-        sellActive := false
-        sellEntry := na
-        sellTarget := na
-else if sellSetup
+// Flat (single-level) ifs on purpose -- no nested if/else-if chains, so
+// there's no deeper indentation level to get mangled by a copy-paste.
+sellSlHit  = sellActive and close > sma29
+sellTpHit  = sellActive and not sellSlHit and low <= sellTarget
+sellJustExited = sellSlHit or sellTpHit
+
+if sellSlHit
+    sellExitFired := true
+    sellExitReason := "SL"
+    sellExitPrice := close
+    sellActive := false
+    sellEntry := na
+    sellTarget := na
+
+if sellTpHit
+    sellExitFired := true
+    sellExitReason := "TARGET"
+    sellExitPrice := sellTarget
+    sellActive := false
+    sellEntry := na
+    sellTarget := na
+
+if not sellActive and not sellJustExited and sellSetup
     sellEntry := close
     sellTarget := close * (1 - targetPct)
     sellActive := true
     sellFired := true
 
 // ----- BUY side (mirror) -----
-if buyActive
-    if close < sma29
-        buyExitFired := true
-        buyExitReason := "SL"
-        buyExitPrice := close
-        buyActive := false
-        buyEntry := na
-        buyTarget := na
-    else if high >= buyTarget
-        buyExitFired := true
-        buyExitReason := "TARGET"
-        buyExitPrice := buyTarget
-        buyActive := false
-        buyEntry := na
-        buyTarget := na
-else if buySetup
+buySlHit  = buyActive and close < sma29
+buyTpHit  = buyActive and not buySlHit and high >= buyTarget
+buyJustExited = buySlHit or buyTpHit
+
+if buySlHit
+    buyExitFired := true
+    buyExitReason := "SL"
+    buyExitPrice := close
+    buyActive := false
+    buyEntry := na
+    buyTarget := na
+
+if buyTpHit
+    buyExitFired := true
+    buyExitReason := "TARGET"
+    buyExitPrice := buyTarget
+    buyActive := false
+    buyEntry := na
+    buyTarget := na
+
+if not buyActive and not buyJustExited and buySetup
     buyEntry := close
     buyTarget := close * (1 + targetPct)
     buyActive := true
