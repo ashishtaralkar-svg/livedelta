@@ -4,10 +4,11 @@
 //
 // SELL setup (all conditions on the SAME signal candle):
 //   * EMA(150) < EMA(600) -- bearish macro trend regime.
-//   * EMA(29) < SMA(29) < close -- price sits above BOTH the 29 EMA and the
-//     29 SMA, with the 29 EMA itself below the 29 SMA (price has bounced
-//     back above its own short-term MAs while the underlying trend is
-//     still bearish -- a "sell the rally" setup).
+//   * close < EMA(29) < SMA(29) -- a fully bearish-aligned MA stack: price
+//     below BOTH the 29 EMA and the 29 SMA, and the faster 29 EMA itself
+//     below the slower 29 SMA (the EMA reacts quicker, so it having already
+//     dropped below the SMA confirms the short-term slide is still fresh,
+//     not just a stale/old decline) -- a downtrend-continuation setup.
 //   * OPEN == HIGH on that candle (tick-tolerant) -- no upper wick at all,
 //     sellers in control from the first tick; the bearish rejection shape.
 //   -> SELL signal fires on that candle, entry = its close.
@@ -20,8 +21,8 @@
 //   (conservative -- same convention as ema21_rejection_pullback_strategy
 //   and every other multi-exit script in this repo).
 //
-// BUY setup is the exact mirror: EMA(150) > EMA(600), close < SMA(29) <
-// EMA(29), OPEN == LOW, SL = a later close back BELOW SMA(29), TARGET =
+// BUY setup is the exact mirror: EMA(150) > EMA(600), SMA(29) < EMA(29) <
+// close, OPEN == LOW, SL = a later close back BELOW SMA(29), TARGET =
 // entry + 1%.
 //
 // A side only hunts for its NEXT signal once its current one has resolved
@@ -67,12 +68,12 @@ eq(a, b) => math.abs(a - b) <= syminfo.mintick
 // Setup conditions (checked on the closed candle itself).
 // ============================================================
 sellTrendOk = emaTrendFast < emaTrendSlow
-sellMaOk    = ema29 < sma29 and sma29 < close
+sellMaOk    = close < ema29 and ema29 < sma29
 sellShapeOk = eq(open, high)
 sellSetup   = sellTrendOk and sellMaOk and sellShapeOk
 
 buyTrendOk  = emaTrendFast > emaTrendSlow
-buyMaOk     = close < sma29 and sma29 < ema29
+buyMaOk     = sma29 < ema29 and ema29 < close
 buyShapeOk  = eq(open, low)
 buySetup    = buyTrendOk and buyMaOk and buyShapeOk
 
