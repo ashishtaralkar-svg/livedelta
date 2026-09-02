@@ -1,0 +1,174 @@
+//@version=5
+// ============================================================================
+// TREND + MA29 REJECTION — SIGNAL ONLY (no trade execution, no strategy.*)
+//
+// SELL setup (all conditions on the SAME signal candle):
+//   * EMA(150) < EMA(600) -- bearish macro trend regime.
+//   * EMA(29) < SMA(29) < close -- price sits above BOTH the 29 EMA and the
+//     29 SMA, with the 29 EMA itself below the 29 SMA (price has bounced
+//     back above its own short-term MAs while the underlying trend is
+//     still bearish -- a "sell the rally" setup).
+//   * OPEN == HIGH on that candle (tick-tolerant) -- no upper wick at all,
+//     sellers in control from the first tick; the bearish rejection shape.
+//   -> SELL signal fires on that candle, entry = its close.
+//   SL: NOT a fixed price -- a LATER candle CLOSING back above SMA(29)
+//       (checked every bar using SMA(29)'s then-current, still-updating
+//       value, not frozen at entry).
+//   TARGET: entry - 1% (fixed the instant the signal fires), touch-based
+//       (a later candle's low reaching it).
+//   Priority when both could resolve on the same bar: SL checked first
+//   (conservative -- same convention as ema21_rejection_pullback_strategy
+//   and every other multi-exit script in this repo).
+//
+// BUY setup is the exact mirror: EMA(150) > EMA(600), close < SMA(29) <
+// EMA(29), OPEN == LOW, SL = a later close back BELOW SMA(29), TARGET =
+// entry + 1%.
+//
+// A side only hunts for its NEXT signal once its current one has resolved
+// (SL or TARGET) -- purely so the plotted entry/target lines never overlap.
+// This is NOT a trading strategy, so there's no position sizing or
+// pyramiding concept at all -- both sides could in principle be "active"
+// at once, though in practice the trend-regime gate (EMA150 vs EMA600)
+// makes sell and buy setups mutually exclusive at any given bar anyway.
+//
+// SIGNAL ONLY -- no strategy.entry/close, no backtest equity curve. Same
+// "signal indicator" convention as tcp_pattern_signal.pine elsewhere in
+// this repo (use TradingView alerts on the alertcondition()s below if you
+// want a notification the moment a setup fires or resolves).
+//
+// NOT YET BACKTESTED -- a fresh port, not a validated setup.
+// ============================================================================
+indicator("Trend + MA29 Rejection Signal", overlay=true, max_labels_count=500)
+
+// ============================================================
+// Inputs
+// ============================================================
+trendFastLen = input.int(150, "Trend EMA Fast Length", minval=1, group="Trend filter")
+trendSlowLen = input.int(600, "Trend EMA Slow Length", minval=1, group="Trend filter")
+maLen        = input.int(29,  "EMA/SMA Length", minval=1, group="MA29")
+targetPct    = input.float(1.0, "Target %", minval=0.01, group="Exit") / 100.0
+
+// ============================================================
+// Indicators, all on real close.
+// ============================================================
+emaTrendFast = ta.ema(close, trendFastLen)
+emaTrendSlow = ta.ema(close, trendSlowLen)
+ema29 = ta.ema(close, maLen)
+sma29 = ta.sma(close, maLen)
+
+plot(emaTrendFast, "EMA " + str.tostring(trendFastLen), color=color.new(color.blue, 0),   linewidth=1)
+plot(emaTrendSlow, "EMA " + str.tostring(trendSlowLen), color=color.new(color.purple, 0), linewidth=1)
+plot(ema29, "EMA " + str.tostring(maLen), color=color.new(color.aqua, 0),   linewidth=2)
+plot(sma29, "SMA " + str.tostring(maLen), color=color.new(color.orange, 0), linewidth=2)
+
+eq(a, b) => math.abs(a - b) <= syminfo.mintick
+
+// ============================================================
+// Setup conditions (checked on the closed candle itself).
+// ============================================================
+sellTrendOk = emaTrendFast < emaTrendSlow
+sellMaOk    = ema29 < sma29 and sma29 < close
+sellShapeOk = eq(open, high)
+sellSetup   = sellTrendOk and sellMaOk and sellShapeOk
+
+buyTrendOk  = emaTrendFast > emaTrendSlow
+buyMaOk     = close < sma29 and sma29 < ema29
+buyShapeOk  = eq(open, low)
+buySetup    = buyTrendOk and buyMaOk and buyShapeOk
+
+// ============================================================
+// State — one active setup per side at a time (re-arms once resolved).
+// ============================================================
+var bool  sellActive = false
+var float sellEntry  = na
+var float sellTarget = na
+
+var bool  buyActive = false
+var float buyEntry  = na
+var float buyTarget = na
+
+sellFired = false
+buyFired  = false
+sellExitFired = false
+buyExitFired  = false
+sellExitReason = ""
+buyExitReason  = ""
+sellExitPrice = 0.0
+buyExitPrice  = 0.0
+
+// ----- SELL side -----
+if sellActive
+    if close > sma29
+        sellExitFired := true
+        sellExitReason := "SL"
+        sellExitPrice := close
+        sellActive := false
+        sellEntry := na
+        sellTarget := na
+    else if low <= sellTarget
+        sellExitFired := true
+        sellExitReason := "TARGET"
+        sellExitPrice := sellTarget
+        sellActive := false
+        sellEntry := na
+        sellTarget := na
+else if sellSetup
+    sellEntry := close
+    sellTarget := close * (1 - targetPct)
+    sellActive := true
+    sellFired := true
+
+// ----- BUY side (mirror) -----
+if buyActive
+    if close < sma29
+        buyExitFired := true
+        buyExitReason := "SL"
+        buyExitPrice := close
+        buyActive := false
+        buyEntry := na
+        buyTarget := na
+    else if high >= buyTarget
+        buyExitFired := true
+        buyExitReason := "TARGET"
+        buyExitPrice := buyTarget
+        buyActive := false
+        buyEntry := na
+        buyTarget := na
+else if buySetup
+    buyEntry := close
+    buyTarget := close * (1 + targetPct)
+    buyActive := true
+    buyFired := true
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(sellFired, title="SELL signal", style=shape.triangledown, location=location.abovebar,
+     color=color.new(color.red, 0), size=size.small, text="SELL")
+plotshape(buyFired, title="BUY signal", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.green, 0), size=size.small, text="BUY")
+
+plot(sellActive ? sellEntry  : na, "Sell entry",  color=color.new(color.gray, 0),  style=plot.style_linebr, linewidth=1)
+plot(sellActive ? sellTarget : na, "Sell target", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(buyActive  ? buyEntry   : na, "Buy entry",   color=color.new(color.gray, 0),  style=plot.style_linebr, linewidth=1)
+plot(buyActive  ? buyTarget  : na, "Buy target",  color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+
+if sellFired
+    label.new(bar_index, sellEntry, "SELL " + str.tostring(sellEntry, format.mintick),
+         style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+if buyFired
+    label.new(bar_index, buyEntry, "BUY " + str.tostring(buyEntry, format.mintick),
+         style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+if sellExitFired
+    label.new(bar_index, sellExitPrice, sellExitReason + " " + str.tostring(sellExitPrice, format.mintick),
+         style=label.style_label_left, color=sellExitReason == "TARGET" ? color.new(color.green, 0) : color.new(color.maroon, 0),
+         textcolor=color.white, size=size.small)
+if buyExitFired
+    label.new(bar_index, buyExitPrice, buyExitReason + " " + str.tostring(buyExitPrice, format.mintick),
+         style=label.style_label_left, color=buyExitReason == "TARGET" ? color.new(color.green, 0) : color.new(color.maroon, 0),
+         textcolor=color.white, size=size.small)
+
+alertcondition(sellFired, title="Sell Setup", message="Trend+MA29: SELL setup fired")
+alertcondition(buyFired,  title="Buy Setup",  message="Trend+MA29: BUY setup fired")
+alertcondition(sellExitFired, title="Sell Exit", message="Trend+MA29: SELL setup resolved")
+alertcondition(buyExitFired,  title="Buy Exit",  message="Trend+MA29: BUY setup resolved")
