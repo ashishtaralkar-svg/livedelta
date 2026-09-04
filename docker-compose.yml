@@ -173,3 +173,69 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Range Engulfing Fade bot -- 15m red/green range-engulfing pattern,
+  # SELL-only, ATM, fixed 1:1 SL/TARGET. The FIRST engine in the fleet with
+  # genuine INTRACANDLE execution (reacts to real-time price within a
+  # forming candle, not just at candle close) -- see the module docstring in
+  # core/range_engulfing_fade_sell_trader.py. Own Delta SUB-ACCOUNT, in
+  # parallel with the other bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/range_fade_pos.json). Fill .env.range_fade first
+  # (cp .env.range_fade.example .env.range_fade, add the sub-account API
+  # keys) -- DELTA_OPTION_OFFSET=0 is REQUIRED for ATM. This engine has
+  # NEVER executed a real order, on a never-before-used real-time code path
+  # -- starts at DELTA_OPTION_CONTRACTS=1, watch it closely. Backtested net
+  # NEGATIVE on both 7d and 30d windows tested so far (see the .env example
+  # for numbers) -- do not raise the lot size or treat this as validated.
+  # Bring it up ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build rangefadebot
+  rangefadebot:
+    build: .
+    image: deltabot:latest
+    container_name: rangefadebot
+    restart: always
+    env_file:
+      - .env.range_fade
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
+
+  # Supertrend Stop-And-Reverse (SAR) bot -- 1m Supertrend(10,3), STRICT
+  # SINGLE POSITION (unlike supertrendbot above, never CE+PE at once),
+  # SELLS options. Candle-color first entry at 17:35 IST (deliberately right
+  # next to the 17:30 evening-restart trigger, collapsing both into one
+  # entry window), frozen-SL reversals (day-low/day-high, widened by a
+  # min-ATR guard), a 70%-decay TP that immediately RE-SELLS the same
+  # direction (roll), and the evening restart itself -- see
+  # src/deltabot/strategy/supertrend_sar.py's module docstring for the full
+  # v1-v5 rule history. Own Delta SUB-ACCOUNT, in parallel with the other
+  # bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/sar_pos.json). Fill .env.sar first (cp
+  # .env.sar.example .env.sar, add the sub-account API keys). This engine
+  # has NEVER executed a real order -- watch it closely. This 1m/17:35/
+  # TP-70% config beat the original 5m/05:35/TP-50% config head-to-head on
+  # matched 1wk/1mo/3mo backtests (10 lots): 3mo +$331.42/492 legs (55.7%
+  # win) vs the original's +$150.22/324 legs (48.8% win) -- see .env.sar.
+  # example for the full comparison table. Bring it up ALONE so the other
+  # running bots are not recreated:
+  #   docker compose up -d --build sarbot
+  sarbot:
+    build: .
+    image: deltabot:latest
+    container_name: sarbot
+    restart: always
+    env_file:
+      - .env.sar
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

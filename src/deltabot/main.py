@@ -11,7 +11,9 @@ from .core.dcv2_trader import DCv2Engine
 from .core.dcv3_trader import DCv3Engine
 from .core.ema21_trader import Ema21BreakdownEngine
 from .core.heikin_ashi_trader import HeikinAshiEngine
+from .core.range_engulfing_fade_sell_trader import RangeEngulfingFadeSellEngine
 from .core.revbreak_trader import RevBreakSellEngine
+from .core.supertrend_sar_trader import SupertrendSarEngine
 from .core.supertrend_trader import SupertrendFixedSlEngine
 from .core.tcp_trader import TCPEngine
 from .enums import NotifyEvent
@@ -46,6 +48,10 @@ async def run(settings: Settings) -> None:
         engine = Ema21BreakdownEngine(settings, rest, notifier)
     elif settings.strategy == "supertrend":
         engine = SupertrendFixedSlEngine(settings, rest, notifier)
+    elif settings.strategy == "sar":
+        engine = SupertrendSarEngine(settings, rest, notifier)
+    elif settings.strategy == "range_fade":
+        engine = RangeEngulfingFadeSellEngine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)

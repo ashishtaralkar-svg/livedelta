@@ -1,0 +1,183 @@
+//@version=5
+// ============================================================================
+// SUPERTREND STOP-AND-REVERSE (SAR) v3 -- v1 produced zero trades in
+// TradingView; v2 was a clean rewrite with a simplified SL rule; v3 (this
+// version) additionally drops Supertrend from the entry DIRECTION choice.
+//
+// From 05:35 IST, the CANDLE that closes at that moment (05:30-05:35 by
+// default) arms a single position by its own color -- Supertrend is NOT
+// consulted for direction at all, only for the SL:
+//   red candle (close < open)   -> SELL (short BTC / sell a CALL live)
+//   green candle (close >= open) -> BUY  (long BTC / sell a PUT live)
+// SL on that first trade of the day = Supertrend's own value at entry,
+// frozen. The instant real price touches that frozen SL, the position
+// REVERSES immediately (single position only, never both sides at once).
+// From the FIRST reversal onward, the new SL is no longer Supertrend's
+// value:
+//   reversal INTO a long  -> new SL = that moment's LOW OF DAY
+//   reversal INTO a short -> new SL = that moment's HIGH OF DAY
+// ...and it keeps reversing this way, unbounded, until the daily
+// square-off (17:25 IST). No profit target, no EMA filter.
+//
+// "Day" here means a custom TRADING session that resets at 05:30 IST, not
+// the calendar day -- everything (day-high, day-low, and the "day's first
+// entry has already fired" flag) rolls over together the instant the clock
+// crosses 05:30 IST, five minutes before the strategy starts hunting for a
+// signal at 05:35. Day-high/day-low are the running extremes from that
+// 05:30 reset through the current bar, FROZEN into activeSL the instant a
+// reversal uses them (not trailing further while that leg stays open).
+//
+// Day-tracking bug (kept from v1, still needed): the day's first-entry
+// signal can fire at most ONCE per session, else square-off's own close
+// would leave the strategy flat with afterStart still true and immediately
+// re-arm a fresh position minutes later, the same session.
+//
+// Implementation note: the session boundary is a plain minute-crossing
+// counter (sessionRollover, exactly the same crossing-detection idiom this
+// script already uses for squareOffNow) rather than time("D") -- avoids any
+// dependency on the chart's own timezone setting (time("D") rolls over at
+// the CHART's midnight, not necessarily dayTZ's), so the reset instant is
+// governed purely by the same hour(time, dayTZ)/minute(time, dayTZ) pattern
+// already proven throughout this script.
+// ============================================================================
+strategy("Supertrend SAR v3", overlay=true, pyramiding=0, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, process_orders_on_close=true, calc_on_every_tick=false, commission_type=strategy.commission.percent, commission_value=0.0, max_labels_count=500)
+
+// ------------------------------------------------------------------
+// Inputs
+// ------------------------------------------------------------------
+grpST = "Supertrend"
+atrPeriod = input.int(10, "ATR Period", minval=1, group=grpST)
+factor    = input.float(3.0, "Multiplier", minval=0.1, group=grpST)
+
+grpSession = "Daily start / square-off (IST)"
+dayTZ    = input.string("Asia/Kolkata", "Timezone", group=grpSession)
+startHr  = input.int(5, "Start Hour",   minval=0, maxval=23, group=grpSession)
+startMin = input.int(35, "Start Minute", minval=0, maxval=59, group=grpSession)
+sqHr     = input.int(17, "Square-off Hour",   minval=0, maxval=23, group=grpSession)
+sqMin    = input.int(25, "Square-off Minute", minval=0, maxval=59, group=grpSession)
+resetHr  = input.int(5, "Daily Reset Hour",   minval=0, maxval=23, group=grpSession)
+resetMin = input.int(30, "Daily Reset Minute", minval=0, maxval=59, group=grpSession)
+
+// ------------------------------------------------------------------
+// Supertrend(10,3) on real (non-HA) OHLC.
+// ------------------------------------------------------------------
+[st, dir] = ta.supertrend(factor, atrPeriod)
+plot(st, "Supertrend", color = dir < 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+// ------------------------------------------------------------------
+// Time windows -- proven hour()/minute()+timezone pattern from every other
+// script in this repo.
+// ------------------------------------------------------------------
+startMins = startHr * 60 + startMin
+sqMins    = sqHr * 60 + sqMin
+nowMins   = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+afterStart   = nowMins >= startMins
+squareOffNow = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+
+// Session-day key: a plain counter that increments the instant the clock
+// crosses the 05:30 IST reset boundary -- same crossing-detection idiom as
+// squareOffNow below, just watching resetMins instead of sqMins.
+resetMins = resetHr * 60 + resetMin
+sessionRollover = not na(nowMins[1]) and nowMins >= resetMins and nowMins[1] < resetMins
+var int dayCounter = 0
+if sessionRollover
+    dayCounter := dayCounter + 1
+dayKey = dayCounter
+var int activeDay = na
+
+// Running day-high / day-low: resets the instant the 05:30 boundary is
+// crossed, then simply expands with each bar's high/low through the rest
+// of the session.
+var float dHigh = na
+var float dLow  = na
+dHigh := sessionRollover ? high : math.max(dHigh, high)
+dLow  := sessionRollover ? low  : math.min(dLow, low)
+
+// ------------------------------------------------------------------
+// State -- the open leg's frozen SL (BTC price level).
+// ------------------------------------------------------------------
+var float activeSL = na
+
+// ----- 1. Frozen SL touched -> reverse immediately (single strategy.entry()
+//          call in the opposite direction; Pine closes the old leg and
+//          opens the new one as one reversal order). New SL = day low (into
+//          a long) / day high (into a short) -- NOT Supertrend's value. -----
+shortSlHit = strategy.position_size < 0 and not na(activeSL) and high >= activeSL
+longSlHit  = strategy.position_size > 0 and not na(activeSL) and low  <= activeSL
+
+reverseFired = false
+sellFired = false
+buyFired  = false
+if shortSlHit
+    strategy.entry("Long", strategy.long, comment="SL: day low")
+    activeSL := dLow
+    reverseFired := true
+    buyFired := true
+else if longSlHit
+    strategy.entry("Short", strategy.short, comment="SL: day high")
+    activeSL := dHigh
+    reverseFired := true
+    sellFired := true
+
+// ----- 2. Daily square-off: force flat unconditionally, even a leg that
+//          just opened via the reversal above on this SAME bar. -----
+squareOffFired = false
+if squareOffNow and strategy.position_size != 0
+    strategy.close_all(comment="EOD square-off")
+    activeSL := na
+    squareOffFired := true
+
+// ----- 3. Day's first entry: the closing candle's own color decides
+//          direction (Supertrend NOT consulted here); SL = Supertrend's
+//          own value (ONLY this first trade of the session uses it --
+//          every later reversal uses day low/high instead). At most once
+//          per session (05:30-to-05:30). -----
+flatNow = strategy.position_size == 0
+
+if flatNow and afterStart and not squareOffNow and dayKey != activeDay
+    activeDay := dayKey
+    if close < open
+        strategy.entry("Short", strategy.short)   // red candle -> SELL (CE); SL still from Supertrend
+        activeSL := st
+        sellFired := true
+    else
+        strategy.entry("Long", strategy.long)     // green candle -> BUY (PE); SL still from Supertrend
+        activeSL := st
+        buyFired := true
+
+// ------------------------------------------------------------------
+// Plotting / markers
+// ------------------------------------------------------------------
+bgcolor(squareOffNow ? color.new(color.gray, 85) : na, title="Square-off moment")
+
+plotshape(sellFired, title="SELL marker", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small)
+plotshape(buyFired, title="BUY marker", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+plotshape(reverseFired, title="Stop-and-reverse marker", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(squareOffFired, title="Square-off exit marker", style=shape.square, location=location.abovebar, color=color.new(color.gray, 0), size=size.tiny)
+
+if sellFired
+    label.new(bar_index, high, text="SELL", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+if buyFired
+    label.new(bar_index, low, text="BUY", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
+if squareOffFired
+    label.new(bar_index, high, text="EOD", style=label.style_label_down, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+
+inPos = strategy.position_size != 0
+plot(inPos ? activeSL : na, "Active (frozen) SL", color=color.orange, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+plot(dHigh, "Day High", color=color.new(color.silver, 60), style=plot.style_circles)
+plot(dLow,  "Day Low",  color=color.new(color.silver, 60), style=plot.style_circles)
+
+// ------------------------------------------------------------------
+// TEMP DIAGNOSTICS -- remove once entries are confirmed firing. Expand the
+// indicator's legend (small caret next to "Supertrend SAR v2" top-left) and
+// hover a bar shortly after 05:35 IST to read these off.
+// ------------------------------------------------------------------
+plot(nowMins, "dbg nowMins")
+plot(dayKey, "dbg dayKey")
+plot(activeDay, "dbg activeDay")
+plot(afterStart ? 1 : 0, "dbg afterStart")
+plot(sessionRollover ? 1 : 0, "dbg sessionRollover")
+plot(squareOffNow ? 1 : 0, "dbg squareOffNow")
+plot(flatNow ? 1 : 0, "dbg flatNow")
+plot(close < st ? 1 : 0, "dbg closeBelowST")

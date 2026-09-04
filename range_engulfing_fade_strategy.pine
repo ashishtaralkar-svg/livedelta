@@ -1,0 +1,153 @@
+//@version=5
+// ============================================================================
+// RANGE ENGULFING FADE (SELL ONLY) — sell the breakout of a bullish
+// range-engulfing candle, fading the extension and targeting its own low.
+// This is a MEAN-REVERSION/FADE strategy, not a continuation-breakout one:
+// the "confirmation" candle is itself the bullish signal, and this strategy
+// bets that a further push past its own extreme is exhaustion, not
+// follow-through -- flagged clearly since that's the opposite of what a
+// breakout-continuation strategy would do with the same pattern.
+// Sell-only, on request: the mirror buy/long side (bearish engulf) has been
+// removed entirely from this script.
+//
+// PATTERN:
+//   * Two consecutive candles: RED then GREEN.
+//   * The GREEN candle's RANGE fully engulfs the RED candle's range:
+//     green low < red low AND green high > red high.
+//   * CONFIRMATION: green candle's close > red candle's open (a real body
+//     move back above where the red candle started, not just a wick).
+//   * ARMED TRIGGER = the green candle's HIGH. ARMED TARGET = the green
+//     candle's LOW (the pattern's own base). ARMED SL (not specified in
+//     the original request -- filled in using the pattern's own height as
+//     the risk unit, on request restored to a 1:1 risk:reward): entry +
+//     (green high - green low), i.e. the SAME distance above entry that
+//     the target sits below it.
+//   * ENTRY (ASAP/intracandle, on request -- a LIVE stop order, same
+//     mechanism engulfing_strategy.pine already uses elsewhere in this
+//     repo): the instant armed, a stop order is placed at the trigger
+//     level; it fills the moment real price crosses it, WITHOUT waiting
+//     for the candle to close. Requires process_orders_on_close=false
+//     (below) -- unlike every closed-bar strategy built this session,
+//     this one deliberately fills mid-bar.
+//   * ONE-CANDLE WINDOW (on request): the armed order is only ever live
+//     for the single candle immediately following the one that armed it.
+//     If that next candle closes without a fill, the order is cancelled
+//     and the setup is gone -- it does NOT stay pending waiting for some
+//     later breakout. A fresh pattern on that same next candle can still
+//     arm a brand-new setup of its own.
+//   * Strict single trade: no pyramiding while a short is already open.
+// ============================================================================
+strategy("Range Engulfing Fade (Sell Only)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 1,
+     process_orders_on_close = false,
+     calc_on_every_tick   = false,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.0)
+
+// ============================================================
+// Pattern detection -- checked every bar, only while flat (see below).
+// ============================================================
+isRed   = close < open
+isGreen = close > open
+
+// RED[1] then GREEN[0], green's range engulfs red's.
+bullEngulf = isRed[1] and isGreen and low < low[1] and high > high[1] and close > open[1]
+
+var float pendingShortTrigger = na   // green candle's high
+var float pendingShortSL      = na   // entry + pattern height
+var float pendingShortTarget  = na   // green candle's low
+var int   pendingShortArmBar  = na   // bar_index the setup was armed on
+
+var float activeSL     = na
+var float activeTarget = na
+
+sellFired  = false
+exitFired  = false
+exitReason = ""
+exitPrice  = 0.0
+firedEntryPrice  = 0.0
+firedTargetPrice = 0.0
+
+// ----- 1. Exits -----
+if strategy.position_size < 0
+    if not na(activeSL) and high >= activeSL
+        strategy.close("Short", comment="SL")
+        exitFired := true
+        exitReason := "SL"
+        exitPrice := activeSL
+        activeSL := na
+        activeTarget := na
+    else if not na(activeTarget) and low <= activeTarget
+        strategy.close("Short", comment="TARGET")
+        exitFired := true
+        exitReason := "TARGET"
+        exitPrice := activeTarget
+        activeSL := na
+        activeTarget := na
+
+// ----- 2. Detect a stop order FILL that happened intrabar since the last
+//          bar (position_size just transitioned away from 0) -- this is
+//          how we find out, on the following bar's script evaluation,
+//          that an armed level was actually hit live. -----
+justEnteredShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if justEnteredShort
+    activeSL := pendingShortSL
+    activeTarget := pendingShortTarget
+    sellFired := true
+    firedEntryPrice := strategy.position_avg_price
+    firedTargetPrice := pendingShortTarget
+    pendingShortTrigger := na
+    pendingShortSL := na
+    pendingShortTarget := na
+    pendingShortArmBar := na
+
+// ----- 2.5 Expire a still-pending order that did NOT fill on the one
+//          candle immediately following its arming -- a setup only ever
+//          gets that single candle's chance, it never stays live waiting
+//          for a later breakout. -----
+if not na(pendingShortTrigger) and bar_index > pendingShortArmBar
+    strategy.cancel("Short")
+    pendingShortTrigger := na
+    pendingShortSL := na
+    pendingShortTarget := na
+    pendingShortArmBar := na
+
+// ----- 3. Fresh pattern detection, only while flat -- arms a LIVE stop
+//          order at the trigger level, valid for exactly the next candle
+//          (see 2.5 above). By this point any older pending order has
+//          always already been cleared (filled or expired), so there is
+//          never a still-live order left to cancel here. -----
+flatForHunt = strategy.position_size == 0
+
+if flatForHunt and bullEngulf
+    patternHeight = high - low
+    pendingShortTrigger := high
+    pendingShortSL      := high + patternHeight   // risk = full reward -> 1:1 R:R
+    pendingShortTarget  := low
+    pendingShortArmBar  := bar_index
+    strategy.entry("Short", strategy.short, stop=pendingShortTrigger)
+
+// ============================================================
+// Plotting / markers
+// ============================================================
+plotshape(bullEngulf, "Bull engulf pattern (arms short)", shape.circle, location.abovebar, color.new(color.fuchsia, 0), size=size.tiny)
+
+plot(not na(pendingShortTrigger) ? pendingShortTrigger : na, "Armed short trigger", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=1)
+plot(not na(pendingShortTarget) ? pendingShortTarget : na, "Armed short target", color=color.new(color.red, 60), style=plot.style_linebr, linewidth=1)
+
+plotshape(sellFired, title="SELL", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small, text="SELL")
+
+inPos = strategy.position_size != 0
+plot(inPos ? activeSL : na, "Active SL", color=color.maroon, style=plot.style_linebr, linewidth=2)
+plot(inPos ? activeTarget : na, "Active Target", color=color.lime, style=plot.style_linebr, linewidth=2)
+plot(inPos ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+if sellFired
+    label.new(bar_index, firedEntryPrice, "SELL " + str.tostring(firedEntryPrice, format.mintick), style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+if exitFired
+    label.new(bar_index, exitPrice, exitReason + " " + str.tostring(exitPrice, format.mintick), style=label.style_label_left, color=exitReason == "TARGET" ? color.new(color.green, 0) : color.new(color.maroon, 0), textcolor=color.white, size=size.small)

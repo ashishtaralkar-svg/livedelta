@@ -6,6 +6,11 @@
 .env.dcv2
 .env.dcv3
 .env.dcv2sim
+.env.tcp
+.env.ema21
+.env.supertrend
+.env.range_fade
+.env.sar
 state/
 
 # Python
