@@ -42,13 +42,26 @@ TWO DISTINCT "reopen" PATHS, both landing on the SAME _open_entry():
     Reopens the SAME direction, tracked here via self._current_is_short
     (not re-derived from the strategy).
 
-CLOSED-BAR ONLY (same discipline as Ema21BreakdownEngine): the strategy has
-no intracandle methods and its own backtest is closed-bar-only, so this
-engine only acts on strategy.update() at candle close for SL/entry --
-timing (sar_start_hour/minute, sar_restart_hour/minute) is expressed in
-terms of a candle's start_time, so the actual live/backtest fill lands on
-the candle that CLOSES after the configured threshold (one bar's lag --
-see the sar_restart_hour/minute comment in config.py).
+ASAP (v6) SL/REVERSAL, CLOSED-BAR ENTRIES: the frozen SL is checked against
+REAL price on every forming-candle WS tick (_handle_forming_candle), firing
+the stop-and-reverse the instant it's touched instead of waiting up to a
+full 1-minute bar for the close -- same established pattern as
+HeikinAshiEngine's own intracandle SL/trail check
+(strategy.check_intracandle_sl() is a pure check; strategy.
+apply_intracandle_reversal() mutates state only after this engine has
+confirmed the close actually succeeded, mirroring HeikinAshi's
+check-then-notify_exit ordering). The closed-bar path
+(_handle_closed_candle) still runs every bar as a FALLBACK -- normally a
+no-op, since by the time the bar closes the intracandle path has already
+moved the strategy's SL past whatever touched it; it only actually fires
+when the ASAP path was skipped (e.g. a WS gap/reconnect). Entries (the
+day's first entry, the v5 evening restart) are NOT ASAP -- both need the
+closing candle's own color/close-vs-open, unknowable before the bar
+actually closes, so they stay on the closed-bar path exactly as before.
+Timing (sar_start_hour/minute, sar_restart_hour/minute) is expressed in
+terms of a candle's start_time, so the actual live/backtest fill for THOSE
+still lands on the candle that CLOSES after the configured threshold (one
+bar's lag -- see the sar_restart_hour/minute comment in config.py).
 
 Square-off is wall-clock driven (a wait-until scheduler, not candle-driven,
 so it fires at the exact configured second rather than lagging up to one
@@ -106,7 +119,9 @@ class SupertrendSarEngine:
             restart_hour=settings.sar_restart_hour, restart_minute=settings.sar_restart_minute,
         )
         self.executor = OptionsExecutor(rest, settings)
-        self.aggregator = CandleAggregator(on_closed=self._on_closed_candle)
+        self.aggregator = CandleAggregator(
+            on_closed=self._on_closed_candle, on_forming=self._on_forming_candle
+        )
         self.ws: WebSocketManager | None = None
         self._last_closed_start: int | None = None
         self._last_btc_close: float | None = None
@@ -242,9 +257,13 @@ class SupertrendSarEngine:
                 "l": candle.low, "c": candle.close, "blocked": self._entries_blocked(),
                 "has_option": self.executor.has_open_position, **self.strategy.debug_state()}})
 
-        # 1. Closed-bar exit: the frozen SL was hit. The SAME Decision may
-        #    also carry a reversal entry -- handled in step 2 right after,
-        #    same call, same bar (executor is flat again by then).
+        # 1. Closed-bar exit: the frozen SL was hit. FALLBACK -- v6's own
+        #    ASAP intracandle path (_handle_forming_candle) normally
+        #    already caught this touch in real time; this only actually
+        #    fires when it didn't (e.g. a gap/reconnect swallowed the WS
+        #    ticks). The SAME Decision may also carry a reversal entry --
+        #    handled in step 2 right after, same call, same bar (executor
+        #    is flat again by then).
         if dec is not None and dec.has_exit and self.executor.has_open_position:
             await self._close_leg("SL", btc_exit_price=dec.exit_price)
 
@@ -259,6 +278,38 @@ class SupertrendSarEngine:
         if (dec is not None and dec.has_entry and not self.executor.has_open_position
                 and (dec.has_exit or not self._entries_blocked())):
             await self._open_entry(dec.entry_is_short, dec.sl_level, candle.close)
+
+    # ------------------------------------------------------------------ #
+    def _on_forming_candle(self, candle: Candle) -> None:
+        task = asyncio.create_task(self._handle_forming_candle(candle))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _handle_forming_candle(self, candle: Candle) -> None:
+        """v6 ASAP: fires the SL/reversal the instant REAL price crosses the
+        frozen SL, instead of waiting for the 1-minute bar to close. Checks
+        both the forming candle's running low AND high (either could have
+        touched it at different points within the still-building bar) --
+        same pattern as HeikinAshiEngine's own intracandle SL check. The
+        entry side (day's-first-entry, evening restart) stays closed-bar
+        only -- both need the closing candle's own color, which can't be
+        known before the bar actually closes; see the strategy's own
+        module docstring."""
+        if not self.strategy.ready or not self.executor.has_open_position:
+            return
+        if self._closing or self._entry_in_progress:
+            return   # a close/open is already mid-flight (TP-roll, or we already beat ourselves to it)
+        for price in (candle.low, candle.high):
+            hit, level = self.strategy.check_intracandle_sl(price)
+            if not hit:
+                continue
+            log.info("SAR: intracandle SL touched", extra={"extra": {"price": price, "sl": level}})
+            await self._close_leg("SL", btc_exit_price=level if level is not None else price)
+            if self.executor.has_open_position:
+                return   # close failed (still tracked) -- do NOT reverse; retry next tick/closed-bar fallback
+            new_is_short, new_sl = self.strategy.apply_intracandle_reversal(price)
+            await self._open_entry(new_is_short, new_sl, price)
+            return
 
     # ------------------------------------------------------------------ #
     async def _tp_poll_loop(self) -> None:

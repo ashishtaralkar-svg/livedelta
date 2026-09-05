@@ -181,6 +181,87 @@ def test_min_sl_atr_mult_zero_disables_the_widening_guard() -> None:
     assert d is not None and d.sl_level == 90.0   # untouched -- guard disabled
 
 
+# ---------------------------------------------------------------------- #
+# v6 ASAP (intracandle) SL/reversal.
+# ---------------------------------------------------------------------- #
+def test_check_intracandle_sl_false_when_flat() -> None:
+    s = _strategy()
+    assert s.check_intracandle_sl(999.0) == (False, None)
+
+
+def test_check_intracandle_sl_detects_a_short_leg_touch() -> None:
+    s = _strategy()
+    _ready(s)
+    s._st.update = lambda h, l, c: (105.0, 1)
+    s.update(_c(_ts(5, 35), 100.0, 101.0, 97.0, 98.0))   # red -> short/CE, SL=105.0
+    assert s.check_intracandle_sl(104.9) == (False, 105.0)   # not touched yet
+    assert s.check_intracandle_sl(105.0) == (True, 105.0)    # touched exactly
+    assert s.check_intracandle_sl(110.0) == (True, 105.0)    # blown through
+
+
+def test_check_intracandle_sl_detects_a_long_leg_touch() -> None:
+    s = _strategy()
+    _ready(s)
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(_ts(5, 35), 100.0, 103.0, 99.0, 102.0))   # green -> long/PE, SL=95.0
+    assert s.check_intracandle_sl(95.1) == (False, 95.0)
+    assert s.check_intracandle_sl(95.0) == (True, 95.0)
+    assert s.check_intracandle_sl(90.0) == (True, 95.0)
+
+
+def test_check_intracandle_sl_never_mutates_state() -> None:
+    """Pure check -- calling it repeatedly must not change anything, unlike
+    apply_intracandle_reversal()."""
+    s = _strategy()
+    _ready(s)
+    s._st.update = lambda h, l, c: (105.0, 1)
+    s.update(_c(_ts(5, 35), 100.0, 101.0, 97.0, 98.0))
+    for _ in range(5):
+        s.check_intracandle_sl(200.0)
+    assert s.is_short is True
+    assert s.debug_state()["active_sl"] == 105.0
+
+
+def test_apply_intracandle_reversal_flips_side_and_sets_day_extreme_sl() -> None:
+    s = _strategy()
+    _ready(s)
+    s._st.update = lambda h, l, c: (105.0, 1)
+    s.update(_c(_ts(5, 35), 100.0, 101.0, 97.0, 98.0))   # short/CE, SL=105.0
+    s.update(_c(_ts(6, 0), 100.0, 102.0, 90.0, 101.0))   # establishes day-low=90.0
+    hit, level = s.check_intracandle_sl(106.0)
+    assert hit and level == 105.0
+    new_is_short, new_sl = s.apply_intracandle_reversal(106.0)
+    assert new_is_short is False           # reversed to long/PE
+    assert new_sl == 90.0                   # v2 rule: tracked day-low (106 doesn't beat it)
+    assert s.is_short is False
+    assert s.debug_state()["active_sl"] == 90.0
+    assert s.debug_state()["last_closed_was_short"] is True   # the side that just closed
+
+
+def test_apply_intracandle_reversal_extends_day_extreme_with_the_tick_price() -> None:
+    """The reversal's day-low/day-high is extended one step further using
+    the REAL tick price itself, ahead of whatever the still-forming
+    candle's eventual close will be."""
+    s = _strategy()
+    _ready(s)
+    s._st.update = lambda h, l, c: (105.0, 1)
+    s.update(_c(_ts(5, 35), 100.0, 101.0, 97.0, 98.0))   # short/CE, SL=105.0; day-low so far = 97.0
+    new_is_short, new_sl = s.apply_intracandle_reversal(106.0)
+    assert new_is_short is False
+    assert new_sl == 97.0   # the tick price (106.0) doesn't beat the existing day-low (97.0)
+
+
+def test_apply_intracandle_reversal_respects_the_min_sl_atr_guard() -> None:
+    s = _strategy(min_sl_atr_mult=1.0)
+    _ready(s)
+    s._st.update = lambda h, l, c: (105.0, 1)
+    s.update(_c(_ts(5, 35), 100.0, 101.0, 97.0, 98.0))
+    s._st._atr._value = 20.0   # minimum reversal distance = 20.0
+    new_is_short, new_sl = s.apply_intracandle_reversal(104.0)   # raw day-low would be 97.0
+    assert new_is_short is False
+    assert new_sl == 84.0   # widened: 104.0 (tick price) - 20.0
+
+
 def test_evening_restart_fires_5min_after_squareoff_in_the_same_direction() -> None:
     """v5: 5 minutes after the daily square-off (an external force_flat()
     call), the strategy resumes trading immediately instead of waiting for

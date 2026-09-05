@@ -65,6 +65,29 @@ def _ist_mins(ts: int) -> int:
     return d.hour * 60 + d.minute
 
 
+# Weekend blackout window: Friday 17:35 IST through Sunday 17:35 IST (a
+# rolling 48h block, not just "skip Sat/Sun") -- only blocks FRESH entries
+# (the day's first entry, or the evening restart); a same-bar stop-and-
+# reverse is NEVER blocked by this, since it's just closing out already-
+# open risk, not opening new exposure (same principle already used for
+# DELTA_SKIP_WEEKDAYS in the live engine's _entries_blocked()).
+_BLACKOUT_START_MINS = 17 * 60 + 35   # Friday 17:35
+_BLACKOUT_END_MINS = 17 * 60 + 35     # Sunday 17:35
+
+
+def _in_weekend_blackout(ts: int) -> bool:
+    d = datetime.fromtimestamp(ts, tz=_IST)
+    wd = d.weekday()   # Mon=0 ... Sun=6
+    mins = d.hour * 60 + d.minute
+    if wd == 4:   # Friday
+        return mins >= _BLACKOUT_START_MINS
+    if wd == 5:   # Saturday -- blacked out all day
+        return True
+    if wd == 6:   # Sunday
+        return mins < _BLACKOUT_END_MINS
+    return False
+
+
 def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     strategy = SupertrendSarStrategy(
         atr_period=args.atr_period, factor=args.factor,
@@ -157,10 +180,17 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             # Stop-and-reverse: the SAME Decision that just closed the old
             # leg (above) also carries the reversal's entry signal -- pos
             # is None again by the time this runs, so it opens right away,
-            # same bar, same decision_ts.
+            # same bar, same decision_ts. A FRESH entry (day's-first or
+            # evening-restart, i.e. not a same-bar reversal) is the only
+            # kind --weekend-blackout can block -- a reversal is just
+            # closing out already-open risk, never new exposure.
             if pos is None and dec is not None and dec.has_entry:
+                is_fresh_entry = not dec.has_exit
                 if c.start_time < sim_start:
                     strategy.force_flat()   # warmup-window entry: don't take it
+                elif (args.weekend_blackout and is_fresh_entry
+                      and _in_weekend_blackout(decision_ts)):
+                    strategy.force_flat()   # blacked-out fresh entry: skip, retry next bar
                 elif not open_leg(client, decision_ts, c.close, dec.entry_is_short):
                     strategy.force_flat()   # couldn't price the contract; stay flat, retry next bar
 
@@ -196,10 +226,11 @@ def report(trades: list[dict], args) -> None:
     print(f"\n{'=' * 108}")
     tp_desc = f"TP {args.tp_pct:.0f}%->roll" if args.tp_pct > 0 else "no TP (pure SAR)"
     sl_desc = f"minSL {args.min_sl_atr_mult:.1f}xATR" if args.min_sl_atr_mult > 0 else "raw day-extreme SL"
+    wk_desc = "Fri17:35-Sun17:35 blackout" if args.weekend_blackout else "24/7 (no blackout)"
     print(f"Supertrend SAR [OPTION SELL] -- {args.days}d, {args.resolution}, "
           f"Supertrend({args.atr_period},{args.factor:.0f}), start {args.start_hour:02d}:{args.start_minute:02d} IST, "
           f"restart {args.restart_hour:02d}:{args.restart_minute:02d} IST, "
-          f"premium ~{args.target_premium:.0f}, {tp_desc}, {sl_desc}, {args.lots} lots, "
+          f"premium ~{args.target_premium:.0f}, {tp_desc}, {sl_desc}, {wk_desc}, {args.lots} lots, "
           f"floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 108}")
     if not trades:
@@ -281,6 +312,9 @@ def main() -> None:
                    help="v5 evening restart: resume trading same-direction this many hours:minutes "
                         "after square-off, instead of waiting for next session's first entry")
     p.add_argument("--restart-minute", type=int, default=30)
+    p.add_argument("--weekend-blackout", action="store_true",
+                   help="block FRESH entries (day's-first-entry / evening-restart, never a "
+                        "same-bar reversal) from Friday 17:35 IST through Sunday 17:35 IST")
     p.add_argument("--target-premium", type=float, default=600.0)
     p.add_argument("--tp-pct", type=float, default=50.0,
                    help="book profit + immediately resell same-direction at --target-premium once the "

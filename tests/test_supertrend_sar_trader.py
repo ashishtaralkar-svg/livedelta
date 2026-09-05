@@ -36,6 +36,7 @@ class FakeExecutor:
         self._open_result: tuple[float | None, str | None] = (1400.0, "C-BTC-76000-050926")
         self._open_size = 10
         self._close_result: float | None = 700.0   # 50% decay, for TP-roll tests
+        self._close_should_fail = False
 
     async def open_option_by_premium(self, signal_dir: int, target_premium: float):
         self.open_calls.append((signal_dir, target_premium))
@@ -49,6 +50,8 @@ class FakeExecutor:
 
     async def close_option(self):
         self.close_calls += 1
+        if self._close_should_fail:
+            raise RuntimeError("simulated close failure")
         self.has_open_position = False
         self.tracked_symbol = None
         self.tracked_size = 0
@@ -272,6 +275,78 @@ async def test_weekday_block_suppresses_a_fresh_day_first_entry() -> None:
     engine.strategy.update = lambda candle: dec
     await engine._handle_closed_candle(_c(6000))
     assert engine.executor.open_calls == []
+
+
+# ---------------------------------------------------------------------- #
+# v6 ASAP (intracandle) SL/reversal -- exercises the REAL strategy (not a
+# mocked update()), since check_intracandle_sl/apply_intracandle_reversal
+# live there (tests/test_supertrend_sar.py covers those methods in
+# isolation; these cover the ENGINE's use of them).
+# ---------------------------------------------------------------------- #
+def _open_short(engine, active_sl: float = 79500.0) -> None:
+    """Puts BOTH the executor and the real strategy into a consistent
+    'holding an open short (CE)' state."""
+    engine.executor.has_open_position = True
+    engine.executor.tracked_symbol = "C-BTC-76000-050926"
+    engine.executor.tracked_product_id = 123
+    engine.executor.tracked_size = 10
+    engine._entry_premium = 1400.0
+    engine._current_is_short = True
+    engine.strategy._warmup_bars = 999
+    engine.strategy._in_position = True
+    engine.strategy._is_short = True
+    engine.strategy._active_sl = active_sl
+    engine.strategy._day_high = active_sl
+    engine.strategy._day_low = 78000.0
+
+
+async def test_forming_candle_fires_asap_reversal_on_sl_touch() -> None:
+    engine = _make_engine()
+    _open_short(engine, active_sl=79500.0)
+    engine.executor._close_result = 1600.0
+    engine.executor._open_result = (1420.0, "P-BTC-82000-050926")
+    await engine._handle_forming_candle(_c(1000, o=79000.0, h=79600.0, low=79000.0, cl=79300.0))
+    assert engine.executor.close_calls == 1
+    assert engine.executor.open_calls == [(SignalDir.LONG.value, 1400.0)]   # reversed to long/PE
+    assert engine.executor.has_open_position
+    assert engine.strategy.is_short is False
+    assert engine._current_is_short is False
+
+
+async def test_forming_candle_noop_when_strategy_not_ready() -> None:
+    engine = _make_engine()
+    _open_short(engine)
+    engine.strategy._warmup_bars = 0   # not ready
+    await engine._handle_forming_candle(_c(1000, h=79600.0))
+    assert engine.executor.close_calls == 0
+
+
+async def test_forming_candle_noop_when_flat() -> None:
+    engine = _make_engine()
+    engine.strategy._warmup_bars = 999   # ready, but the executor reports flat
+    await engine._handle_forming_candle(_c(1000, h=999999.0))
+    assert engine.executor.close_calls == 0
+
+
+async def test_forming_candle_noop_when_price_has_not_touched_sl() -> None:
+    engine = _make_engine()
+    _open_short(engine, active_sl=79500.0)
+    await engine._handle_forming_candle(_c(1000, o=79000.0, h=79400.0, low=79000.0, cl=79300.0))
+    assert engine.executor.close_calls == 0
+    assert engine.strategy.is_short is True   # untouched
+
+
+async def test_forming_candle_does_not_reverse_when_the_close_fails() -> None:
+    """If the exchange close call itself fails, the executor is still
+    tracked as open -- must NOT proceed to reverse the strategy/reopen."""
+    engine = _make_engine()
+    _open_short(engine, active_sl=79500.0)
+    engine.executor._close_should_fail = True
+    await engine._handle_forming_candle(_c(1000, o=79000.0, h=79600.0, low=79000.0, cl=79300.0))
+    assert engine.executor.close_calls == 1
+    assert engine.executor.open_calls == []   # never attempted the reopen
+    assert engine.strategy.is_short is True    # strategy state untouched -- still short
+    assert engine.executor.has_open_position   # still tracked as open (close failed)
 
 
 # ---------------------------------------------------------------------- #

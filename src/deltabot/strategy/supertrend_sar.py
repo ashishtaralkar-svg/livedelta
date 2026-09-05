@@ -1,4 +1,4 @@
-"""SupertrendSarStrategy v5 -- user-specified strategy: from a fixed daily
+"""SupertrendSarStrategy v6 -- user-specified strategy: from a fixed daily
 start time, the CANDLE that closes at that moment (05:30-05:35 IST by
 default) arms a single position -- green candle -> BUY/PE, red -> SELL/CE --
 then Stop-And-Reverse (SAR) every time the frozen SL is hit, continuing
@@ -24,11 +24,20 @@ traceable):
     after the session reset, because day-high/day-low is still only a few
     bars wide that early and sits too close to price to be a meaningful
     stop. Still current.
-  * v5 (current): EVENING RESTART (see below) -- previously the strategy
-    sat flat from square-off (17:25 IST) until next session's first entry
-    (05:35 IST); now it resumes, in the same direction, 5 minutes after
+  * v5: EVENING RESTART (see below) -- previously the strategy sat flat
+    from square-off (17:25 IST) until next session's first entry (05:35
+    IST); now it resumes, in the same direction, 5 minutes after
     square-off (restart_hour:restart_minute, default 17:30 IST) instead of
-    waiting for the next session.
+    waiting for the next session. Still current.
+  * v6 (current): ASAP (intracandle) SL/reversal -- check_intracandle_sl()/
+    apply_intracandle_reversal() let the ENGINE react to the frozen SL
+    being touched by REAL price the instant it happens, instead of waiting
+    for the bar to close (this class's own update() still does the
+    closed-bar version, as a fallback/backtest path -- the two are never
+    both applied for the same touch, that's the engine's job to guard).
+    The entry side (day's-first-entry, evening restart) is NOT ASAP --
+    both need the closing candle's own color/close-vs-open, which can't be
+    known before the bar actually closes.
 
 Rules:
   * Supertrend(10,3) on real (non-HA) OHLC -- computed continuously across
@@ -277,6 +286,67 @@ class SupertrendSarStrategy:
         # for the rest of that session, incorrectly re-arming a fresh
         # entry minutes after square-off instead of waiting for its
         # proper next window.
+
+    # ------------------------------------------------------------------ #
+    # v6 ASAP (intracandle) execution -- mirrors this repo's established
+    # HeikinAshiStrategy pattern (check_intracandle_sl/notify_exit): the SL
+    # is checked against REAL price on every forming-candle tick instead of
+    # waiting for the bar to close, so a stop fires the instant price
+    # crosses it rather than up to one full bar late. Split the same way
+    # HeikinAshi splits it: check_intracandle_sl() is a PURE check (no
+    # mutation, safe to call every tick); apply_intracandle_reversal() is
+    # called by the ENGINE only AFTER it has confirmed the exit fired (and,
+    # for SAR, after the reversal leg's order actually went through) --
+    # deferring the mutation until the trade is real, same safety
+    # discipline as HeikinAshiEngine's notify_exit() call ordering.
+    #
+    # Unlike HeikinAshi (which just goes flat, no forced re-entry),
+    # SupertrendSarStrategy ALWAYS reverses -- so apply_intracandle_reversal
+    # both closes the old leg and opens the new one in a single mutation,
+    # exactly mirroring update()'s own closed-bar reversal branch, just
+    # driven by a real-time price instead of a closed candle's high/low.
+    # The entry side of this strategy (day's-first-entry, evening restart)
+    # is NOT made ASAP here -- both depend on the closing candle's own
+    # color/close-vs-open, which is fundamentally unknowable before the bar
+    # actually closes, so they stay on the closed-bar path.
+    def check_intracandle_sl(self, price: float) -> tuple[bool, float | None]:
+        """Has an intracandle REAL price crossed the open leg's frozen SL?
+        -> (hit, level). Pure -- never mutates state, safe to call on every
+        forming-candle tick."""
+        if not self._in_position or self._active_sl is None:
+            return False, None
+        hit = (price >= self._active_sl) if self._is_short else (price <= self._active_sl)
+        return bool(hit), self._active_sl
+
+    def apply_intracandle_reversal(self, tick_price: float) -> tuple[bool, float]:
+        """Call ONLY after check_intracandle_sl() returned a hit AND the
+        engine has confirmed the reversal leg's order actually went
+        through. Mutates state exactly like update()'s own closed-bar
+        reversal branch (day-low/day-high SL, widened by min_sl_atr_mult *
+        ATR if that would be tighter) -- the one difference is day-high/
+        day-low are extended one step further using `tick_price` itself
+        (the real price at this exact moment, ahead of whatever the still-
+        forming candle's eventual close will be) so the fresh SL reflects
+        the most current information available; the closed-bar update()
+        later this bar naturally continues extending day-high/day-low from
+        there, so this is a forward-looking peek, not a double-count.
+        Returns (new_is_short, new_sl) for the engine's own notify/state.
+        """
+        if self._day_high is None or tick_price > self._day_high:
+            self._day_high = tick_price
+        if self._day_low is None or tick_price < self._day_low:
+            self._day_low = tick_price
+        self._is_short = not self._is_short
+        self._active_sl = self._day_high if self._is_short else self._day_low
+        atr_val = self._st.atr
+        if atr_val is not None and self.min_sl_atr_mult > 0:
+            min_dist = atr_val * self.min_sl_atr_mult
+            if self._is_short:
+                self._active_sl = max(self._active_sl, tick_price + min_dist)
+            else:
+                self._active_sl = min(self._active_sl, tick_price - min_dist)
+        self._last_closed_was_short = not self._is_short   # the side that just closed
+        return self._is_short, self._active_sl
 
     def debug_state(self) -> dict:
         def r(x):
