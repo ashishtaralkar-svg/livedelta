@@ -302,9 +302,26 @@ class SupertrendSarEngine:
         #    filter, since it's just closing out an already-open risk, not
         #    opening new exposure. Weekday gating is therefore checked
         #    against whether this is a reversal via dec.has_exit.)
-        if (dec is not None and dec.has_entry and not self.executor.has_open_position
-                and (dec.has_exit or not self._entries_blocked())):
-            await self._open_entry(dec.entry_is_short, dec.sl_level, candle.close)
+        if dec is not None and dec.has_entry and not self.executor.has_open_position:
+            if dec.has_exit or not self._entries_blocked():
+                await self._open_entry(dec.entry_is_short, dec.sl_level, candle.close)
+            else:
+                # A FRESH entry (day's-first-entry / evening-restart) was
+                # blocked -- but strategy.update() already committed its
+                # OWN internal state for it (_in_position/_active_sl/
+                # _is_short) before this engine ever saw the Decision; left
+                # alone, that phantom position would just sit there until
+                # its own frozen SL got touched, at which point the SAME-BAR
+                # reversal branch above (dec.has_exit=True) bypasses this
+                # gate entirely -- opening a REAL position on the exchange
+                # from a "reversal" of a leg that was never actually taken,
+                # silently defeating the block. force_flat() clears the
+                # phantom in-position state (but deliberately leaves
+                # _active_session/_active_restart_session/day-high/day-low
+                # alone, so this entry slot doesn't just re-fire again next
+                # bar) -- mirrors scripts/backtest_supertrend_sar.py's own
+                # run() loop, which already guards against exactly this.
+                self.strategy.force_flat()
 
     # ------------------------------------------------------------------ #
     def _on_forming_candle(self, candle: Candle) -> None:

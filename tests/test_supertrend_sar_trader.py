@@ -283,6 +283,40 @@ async def test_weekday_block_suppresses_a_fresh_day_first_entry() -> None:
     assert engine.executor.open_calls == []
 
 
+async def test_blocked_fresh_entry_does_not_leave_a_phantom_position(monkeypatch) -> None:
+    """Regression: strategy.update() commits its OWN internal state
+    (_in_position/_active_sl/_is_short) for a fresh entry BEFORE this
+    engine ever sees the Decision -- so simply skipping _open_entry() on a
+    blocked bar isn't enough. Left uncorrected, that phantom position sits
+    there until its frozen SL gets touched by real price, at which point
+    the SAME-BAR reversal branch (dec.has_exit=True) bypasses the block
+    entirely and opens a REAL position from a leg that was never actually
+    taken. Uses the REAL SupertrendSarStrategy (only its Supertrend value
+    is pinned) across two real update() calls so this genuinely exercises
+    the cross-call state, not a canned Decision."""
+    import datetime as _dt
+
+    engine = _make_engine(skip_weekdays="Mon,Tue,Wed,Thu,Fri,Sat,Sun")  # every day blocked
+    s = engine.strategy
+    s._warmup_bars = 10
+    s._st.update = lambda h, l, c: (79800.0, 1)   # pin the frozen SL every bar
+
+    ts1 = int(_dt.datetime(2026, 9, 8, 17, 35, tzinfo=_ist).timestamp())
+    candle1 = Candle(start_time=ts1, open=80000.0, high=80050.0, low=79950.0, close=79900.0, volume=1.0)
+    await engine._handle_closed_candle(candle1)   # red candle -> would-be SELL CE, blocked
+    assert engine.executor.open_calls == []
+    assert not engine.executor.has_open_position
+
+    # Next bar: real price crosses 79800 (the phantom SL) -- pre-fix, the
+    # strategy's un-cleared _in_position=True would report this as a
+    # same-bar reversal and the engine would open a REAL position here.
+    ts2 = ts1 + 60
+    candle2 = Candle(start_time=ts2, open=79700.0, high=79850.0, low=79650.0, close=79700.0, volume=1.0)
+    await engine._handle_closed_candle(candle2)
+    assert engine.executor.open_calls == []          # still never opened anything real
+    assert not engine.executor.has_open_position
+
+
 # ---------------------------------------------------------------------- #
 # Weekend blackout (Fri 17:35 IST -> Sun 17:35 IST) -- ported from
 # scripts/backtest_supertrend_sar.py's own _in_weekend_blackout(), which
