@@ -37,6 +37,7 @@ class FakeExecutor:
         self._open_size = 10
         self._close_result: float | None = 700.0   # 50% decay, for TP-roll tests
         self._close_should_fail = False
+        self.last_leverage_ok: bool | None = None   # mirrors OptionsExecutor's real attribute
 
     async def open_option_by_premium(self, signal_dir: int, target_premium: float):
         self.open_calls.append((signal_dir, target_premium))
@@ -138,6 +139,22 @@ async def test_entry_is_short_false_sells_put_via_signal_dir_long() -> None:
     assert engine._current_is_short is False
     ev = engine.notifier.notify.await_args
     assert ev.args[0] == NotifyEvent.ENTRY_LONG and ev.kwargs["direction"] == "PUT"
+
+
+async def test_entry_notify_carries_leverage_status_when_configured() -> None:
+    engine = _make_engine(option_leverage=50)
+    engine.executor.last_leverage_ok = True   # OptionsExecutor would have set this on a real entry
+    await engine._open_entry(True, sl_level=79500.0, btc_price=79000.0)
+    ev = engine.notifier.notify.await_args
+    assert ev.kwargs["leverage"] == 50
+    assert ev.kwargs["leverage_ok"] is True
+
+
+async def test_entry_notify_leverage_ok_none_when_not_configured() -> None:
+    engine = _make_engine()   # option_leverage defaults to 0 -- never attempted
+    await engine._open_entry(True, sl_level=79500.0, btc_price=79000.0)
+    ev = engine.notifier.notify.await_args
+    assert ev.kwargs["leverage_ok"] is None
 
 
 async def test_sar_tp_pct_zero_disables_the_decay_target() -> None:

@@ -84,12 +84,30 @@ async def test_buy_side_skips_leverage_call() -> None:
     ex = OptionsExecutor(_fake_rest(), _settings(option_side="buy", option_leverage=5))
     await ex.open_option_by_premium(SignalDir.LONG.value, 500.0)
     ex._rest.set_leverage.assert_not_called()
+    assert ex.last_leverage_ok is None   # never attempted -- buy-side
 
 
 async def test_sell_side_still_sets_leverage_when_configured() -> None:
     ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell", option_leverage=5))
     await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
     ex._rest.set_leverage.assert_called_once()
+    assert ex.last_leverage_ok is True
+
+
+async def test_last_leverage_ok_is_none_when_leverage_not_configured() -> None:
+    ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell", option_leverage=0))
+    await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    ex._rest.set_leverage.assert_not_called()
+    assert ex.last_leverage_ok is None
+
+
+async def test_last_leverage_ok_is_false_when_the_exchange_call_fails() -> None:
+    rest = _fake_rest()
+    rest.set_leverage = MagicMock(side_effect=RuntimeError("rejected: options use risk-engine margin"))
+    ex = OptionsExecutor(rest, _settings(option_side="sell", option_leverage=5))
+    fill, symbol = await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    assert ex.last_leverage_ok is False
+    assert fill is not None and symbol is not None   # a leverage failure never blocks the trade
 
 
 # --------------------------------------------------------------------- #

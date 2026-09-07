@@ -552,14 +552,16 @@ class SupertrendSarEngine:
                 )
             tp_display = round(self._tp_price, 1) if self._tp_price is not None else None
             direction = "CALL" if is_short else "PUT"
+            leverage_ok = self.executor.last_leverage_ok   # None unless DELTA_OPTION_LEVERAGE>0
             log.info("SAR entry", extra={"extra": {
                 "direction": direction, "symbol": symbol, "fill": fill,
-                "tp_price": tp_display, "sl_level": sl_level}})
+                "tp_price": tp_display, "sl_level": sl_level, "leverage_ok": leverage_ok}})
             event = NotifyEvent.ENTRY_SHORT if is_short else NotifyEvent.ENTRY_LONG
             await self.notifier.notify(
                 event, direction=direction, contract=symbol or "?",
                 premium=fill, btc_price=btc_price, sl_level=sl_level,
                 tp_price=tp_display, side="sell",
+                leverage=self.settings.option_leverage, leverage_ok=leverage_ok,
             )
         finally:
             self._entry_in_progress = False

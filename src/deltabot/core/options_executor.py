@@ -59,6 +59,12 @@ class OptionsExecutor:
         self._option_type: OptionType | None = None
         self._symbol: str | None = None  # human-readable contract, e.g. C-BTC-61400-250626
         self._strike: float | None = None
+        # Outcome of the most recent _maybe_set_leverage() call: None = not
+        # attempted (option_leverage<=0 or buy-side), True = exchange
+        # accepted it, False = the call raised (best-effort -- the trade
+        # still went through at the exchange's default margin). Read by
+        # callers that want to surface this (e.g. a Telegram entry note).
+        self.last_leverage_ok: bool | None = None
 
     @property
     def is_buy_side(self) -> bool:
@@ -613,15 +619,18 @@ class OptionsExecutor:
         uses the exchange's current/default margin). No-op when option_leverage<=0."""
         lev = self._settings.option_leverage
         if lev <= 0:
+            self.last_leverage_ok = None
             return
         try:
             await asyncio.to_thread(self._rest.set_leverage, product_id, lev)
             log.info("Set option leverage", extra={"extra": {"product_id": product_id, "leverage": lev}})
+            self.last_leverage_ok = True
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "set_leverage failed — proceeding at exchange default margin",
                 extra={"extra": {"error": str(exc), "product_id": product_id, "leverage": lev}},
             )
+            self.last_leverage_ok = False
 
     async def _check_balance(self) -> None:
         """Best-effort margin gate: skip the sell if available balance is below the

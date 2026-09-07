@@ -55,6 +55,15 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
             )
             if ctx.get("sl_level") is not None:
                 msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
+            # Leverage: only shown when option_leverage>0 actually made the
+            # executor attempt to set it (leverage_ok is None otherwise --
+            # buy-side or option_leverage<=0 -- see OptionsExecutor.
+            # last_leverage_ok). True = exchange accepted it; False = the
+            # call failed and the trade went through at exchange default
+            # margin instead (never blocks the trade, just worth flagging).
+            if ctx.get("leverage_ok") is not None:
+                lev_mark = "✅" if ctx.get("leverage_ok") else "⚠️ failed — exchange default margin used"
+                msg += f"\nLeverage: {ctx.get('leverage')}x {lev_mark}"
             return msg
         return f"{emoji} <b>ENTRY {ctx.get('direction')}</b> {ctx.get('symbol')} @ {ctx.get('price'):.2f}"
     if event == NotifyEvent.SKIPPED:
