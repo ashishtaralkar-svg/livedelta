@@ -83,8 +83,14 @@ class FakeRest:
 
 
 def _make_engine(**kw) -> SupertrendSarEngine:
+    # sar_weekend_blackout=False by default so pre-existing tests never
+    # flake depending on the REAL wall-clock day/time the suite happens to
+    # run at (Settings' default is True in production -- see the dedicated
+    # weekend-blackout tests below for that behavior, which control time
+    # explicitly rather than relying on the base default).
     base = dict(strategy="sar", target_premium=1400.0, sar_tp_pct=50.0,
-                option_contracts=10, option_side="sell", state_file="", skip_weekdays="")
+                option_contracts=10, option_side="sell", state_file="", skip_weekdays="",
+                sar_weekend_blackout=False)
     base.update(kw)
     settings = Settings(_env_file=None, **base)
     engine = SupertrendSarEngine(settings, rest=FakeRest(), notifier=AsyncMock())
@@ -275,6 +281,74 @@ async def test_weekday_block_suppresses_a_fresh_day_first_entry() -> None:
     engine.strategy.update = lambda candle: dec
     await engine._handle_closed_candle(_c(6000))
     assert engine.executor.open_calls == []
+
+
+# ---------------------------------------------------------------------- #
+# Weekend blackout (Fri 17:35 IST -> Sun 17:35 IST) -- ported from
+# scripts/backtest_supertrend_sar.py's own _in_weekend_blackout(), which
+# validated it as a strict 3-month improvement with no downside.
+# ---------------------------------------------------------------------- #
+import datetime as _dt_module  # noqa: E402  (grouped near its own tests, not the file's imports)
+
+from deltabot.core.supertrend_sar_trader import _in_weekend_blackout  # noqa: E402
+
+
+@pytest.mark.parametrize("iso,expected", [
+    ("2026-09-04T17:34:00", False),   # Friday, just before the window opens
+    ("2026-09-04T17:35:00", True),    # Friday, window opens
+    ("2026-09-04T23:59:00", True),    # Friday night
+    ("2026-09-05T12:00:00", True),    # Saturday -- blacked out all day
+    ("2026-09-06T00:00:00", True),    # Sunday, still blacked out
+    ("2026-09-06T17:34:00", True),    # Sunday, just before the window closes
+    ("2026-09-06T17:35:00", False),   # Sunday, window closes
+    ("2026-09-07T09:00:00", False),   # Monday -- normal trading
+])
+def test_in_weekend_blackout_pure_function(iso: str, expected: bool) -> None:
+    now = _dt_module.datetime.fromisoformat(iso)
+    assert _in_weekend_blackout(now) is expected
+
+
+async def test_weekend_blackout_suppresses_a_fresh_entry(monkeypatch) -> None:
+    """Same shape as test_weekday_block_suppresses_a_fresh_day_first_entry,
+    but for the time-window blackout instead of a calendar-day skip --
+    wall-clock is monkeypatched so this never depends on the REAL day/time
+    the suite happens to run at."""
+    import deltabot.core.supertrend_sar_trader as trader_mod
+
+    class _FixedDatetime(_dt_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt_module.datetime(2026, 9, 5, 12, 0, tzinfo=tz)   # Saturday noon IST
+
+    monkeypatch.setattr(trader_mod, "datetime", _FixedDatetime)
+    engine = _make_engine(sar_weekend_blackout=True)
+    dec = _dec(entry=True, entry_is_short=True, sl_level=79800.0)
+    engine.strategy.update = lambda candle: dec
+    await engine._handle_closed_candle(_c(6000))
+    assert engine.executor.open_calls == []
+
+
+async def test_weekend_blackout_does_not_suppress_a_reversals_reentry(monkeypatch) -> None:
+    """A same-bar stop-and-reverse must still reopen during the blackout --
+    it's managing already-open risk, not opening fresh exposure (mirrors
+    test_weekday_block_does_not_suppress_a_reversals_reentry)."""
+    import deltabot.core.supertrend_sar_trader as trader_mod
+
+    class _FixedDatetime(_dt_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt_module.datetime(2026, 9, 5, 12, 0, tzinfo=tz)   # Saturday noon IST
+
+    monkeypatch.setattr(trader_mod, "datetime", _FixedDatetime)
+    engine = _make_engine(sar_weekend_blackout=True)
+    await engine._open_entry(True, sl_level=None, btc_price=79000.0)
+    engine.executor._close_result = 1600.0
+    engine.executor._open_result = (1420.0, "P-BTC-82000-050926")
+    dec = _dec(exit=True, exit_price=79500.0, exit_was_short=True,
+               entry=True, entry_is_short=False, sl_level=78000.0)
+    engine.strategy.update = lambda candle: dec
+    await engine._handle_closed_candle(_c(5000))
+    assert engine.executor.has_open_position   # the reversal DID reopen despite the blackout
 
 
 # ---------------------------------------------------------------------- #

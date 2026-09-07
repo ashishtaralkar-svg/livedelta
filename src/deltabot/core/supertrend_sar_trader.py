@@ -3,21 +3,23 @@
 Runs SupertrendSarStrategy on 1-MINUTE BTC candles, SELLING options: the
 strategy's own entry_is_short flag picks the side directly (True -> sell a
 CALL, False -> sell a PUT) -- see src/deltabot/strategy/supertrend_sar.py's
-module docstring for the full v1-v5 rule history. This is the winning
-config found by comparing against the ORIGINAL 5-minute/05:35-start/TP-50%
-baseline across matched 1wk/1mo/3mo windows: "1m candles + sell +
-premium~1400 + TP 70%->roll + min-SL 1.0xATR + evening restart, with the
-day's-first-entry time moved to 17:35 (i.e. right next to the 17:30
-evening-restart trigger, effectively collapsing both into one entry
-window)" -- validated in scripts/backtest_supertrend_sar.py:
-  3mo: +$331.42 net / 492 legs at 10 lots, 55.7% win rate ($11.05/lot/mo)
-  1mo: +$183.38 net / 179 legs at 10 lots, 59.8% win rate ($18.34/lot/mo)
-  1wk: +$73.21 net / 37 legs at 10 lots, 70.3% win rate ($7.32/lot/wk)
+module docstring for the full v1-v9 rule history. This is the FINAL/
+DEPLOYED config, found by comparing several candidates head-to-head on
+matched 1wk/1mo/3mo backtest windows: "1m candles + sell + premium~1400 +
+TP 70%->roll + min-SL 1.0xATR + candle-color entry at 17:35 IST + evening
+restart at 17:30 + session reset at the ORIGINAL 05:30 (NOT the more
+'correct' 17:30 that was tried and reverted -- it backtested worse on
+every window, see config.py's sar_reset_hour comment) + weekend blackout
+(Fri 17:35 IST -> Sun 17:35 IST, fresh entries only)" -- validated in
+scripts/backtest_supertrend_sar.py / backtest_supertrend_sar_original.py:
+  3mo: +$363.25 net / 441 legs at 10 lots, 58.3% win rate ($12.11/lot/mo)
+  1mo: +$183.60 net / 163 legs at 10 lots, 61.3% win rate ($18.36/lot/mo)
+  1wk: +$73.59 net / 34 legs at 10 lots, 73.5% win rate ($7.36/lot/wk)
 vs. the original 5m/05:35/TP-50% baseline's 3mo figure of only
-+$150.22/324 legs at 10 lots, 48.8% win rate ($5.01/lot/mo) -- roughly 2x
-better per lot per month, and the ONLY config whose win rate stayed above
-50% across all three windows. See config.py's sar_* block for the full
-before/after comparison table this decision was based on.
++$150.22/324 legs at 10 lots, 48.8% win rate ($5.01/lot/mo) -- over 2x
+better per lot per month, and also beats the ORB (v7) and 17:30-reset (v8/
+v9) variants that were tried in between and reverted. See config.py's
+sar_* block for the full comparison history this decision was based on.
 
 ARCHITECTURE: unlike SupertrendFixedSlEngine (strategy="supertrend"), this
 strategy is STRICT SINGLE POSITION -- a CE and a PE are never open at the
@@ -98,7 +100,29 @@ from .options_executor import OptionsExecutor, OptionsMarginError
 _IST = ZoneInfo("Asia/Kolkata")
 _BAR_SECONDS = 60  # 1 minute -- see module docstring for why this beat 5m
 
+# Weekend blackout window: Friday 17:35 IST through Sunday 17:35 IST (a
+# rolling ~48h block, not just "skip Sat/Sun") -- only blocks FRESH entries
+# (the day's first entry, or the evening restart); a same-bar stop-and-
+# reverse or a TP-roll re-entry is NEVER blocked, since both are just
+# managing already-open risk, not opening new exposure. Ported verbatim
+# from scripts/backtest_supertrend_sar.py's own _in_weekend_blackout(),
+# which validated this as a strict 3-month improvement with no downside.
+_BLACKOUT_START_MINS = 17 * 60 + 35   # Friday 17:35
+_BLACKOUT_END_MINS = 17 * 60 + 35     # Sunday 17:35
+
 log = get_logger(__name__)
+
+
+def _in_weekend_blackout(now: datetime) -> bool:
+    wd = now.weekday()   # Mon=0 ... Sun=6
+    mins = now.hour * 60 + now.minute
+    if wd == 4:   # Friday
+        return mins >= _BLACKOUT_START_MINS
+    if wd == 5:   # Saturday -- blacked out all day
+        return True
+    if wd == 6:   # Sunday
+        return mins < _BLACKOUT_END_MINS
+    return False
 
 
 class SupertrendSarEngine:
@@ -117,6 +141,9 @@ class SupertrendSarEngine:
             reset_hour=settings.sar_reset_hour, reset_minute=settings.sar_reset_minute,
             min_sl_atr_mult=settings.sar_min_sl_atr_mult,
             restart_hour=settings.sar_restart_hour, restart_minute=settings.sar_restart_minute,
+            orb_enabled=settings.sar_orb_enabled,
+            orb_start_hour=settings.sar_orb_start_hour, orb_start_minute=settings.sar_orb_start_minute,
+            orb_end_hour=settings.sar_orb_end_hour, orb_end_minute=settings.sar_orb_end_minute,
         )
         self.executor = OptionsExecutor(rest, settings)
         self.aggregator = CandleAggregator(
@@ -570,7 +597,10 @@ class SupertrendSarEngine:
     # handling needed here.
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
-        return datetime.now(_IST).weekday() in self.settings.skip_weekday_ints
+        now = datetime.now(_IST)
+        if now.weekday() in self.settings.skip_weekday_ints:
+            return True
+        return self.settings.sar_weekend_blackout and _in_weekend_blackout(now)
 
     async def _square_off_scheduler(self) -> None:
         while True:

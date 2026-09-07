@@ -310,42 +310,81 @@ class Settings(BaseSettings):
     # engine runs on 1-MINUTE candles -- see core/supertrend_sar_trader.py):
     # Stop-And-Reverse, STRICT SINGLE POSITION (never CE+PE at once, unlike
     # strategy="supertrend"/SupertrendFixedSlEngine -- this one uses ONE
-    # OptionsExecutor, same architecture as ema21bot). From
-    # sar_start_hour:sar_start_minute, the candle that closes at that moment
-    # arms a position by its own color (green->PE, red->CE), SL =
-    # Supertrend's value at entry, frozen. Every SL hit reverses immediately
-    # with a fresh SL = the running day-low/day-high (widened to
-    # sar_min_sl_atr_mult * ATR if that would be tighter). Always sell-mode
+    # OptionsExecutor, same architecture as ema21bot). Always sell-mode
     # (never buys) -- leave DELTA_OPTION_SIDE at its "sell" default, unset
     # here.
     #
-    # DEFAULTS BELOW are the winner of a head-to-head comparison against the
-    # original 5m/05:35-start/TP-50% baseline, across matched 1wk/1mo/3mo
-    # backtest windows (10 lots each):
-    #                         1wk win%   1mo win%   3mo win%   3mo $/lot/mo
-    #   5m, 05:35, TP 50%      56.5%      50.0%      48.8%       $5.01
-    #   1m, 17:35, TP 70%      70.3%      59.8%      55.7%      $11.05
-    # The 1m/17:35/TP-70% config won on every window and every metric, and
-    # was the ONLY one whose win rate stayed above 50% at all three lengths
-    # -- roughly 2x the original's per-lot-per-month return at 3 months
-    # (+$331.42/492 legs at 10 lots vs the original's +$150.22/324 legs).
-    # Moving sar_start_hour/minute to 17:35 puts it right next to the
-    # sar_restart_hour/minute default (17:30) -- this deliberately collapses
-    # the "day's first entry" and "evening restart" into one entry window;
-    # see supertrend_sar_trader.py's module docstring. Never executed a real
-    # order -- start cautious and watch closely regardless of the backtest
-    # numbers above.
+    # FINAL/DEPLOYED config ("Original" + weekend blackout): the session's
+    # first entry is candle-color based -- the candle that closes at
+    # sar_start_hour:sar_start_minute (default 17:35 IST) arms a position
+    # by its own color (green->PE, red->CE). SL = Supertrend's value at
+    # entry, frozen. Every SL hit reverses immediately with a fresh SL =
+    # the running day-low/day-high (widened to sar_min_sl_atr_mult * ATR
+    # if that would be tighter).
+    #
+    # sar_orb_enabled=True switches the first entry to an Opening Range
+    # Breakout instead (v7, opt-in): sar_orb_start_hour/minute to
+    # sar_orb_end_hour/minute (default 17:30-18:00 IST) is watched as a
+    # range, and the first candle at/after the range closes whose high/low
+    # breaks it arms the position (broke below -> sell CE, broke above ->
+    # sell PE) -- sar_start_hour/minute are then unused. This was the
+    # DEFAULT for a while (v7/v8) but real backtest results came back
+    # mixed-to-worse vs the candle-color baseline on every window tested
+    # (1wk/1mo/3mo), and it also required moving sar_restart_hour/minute
+    # later (to 18:05) to avoid colliding with its own range window --
+    # both reverted. Kept available, not deleted, in case it's worth
+    # re-evaluating later.
+    #
+    # sar_reset_hour/minute is back at the ORIGINAL 05:30 (NOT 17:30).
+    # v8 moved it to 17:30 to fix a real bug: a reversal's day-high/day-low
+    # SL could be set by a price spike from early that same morning, hours
+    # before the evening session it was actually trading in even started --
+    # more theoretically correct. But re-tested head-to-head against 05:30
+    # on matched 1wk/1mo/3mo windows, 17:30 came out WORSE every time (more
+    # legs, lower win rate -- tighter day-high/low from a fresh reset means
+    # more same-session whipsaw reversals): 3mo net $298.94/659 legs/47.6%
+    # win (17:30) vs $331.42/492 legs/55.7% win (05:30) at 10 lots. Reverted
+    # to 05:30 for that reason -- see supertrend_sar.py's v8/v9 history
+    # notes for the full story, including why this is a "less correct but
+    # backtests better" tradeoff, not a mistake being undone.
+    #
+    # sar_weekend_blackout=True (new, on by default): blocks FRESH entries
+    # (day's-first-entry / evening-restart, never a same-bar reversal)
+    # during Fri 17:35 IST -> Sun 17:35 IST. Backtested as a strict
+    # improvement with no downside on every window: 3mo net +$363.25/441
+    # legs/58.3% win at 10 lots, vs +$331.42 without it -- this is now
+    # folded into the "best validated" figure below.
+    #
+    # Best validated backtest (1m, candle-color entry at 17:35, TP 70%,
+    # min-SL 1.0xATR, evening restart at 17:30, reset at 05:30, weekend
+    # blackout on, 10 lots, 3 months): +$363.25 net / 441 legs / 58.3% win
+    # ($12.11/lot/mo) -- beats the original 5m/05:35-entry/TP-50% baseline's
+    # +$150.22/324 legs/48.8% win ($5.01/lot/mo) by well over 2x per lot per
+    # month, and beats the 17:30-reset variant on every window re-tested.
+    # Never executed a real order -- start cautious regardless.
     sar_atr_period: int = 10
     sar_factor: float = 3.0
     sar_start_hour: int = 17
     sar_start_minute: int = 35
+    # Opening Range Breakout -- opt-in, see the block comment above.
+    sar_orb_enabled: bool = False
+    sar_orb_start_hour: int = 17
+    sar_orb_start_minute: int = 30
+    sar_orb_end_hour: int = 18
+    sar_orb_end_minute: int = 0
     # Session (not calendar-day) reset -- day-high/day-low and the "first
-    # entry already fired" flag all roll over here. Deliberately NOT moved
-    # alongside sar_start_hour/minute above -- still 05:30, so the running
-    # day-high/day-low a reversal's SL uses has the whole prior session's
-    # range behind it by the time entries start at 17:35.
+    # entry already fired" flag all roll over here. Back at the ORIGINAL
+    # 05:30 -- see the block comment above for why the more "correct" 17:30
+    # was tried and then reverted after re-testing.
     sar_reset_hour: int = 5
     sar_reset_minute: int = 30
+    # Weekend blackout: Friday 17:35 IST through Sunday 17:35 IST, blocking
+    # only FRESH entries (day's-first-entry / evening-restart) -- a same-bar
+    # stop-and-reverse or a TP-roll re-entry is NEVER blocked by this, since
+    # both are just managing already-open risk, not opening new exposure
+    # (mirrors DELTA_SKIP_WEEKDAYS's own exemption). See the block comment
+    # above for the backtest numbers.
+    sar_weekend_blackout: bool = True
     # Widen a reversal's day-low/day-high SL to at least this many ATRs from
     # price if it would otherwise be tighter (fixes same-session whipsaw
     # right after a session reset). 0 disables (raw day-extreme SL). Tuned
@@ -355,11 +394,13 @@ class Settings(BaseSettings):
     sar_min_sl_atr_mult: float = 1.0
     # Evening restart: once square-off leaves the strategy flat, resume
     # trading in the SAME direction as whatever was open going into it, at
-    # this time instead of waiting for next session's first entry. Because
-    # entries only act on CLOSED candles, the actual live/backtest fill
-    # lands on the candle that closes AFTER this threshold (same one-candle
-    # lag as sar_start_hour/minute's own entry) -- on 1m bars that's
-    # typically 17:31-17:32, not exactly 17:30.
+    # this time instead of waiting for next session's first entry. Default
+    # 17:30 (5 min after the usual 17:25 square-off) -- if sar_orb_enabled
+    # is turned on, consider moving this to 5 min after sar_orb_end_hour/
+    # minute instead, or restart will normally win the race and the ORB
+    # range will rarely get a chance to finish building before restart
+    # already claimed the day's first entry (see supertrend_sar.py's v7
+    # history note).
     sar_restart_hour: int = 17
     sar_restart_minute: int = 30
     # Roll-on-target: an OPTION-level mechanic layered on top of the
@@ -368,8 +409,8 @@ class Settings(BaseSettings):
     # what it was sold for, book the profit ("TP") and IMMEDIATELY resell a
     # fresh contract in the SAME direction at target_premium again. 0
     # disables (pure SAR, no rolling). 70% (book profit sooner, on a
-    # smaller decay) beat the original 50% on every window tested -- see
-    # the comparison table above.
+    # smaller decay) beat 50% on every window tested against the
+    # candle-color-entry predecessor config.
     sar_tp_pct: float = 70.0
     sar_tp_poll_seconds: float = 15.0   # poll option mark for the TP-roll (0 = only at candle close)
     sar_debug_state: bool = False       # log a full strategy-state snapshot on every closed 1m candle

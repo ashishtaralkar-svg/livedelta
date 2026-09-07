@@ -1,9 +1,12 @@
-"""SupertrendSarStrategy v6 -- user-specified strategy: from a fixed daily
-start time, the CANDLE that closes at that moment (05:30-05:35 IST by
-default) arms a single position -- green candle -> BUY/PE, red -> SELL/CE --
-then Stop-And-Reverse (SAR) every time the frozen SL is hit, continuing
-until the daily square-off, whereupon it immediately resumes (see EVENING
-RESTART below). No EMA filter, no profit target -- sell-mode only.
+"""SupertrendSarStrategy v9 -- user-specified strategy: the candle that
+closes at start_mins (05:35 PM IST by default) arms a single position by
+its own color -- green -> BUY/PE, red -> SELL/CE -- then Stop-And-Reverse
+(SAR) every time the frozen SL is hit, continuing until the daily
+square-off, whereupon it resumes shortly after (see EVENING RESTART
+below). No EMA filter, no profit target -- sell-mode only. An Opening
+Range Breakout (ORB) alternative for the first-entry direction (v7) is
+still available, opt-in via orb_enabled=True -- see v9's own history note
+below for why it's off by default.
 
 Version history (each superseded by/layered onto the next per direct
 follow-up requests -- kept here so the "why" of the current rules is
@@ -29,36 +32,94 @@ traceable):
     IST); now it resumes, in the same direction, 5 minutes after
     square-off (restart_hour:restart_minute, default 17:30 IST) instead of
     waiting for the next session. Still current.
-  * v6 (current): ASAP (intracandle) SL/reversal -- check_intracandle_sl()/
+  * v6: ASAP (intracandle) SL/reversal -- check_intracandle_sl()/
     apply_intracandle_reversal() let the ENGINE react to the frozen SL
     being touched by REAL price the instant it happens, instead of waiting
     for the bar to close (this class's own update() still does the
     closed-bar version, as a fallback/backtest path -- the two are never
     both applied for the same touch, that's the engine's job to guard).
     The entry side (day's-first-entry, evening restart) is NOT ASAP --
-    both need the closing candle's own color/close-vs-open, which can't be
-    known before the bar actually closes.
+    at the time this was written both needed the closing candle's own
+    color/close-vs-open, which can't be known before the bar actually
+    closes. Still current (ASAP SL/reversal), though v7 below changes
+    what "the entry side" even means for the day's first entry.
+  * v7: the SESSION'S FIRST entry no longer reads Supertrend OR the
+    candle's own color at all -- it's now an Opening Range Breakout (ORB):
+    orb_start_mins-orb_end_mins (default 17:30-18:00 IST) is watched as a
+    range, and the first candle at/after orb_end_mins whose high/low
+    breaks it arms the position in that direction (see DAY'S FIRST ENTRY
+    below). When first shipped, orb_start_mins defaulted to the SAME
+    moment as restart_mins (17:30 both) -- on any day the strategy was
+    already flat right at 17:30, the v5 EVENING RESTART's own elif branch
+    fired FIRST and claimed that slot before the ORB range even finished
+    building, since restart only needed now_mins >= restart_mins (no
+    range-break condition to wait for), so ORB almost never actually
+    fired. Fixed in v8 below by moving restart_mins later. Made OPT-IN in
+    v9 (default off) -- see that entry.
+  * v8: TWO fixes based on real backtest trade-log review after v7
+    shipped:
+    (a) restart_hour:restart_minute moved from 17:30 to 18:05 (5 minutes
+        after orb_end_mins) so ORB gets first crack at the day's first
+        entry every session, with restart as the fallback for whatever
+        ORB doesn't catch (was previously starving ORB out entirely, see
+        the v7 note above). Reverted back to 17:30 in v9 alongside ORB
+        being turned off by default -- see that entry.
+    (b) reset_hour:reset_minute (the SESSION RESET boundary that drives
+        day-high/day-low) moved from 05:30 to 17:30 -- a real backtest
+        trade was found where a reversal's SL (the day-high) had been set
+        by a price spike from EARLY THAT MORNING, hours before the
+        evening session the position actually traded in even started, and
+        that same stale level then carried through a TP-roll into a much
+        later SL exit. Aligning the session reset to 17:30 means
+        day-high/day-low -- and therefore every reversal SL for the rest
+        of the evening -- only ever reflects price action from the
+        CURRENT session onward. Still current regardless of orb_enabled
+        (this fix is unrelated to ORB specifically). See the SESSION RESET
+        rule below.
+  * v9 (current): ORB (v7) made OPT-IN via orb_enabled (default False) per
+    direct follow-up request -- with it off, the session's first entry
+    goes back to the v3 candle-color rule (start_hour:start_minute,
+    default 17:35 IST -- moved here from the original 05:35 to match the
+    config validated as the winning baseline across this session's own
+    1wk/1mo/3mo comparisons, back when v7/v8 were being evaluated against
+    it). restart_hour:restart_minute also reverted to 17:30 (was 18:05) --
+    that move only existed to give ORB a chance to fire; without ORB
+    active there is no longer a range that needs time to finish building,
+    so restart can resume immediately after square-off again, same as v5
+    originally intended.
 
 Rules:
   * Supertrend(10,3) on real (non-HA) OHLC -- computed continuously across
     the whole backtest, same as every other Supertrend-based strategy here
     (it needs uninterrupted history for its ATR; only the TRADING logic
     below is what resets/restarts each session).
-  * SESSION RESET: everything session-scoped -- the running day-high/
-    day-low, and the "day's first entry has already fired" flag -- rolls
-    over together the instant the clock crosses reset_hour:reset_minute
-    (default 05:30 IST), NOT at calendar midnight. This is five minutes
-    before the strategy starts hunting for a signal at start_hour:
-    start_minute (default 05:35 IST). Detected the same way as the daily
-    square-off elsewhere in this repo: a same-bar-vs-previous-bar minute
-    crossing, robust to data gaps as long as some earlier bar in the
-    session was still below the boundary.
-  * DAY'S FIRST ENTRY (v3): the first closed candle each session at or
-    after start_hour:start_minute whose evaluation finds the strategy FLAT
-    arms the session's first position -- i.e. by default, the candle
-    spanning 05:30-05:35 IST itself. Direction ignores Supertrend
-    entirely: close > open (a green candle) -> BUY a PUT (PE); close <=
-    open (red or a doji) -> SELL a CALL (CE).
+  * SESSION RESET (v8: moved to 17:30, was 05:30): everything
+    session-scoped -- the running day-high/day-low, and the "day's first
+    entry has already fired" flag -- rolls over together the instant the
+    clock crosses reset_hour:reset_minute (default 17:30 IST), NOT at
+    calendar midnight. This is now the SAME moment orb_start_mins begins
+    (deliberately -- see the v8 history note below): a reversal's SL
+    (day-low/day-high) should only ever reflect price action from the
+    CURRENT evening session onward, not carry over stale extremes from
+    hours earlier in the same calendar day. Detected the same way as the
+    daily square-off elsewhere in this repo: a same-bar-vs-previous-bar
+    minute crossing, robust to data gaps as long as some earlier bar in
+    the session was still below the boundary.
+  * DAY'S FIRST ENTRY -- orb_enabled=False (v9, the default): the first
+    closed candle each session at or after start_mins (default 17:35 IST)
+    arms the session's first position by its own color: green (close >
+    open) -> BUY a PUT (PE); red (close <= open, a doji included) -> SELL
+    a CALL (CE). orb_enabled=True (v7, opt-in): orb_start_mins-orb_end_mins
+    (default 17:30-18:00 IST) is watched each session as an Opening Range
+    instead -- every bar in that window (while the strategy is FLAT or
+    not, tracking doesn't care) extends orb_high/orb_low, and the first
+    closed candle AT OR AFTER orb_end_mins whose own high/low breaks that
+    range arms the position: broke below orb_low -> SELL a CALL (CE);
+    broke above orb_high -> BUY a PUT (PE). (A bar that breaks both sides
+    at once -- a big range or a gap -- follows the CLOSE instead: above
+    the range -> PE, below -> CE, still inside -> close vs the range
+    midpoint.) Either way, Supertrend itself is never consulted for
+    direction.
   * SL = Supertrend's OWN VALUE at the moment of THIS FIRST entry only,
     frozen from that point on (same "frozen, not trailing" discipline as
     supertrend_fixed_sl.py) -- Supertrend still sets the STOP even though
@@ -70,7 +131,7 @@ Rules:
     that moment's running LOW OF SESSION; a reversal INTO A SHORT freezes
     SL at that moment's running HIGH OF SESSION (the natural support/
     resistance level for that direction). Day-high/day-low are running
-    extremes from the session's 05:30 reset through the current bar,
+    extremes from the session's 17:30 reset through the current bar,
     simply frozen (not trailed further) into activeSL at the instant a
     reversal uses them -- UNLESS that level is closer than
     min_sl_atr_mult * ATR to price (default 1.0x ATR), in which case the
@@ -84,21 +145,23 @@ Rules:
     the daily square-off (a backtest/live-engine concept, NOT modeled
     inside this class -- see scripts/backtest_supertrend_sar.py's own
     --square-off-hour/minute, matching every other strategy here).
-  * EVENING RESTART (v5): square-off is external (a force_flat() call the
-    strategy doesn't initiate), so this class can't tell WHY it went
-    flat -- it just remembers whichever side (self._last_closed_was_short)
-    was open at the moment it did, updated on every close (a normal SL-hit
-    reversal, or force_flat() itself). At restart_hour:restart_minute
-    (default 17:30 IST, 5 minutes after the usual 17:25 square-off), if
-    still flat, it immediately resumes in that SAME direction -- SL =
-    Supertrend's current value (the same convention as the session's first
-    entry, since this is a fresh position, not a reversal). Fires at most
-    once per session, the same way the first entry does (an internal
-    _active_restart_session marker; force_flat() deliberately does not
+  * EVENING RESTART (v5; timing moved to 18:05 in v8 for ORB's sake, back
+    to 17:30 in v9 now that ORB is off by default): square-off is external
+    (a force_flat() call the strategy doesn't initiate), so this class
+    can't tell WHY it went flat -- it just remembers whichever side
+    (self._last_closed_was_short) was open at the moment it did, updated
+    on every close (a normal SL-hit reversal, or force_flat() itself). At
+    restart_hour:restart_minute (default 17:30 IST, 5 minutes after the
+    usual 17:25 square-off), if still flat, it immediately resumes in
+    that SAME direction -- SL = Supertrend's current value (the same
+    convention as the session's first entry, since this is a fresh
+    position, not a reversal). Fires at most once per session, the same
+    way the first entry does (an internal _active_restart_session marker;
+    force_flat() deliberately does not
     clear it, nor _active_session, nor the running day-high/day-low). From
     here it's an entirely ordinary position -- normal SL-hit reversals
     (day-low/day-high, v2) apply as usual, and it carries straight through
-    the next session's 05:30 reset without the day's-first-entry branch
+    the next session's 17:30 reset without the day's-first-entry branch
     ever re-firing (it only checks while flat). The backtest/live engine
     is expected to resolve this leg against the FOLLOWING day's option
     expiry like any other post-cutoff entry -- nothing SAR-specific is
@@ -218,21 +281,35 @@ class SupertrendSarStrategy:
         atr_period: int = 10,
         factor: float = 3.0,
         day_tz: str = "Asia/Kolkata",
-        start_hour: int = 5,
+        start_hour: int = 17,
         start_minute: int = 35,
-        reset_hour: int = 5,
+        reset_hour: int = 17,
         reset_minute: int = 30,
         min_sl_atr_mult: float = 1.0,
         restart_hour: int = 17,
         restart_minute: int = 30,
+        orb_enabled: bool = False,
+        orb_start_hour: int = 17,
+        orb_start_minute: int = 30,
+        orb_end_hour: int = 18,
+        orb_end_minute: int = 0,
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
         self._tz = ZoneInfo(day_tz)
+        # v9: ORB (v7) is now OPT-IN via orb_enabled (default False, i.e.
+        # REMOVED from the default behavior per direct follow-up request --
+        # see the v9 history note below). With it off, the session's first
+        # entry goes back to the v3 candle-color rule using start_hour/
+        # start_minute; with it on, start_hour/start_minute are unused (see
+        # the old v7 comment, still true in that case).
         self._start_mins = start_hour * 60 + start_minute
         self._reset_mins = reset_hour * 60 + reset_minute
         self.min_sl_atr_mult = min_sl_atr_mult
         self._restart_mins = restart_hour * 60 + restart_minute
+        self.orb_enabled = orb_enabled
+        self._orb_start_mins = orb_start_hour * 60 + orb_start_minute
+        self._orb_end_mins = orb_end_hour * 60 + orb_end_minute
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -242,7 +319,7 @@ class SupertrendSarStrategy:
         self._in_position = False
         self._is_short: bool | None = None   # True=CE/short, False=PE/long, None=flat
         self._active_sl: float | None = None
-        # v2 session bookkeeping (05:30 IST reset, not calendar midnight):
+        # v2 session bookkeeping (v8: reset moved to 17:30 IST, not calendar midnight):
         self._prev_now_mins: int | None = None
         self._session_id = 0            # increments each time the reset boundary is crossed
         self._active_session: int | None = None   # session_id whose first-entry already fired
@@ -252,6 +329,11 @@ class SupertrendSarStrategy:
         # docstring):
         self._last_closed_was_short: bool | None = None   # side of whichever leg most recently closed
         self._active_restart_session: int | None = None   # session_id whose restart already fired
+        # v7 Opening-Range-Breakout (ORB) bookkeeping (see DAY'S FIRST ENTRY
+        # in the module docstring):
+        self._orb_high: float | None = None
+        self._orb_low: float | None = None
+        self._orb_range_session: int | None = None   # session_id the current orb_high/low belongs to
 
     @property
     def ready(self) -> bool:
@@ -360,6 +442,7 @@ class SupertrendSarStrategy:
             "day_high": r(self._day_high), "day_low": r(self._day_low),
             "last_closed_was_short": self._last_closed_was_short,
             "active_restart_session": self._active_restart_session,
+            "orb_high": r(self._orb_high), "orb_low": r(self._orb_low),
         }
 
     # ------------------------------------------------------------------ #
@@ -371,8 +454,8 @@ class SupertrendSarStrategy:
         now_mins = local.hour * 60 + local.minute
 
         # v2 session rollover: a minute-crossing of reset_mins (default
-        # 05:30 IST), same idiom as the daily square-off elsewhere in this
-        # repo -- kept in lockstep with the Pine port's sessionRollover.
+        # 17:30 IST as of v8, was 05:30), same idiom as the daily
+        # square-off elsewhere in this repo.
         session_rollover = (
             self._prev_now_mins is not None
             and now_mins >= self._reset_mins
@@ -388,6 +471,21 @@ class SupertrendSarStrategy:
         else:
             self._day_high = max(self._day_high, candle.high)
             self._day_low = min(self._day_low, candle.low)
+
+        # v7 ORB (Opening Range Breakout) range tracking: build orb_high/
+        # orb_low fresh each session from every bar inside
+        # orb_start_mins-orb_end_mins (default 17:30-18:00 IST); the day's
+        # first entry (below) fires on a breakout of that finalized range,
+        # not the candle's own color. Runs unconditionally (like day-high/
+        # day-low above), not gated on self.ready, so the range is already
+        # correctly built by the time warmup completes mid-window.
+        if self._orb_range_session != self._session_id:
+            self._orb_range_session = self._session_id
+            self._orb_high = None
+            self._orb_low = None
+        if self._orb_start_mins <= now_mins < self._orb_end_mins:
+            self._orb_high = candle.high if self._orb_high is None else max(self._orb_high, candle.high)
+            self._orb_low = candle.low if self._orb_low is None else min(self._orb_low, candle.low)
 
         exit_ = False
         exit_price = candle.close
@@ -427,22 +525,57 @@ class SupertrendSarStrategy:
                             self._active_sl = min(self._active_sl, candle.close - min_dist)
                     entry_signal, entry_is_short = True, self._is_short
                     entry_price, new_sl = candle.close, self._active_sl
-            elif not self._in_position and self._session_id != self._active_session and now_mins >= self._start_mins:
-                # The session's first position (v3): direction ignores
-                # Supertrend entirely and instead reads the CANDLE that
-                # closes at start_mins itself (the 05:30-05:35 candle by
-                # default) -- green (close > open) -> BUY/PE, red
-                # (close <= open, a doji included) -> SELL/CE. Supertrend is
-                # still computed continuously (needed for its own ATR
-                # warmup) and its value is still used for THIS entry's SL --
-                # only the DIRECTION choice stopped reading it.
-                # self._session_id != self._active_session ensures this can
-                # only fire ONCE per session -- see force_flat()'s own
-                # comment for why this matters (without it, the square-
-                # off's force_flat() would leave the strategy eligible to
-                # re-arm minutes later, the same session).
+            elif not self._in_position and self._session_id != self._active_session and (
+                (self.orb_enabled and now_mins >= self._orb_end_mins
+                 and self._orb_high is not None and self._orb_low is not None
+                 and (candle.high > self._orb_high or candle.low < self._orb_low))
+                or (not self.orb_enabled and now_mins >= self._start_mins)
+            ):
+                # The session's first position. TWO mutually exclusive
+                # modes, chosen by orb_enabled (v9 -- default False, i.e.
+                # ORB removed from the default behavior per direct
+                # follow-up request; still available opt-in):
+                #   orb_enabled=True (v7 ORB): direction ignores both
+                #     Supertrend AND the candle's own color -- the
+                #     orb_start_mins-orb_end_mins window (default
+                #     17:30-18:00 IST) is watched as an Opening Range, and
+                #     the first candle AT OR AFTER orb_end_mins whose
+                #     high/low breaks that range arms the position: broke
+                #     below orb_low -> bearish -> SELL/CE; broke above
+                #     orb_high -> bullish -> BUY/PE. (On the rare bar that
+                #     breaks BOTH sides at once -- a big range or a gap --
+                #     direction follows whichever side the CLOSE ended up
+                #     beyond; if the close is back inside the range too,
+                #     fall back to close vs the range midpoint.)
+                #   orb_enabled=False (v3, the current default): the
+                #     candle that closes at start_mins itself (default
+                #     05:35 IST) decides direction by its own color --
+                #     green (close > open) -> BUY/PE, red (close <= open,
+                #     a doji included) -> SELL/CE.
+                # Either way Supertrend is still computed continuously
+                # (needed for its own ATR warmup) and its value is still
+                # used for THIS entry's SL. self._session_id !=
+                # self._active_session ensures this can only fire ONCE per
+                # session -- see force_flat()'s own comment for why this
+                # matters (without it, the square-off's force_flat() would
+                # leave the strategy eligible to re-arm minutes later, the
+                # same session).
                 self._active_session = self._session_id
-                self._is_short = candle.close < candle.open
+                if self.orb_enabled:
+                    broke_up = candle.high > self._orb_high
+                    broke_down = candle.low < self._orb_low
+                    if broke_down and not broke_up:
+                        self._is_short = True
+                    elif broke_up and not broke_down:
+                        self._is_short = False
+                    elif candle.close > self._orb_high:
+                        self._is_short = False
+                    elif candle.close < self._orb_low:
+                        self._is_short = True
+                    else:
+                        self._is_short = candle.close < (self._orb_high + self._orb_low) / 2
+                else:
+                    self._is_short = candle.close < candle.open
                 self._active_sl = st_value
                 self._in_position = True
                 entry_signal, entry_is_short = True, self._is_short
@@ -453,28 +586,28 @@ class SupertrendSarStrategy:
                 # v5 EVENING RESTART: once the daily square-off (an
                 # external force_flat() call, not modeled inside this
                 # class) has left the strategy flat, don't just sit out
-                # until next session's 05:35 first-entry -- at
-                # restart_mins (default 17:30 IST, 5 minutes after the
-                # usual 17:25 square-off) resume trading immediately, in
-                # the SAME direction as whichever leg was open going into
-                # that square-off (self._last_closed_was_short, updated on
-                # every close: a normal SL-hit reversal above, or
-                # force_flat() itself). SL = Supertrend's current value,
-                # same convention as the session's first entry (this is a
-                # fresh, non-reversal position, so it doesn't borrow the
-                # day-low/day-high reversal-SL rule). Gated to fire at most
-                # once per session the same way the first entry is; the
-                # backtest/live engine is expected to resolve this leg
-                # against the FOLLOWING day's option expiry, same as any
-                # other post-cutoff entry (see resolve_by_premium's own
-                # expiry-cutoff handling -- nothing SAR-specific needed
-                # here). Once open, this position is a completely ordinary
-                # position from here on -- normal SL-hit reversals (using
-                # day-low/day-high, v2 rule) apply exactly as usual, and it
-                # naturally carries through the next session's 05:30 reset
-                # without the day's-first-entry branch ever re-firing
-                # (guarded by "not self._in_position" like everything
-                # else here).
+                # until next session's first entry -- at restart_mins
+                # (default 17:30 IST, 5 minutes after the usual 17:25
+                # square-off) resume trading immediately, in the SAME
+                # direction as
+                # whichever leg was open going into that square-off
+                # (self._last_closed_was_short, updated on every close: a
+                # normal SL-hit reversal above, or force_flat() itself).
+                # SL = Supertrend's current value, same convention as the
+                # session's first entry (this is a fresh, non-reversal
+                # position, so it doesn't borrow the day-low/day-high
+                # reversal-SL rule). Gated to fire at most once per session
+                # the same way the first entry is; the backtest/live engine
+                # is expected to resolve this leg against the FOLLOWING
+                # day's option expiry, same as any other post-cutoff entry
+                # (see resolve_by_premium's own expiry-cutoff handling --
+                # nothing SAR-specific needed here). Once open, this
+                # position is a completely ordinary position from here on
+                # -- normal SL-hit reversals (using day-low/day-high, v2
+                # rule) apply exactly as usual, and it naturally carries
+                # through the next session's 17:30 reset without the
+                # day's-first-entry branch ever re-firing (guarded by "not
+                # self._in_position" like everything else here).
                 self._active_restart_session = self._session_id
                 self._is_short = self._last_closed_was_short
                 self._active_sl = st_value
