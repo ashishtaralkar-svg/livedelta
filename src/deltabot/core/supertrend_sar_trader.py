@@ -221,7 +221,22 @@ class SupertrendSarEngine:
         current_bar = (now // _BAR_SECONDS) * _BAR_SECONDS
         closed = [c for c in candles if c.start_time < current_bar]
         for c in closed:
-            self.strategy.update(c)
+            dec = self.strategy.update(c)
+            # Mirror _handle_closed_candle's own blocked-entry handling
+            # (see that method's comment) for this REPLAYED bar too --
+            # without this, a fresh entry that fell inside a past weekend
+            # blackout / skip-weekday window would silently commit a
+            # phantom in-position state while replaying history, exactly
+            # the bug fixed there, just reachable via a restart landing
+            # anywhere within the warmup lookback (sar_warmup_days) of a
+            # blackout window instead of via live processing. Evaluated at
+            # the CANDLE'S OWN close time (start_time + bar_seconds), the
+            # same convention backtest_supertrend_sar.py uses for its own
+            # decision_ts, not "now" -- this candle happened in the past.
+            if dec is not None and dec.has_entry and not dec.has_exit:
+                close_time = datetime.fromtimestamp(c.start_time + _BAR_SECONDS, tz=_IST)
+                if self._entries_blocked(now=close_time):
+                    self.strategy.force_flat()
             if c.close:
                 self._last_btc_close = c.close
         if closed:
@@ -613,8 +628,13 @@ class SupertrendSarEngine:
     # naturally re-arms via the NEXT closed candle's Decision, no special
     # handling needed here.
     # ------------------------------------------------------------------ #
-    def _entries_blocked(self) -> bool:
-        now = datetime.now(_IST)
+    def _entries_blocked(self, now: datetime | None = None) -> bool:
+        # `now` is overridable (rather than always reading the real wall
+        # clock) so _warmup() can ask "would THIS have been blocked, back
+        # when it historically happened" for a replayed candle -- same
+        # need backtest_supertrend_sar.py has for its own decision_ts.
+        if now is None:
+            now = datetime.now(_IST)
         if now.weekday() in self.settings.skip_weekday_ints:
             return True
         return self.settings.sar_weekend_blackout and _in_weekend_blackout(now)

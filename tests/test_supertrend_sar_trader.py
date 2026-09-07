@@ -317,6 +317,36 @@ async def test_blocked_fresh_entry_does_not_leave_a_phantom_position(monkeypatch
     assert not engine.executor.has_open_position
 
 
+async def test_warmup_does_not_leave_a_phantom_position_from_a_blocked_historical_entry(monkeypatch) -> None:
+    """Same bug as test_blocked_fresh_entry_does_not_leave_a_phantom_position,
+    reachable a second way: _warmup() calls strategy.update() directly on
+    replayed history and discards the Decision, with none of
+    _handle_closed_candle's blocked-entry handling applied -- so a restart
+    whose warmup lookback happens to replay a blocked (weekend blackout /
+    skip-weekday) window could reconstruct a phantom in-position state
+    purely from history, before the bot ever processes a single live
+    candle. Live and backtest should reconstruct the SAME state from the
+    same history; this is what keeps them matching across a restart."""
+    engine = _make_engine(skip_weekdays="Mon,Tue,Wed,Thu,Fri,Sat,Sun")  # every day blocked
+    s = engine.strategy
+    s._warmup_bars = 10   # ready from the first replayed candle (matches _ready() in test_supertrend_sar.py)
+    s._st.update = lambda h, l, c: (79800.0, 1)   # pin the frozen SL every bar
+
+    ts1 = int(_dt_module.datetime(2026, 9, 8, 17, 35, tzinfo=_ist).timestamp())
+    candle1 = _c(ts1, 80000.0, 80050.0, 79950.0, 79900.0)   # red -> would-be SELL CE, blocked
+    ts2 = ts1 + 60
+    candle2 = _c(ts2, 79700.0, 79850.0, 79650.0, 79700.0)   # crosses the phantom SL
+
+    async def fake_fetch(start, end):
+        return [candle1, candle2]
+
+    monkeypatch.setattr(engine, "_fetch_history_paged", fake_fetch)
+    monkeypatch.setattr("time.time", lambda: ts2 + 120)   # "now" safely after both replayed bars
+
+    await engine._warmup()
+    assert not s.in_position   # no phantom position survives warmup replay
+
+
 # ---------------------------------------------------------------------- #
 # Weekend blackout (Fri 17:35 IST -> Sun 17:35 IST) -- ported from
 # scripts/backtest_supertrend_sar.py's own _in_weekend_blackout(), which
