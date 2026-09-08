@@ -250,3 +250,36 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Supertrend 15m-Filter Fixed-SL bot -- 1m Supertrend(10,3) entry, gated by
+  # a 15m Supertrend(10,3) confirmation filter (LOCKED at each 15m boundary,
+  # not live-repainting), SL FROZEN at the flip candle's own Supertrend value
+  # (no trailing, no auto-reverse -- unlike sarbot above), SELLS options.
+  # STRICT SINGLE POSITION (like sarbot, never CE+PE at once). Profit target
+  # checked once per closed 1m candle (REDUCTION convention -- see
+  # .env.st15f.example), then blocked from re-entering until the 15m
+  # Supertrend itself has its own next fresh flip. NO daily square-off, NO
+  # rollover. Own Delta SUB-ACCOUNT, in parallel with the other bots which it
+  # NEVER touches (separate capital, DELTA_STATE_FILE=state/st15f_pos.json).
+  # Fill .env.st15f first (cp .env.st15f.example .env.st15f, add the
+  # sub-account API keys). Best backtest (1m, 25 lots, target 70%, premium
+  # ~1400): 3mo +$635.26/483 legs/28.8% win -- the most consistent pace and
+  # win rate across 1wk/1mo/3mo of any strategy tested this session. This
+  # engine has NEVER executed a real order -- watch it closely. Bring it up
+  # ALONE so the other running bots are not recreated:
+  #   docker compose up -d --build st15fbot
+  st15fbot:
+    build: .
+    image: deltabot:latest
+    container_name: st15fbot
+    restart: always
+    env_file:
+      - .env.st15f
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

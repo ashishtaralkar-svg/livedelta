@@ -415,6 +415,62 @@ class Settings(BaseSettings):
     sar_tp_poll_seconds: float = 15.0   # poll option mark for the TP-roll (0 = only at candle close)
     sar_debug_state: bool = False       # log a full strategy-state snapshot on every closed 1m candle
 
+    # Supertrend15mFilterFixedSl (strategy="st15f",
+    # src/deltabot/strategy/supertrend_15m_filter_fixed_sl.py, engine runs on
+    # 1-MINUTE candles -- see core/supertrend_15m_filter_fixed_sl_trader.py):
+    # STRICT SINGLE POSITION (one OptionsExecutor, same architecture as
+    # ema21bot/sarbot). Always sell-mode -- leave DELTA_OPTION_SIDE at its
+    # "sell" default, unset here.
+    #
+    # A 1-minute Supertrend(10,3) fires the entry on its own FRESH flip, but
+    # ONLY when a 15-minute Supertrend(10,3) already agrees at that exact
+    # moment (a LOCKED, bucket-boundary confirmation -- see the strategy's
+    # own docstring for why this deliberately diverges from Pine's live-
+    # repainting request.security()). SL is FROZEN at the 1-minute
+    # Supertrend's own value on the flip candle -- a real BTC price level,
+    # not re-derived on later bars -- and does not auto-reverse on a stop-out
+    # (unlike strategy="sar"). Runs on REAL (non-HA) candles -- Heikin Ashi
+    # was only ever applied to the separate supertrend_flip strategy, never
+    # this one.
+    #
+    # Profit target (st15f_target_pct) is an OPTION-PREMIUM mechanic checked
+    # once per closed 1-minute candle (not a continuous poll, to exactly
+    # match the validated backtest) -- REDUCTION convention, the OPPOSITE of
+    # sar_tp_pct's decay-TO convention: "target 70% reduce price of option
+    # means if sold at 100 then target is 30", i.e.
+    # target = entry_premium * (1 - st15f_target_pct/100). After a target
+    # hit, no new trade until the 15-minute Supertrend itself has its own
+    # next fresh flip (handled inside the strategy's own
+    # notify_target_hit()) -- no roll/re-sell, just flat.
+    #
+    # Expiry needed MINUTE precision ("if at 17:26 you should take trade in
+    # next day option") that the shared option_expiry_cutoff_hour (hour-only)
+    # can't express, so this engine uses a small OptionsExecutor subclass
+    # local to core/supertrend_15m_filter_fixed_sl_trader.py that overrides
+    # ONLY _select_expiry() with st15f_expiry_cutoff_hour/minute -- no other
+    # bot is affected (OptionsExecutor has no shared/singleton state).
+    #
+    # No daily square-off, no rollover -- neither was described and the
+    # validated backtest has neither; a still-open leg just runs until its
+    # own SL/target fires, or (live-only, not modeled in the backtest) the
+    # exchange's own settlement plus this bot's regular self-heal/reconcile
+    # catches an expired contract.
+    #
+    # Best validated backtest (1m, 15m filter, frozen SL, target 70%, premium
+    # ~1400, 25 lots): 1wk +$32.67/38 legs/26.3% win, 1mo +$243.25/150
+    # legs/30.0% win, 3mo +$635.26/483 legs/28.8% win -- the most consistent
+    # pace (~5.4 legs/day) and win rate across all three windows of any
+    # strategy tested this session. Never executed a real order -- treat
+    # live results with real caution.
+    st15f_atr_period: int = 10
+    st15f_factor: float = 3.0
+    st15f_atr_period_15m: int = 10
+    st15f_factor_15m: float = 3.0
+    st15f_expiry_cutoff_hour: int = 17
+    st15f_expiry_cutoff_minute: int = 26
+    st15f_target_pct: float = 70.0   # REDUCTION convention -- see block comment above. 0 = no target.
+    st15f_debug_state: bool = False  # log a full strategy-state snapshot on every closed 1m candle
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

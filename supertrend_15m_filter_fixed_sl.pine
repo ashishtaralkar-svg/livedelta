@@ -1,0 +1,133 @@
+//@version=5
+// ============================================================================
+// SUPERTREND 15m-FILTER, FIXED SL (1-minute chart)
+//
+// New, standalone strategy -- shares ideas with supertrend_flip_sell_only.pine
+// (the 15m confirmation filter) and supertrend_sar_strategy.pine (a frozen,
+// non-trailing SL at the Supertrend's own value) but is neither of those
+// scripts; built fresh per spec.
+//
+// RULES (as specified):
+//  1. Supertrend(10,3) on the 15-MINUTE timeframe is a CONFIRMATION FILTER
+//     only -- "15 min supertrend is filter". Fetched via request.security,
+//     same MTF pattern as supertrend_flip_sell_only.pine.
+//  2. Trades are taken off the 1-MINUTE Supertrend -- "take trade in 1 min
+//     supertrend". Entry fires on the bar the 1-minute Supertrend itself
+//     FLIPS (a fresh change, not merely already sitting in that color),
+//     PROVIDED the 15-minute Supertrend already agrees at that exact
+//     moment: 1m flips red + 15m already red -> SELL; 1m flips green + 15m
+//     already green -> BUY. If the 15m disagrees right at the flip, this
+//     version simply skips that flip (no "wait for 15m to catch up"
+//     mechanic like supertrend_flip_sell_only.pine's v5/v10 -- say so if
+//     you want that added here too).
+//  3. SL: "sl is fixed on supertrend where candle change supertrend" -- the
+//     STOP is the 1-MINUTE Supertrend's own value AT THE FLIP CANDLE
+//     (i.e. the same candle the entry fires on), FROZEN from that point on
+//     -- it does NOT trail the Supertrend's later values like a normal
+//     Supertrend-stop system would. The instant real price crosses that
+//     frozen level, the position closes.
+//  4. After an SL hit, the strategy is flat and waits for the NEXT fresh 1m
+//     flip (with 15m agreement) before re-entering -- this version does
+//     NOT auto-reverse into the opposite side on an SL hit (unlike
+//     supertrend_sar_strategy.pine's stop-and-reverse); it was described as
+//     a stop, not a reversal trigger. Flag it if you want a reversal
+//     instead.
+//
+// LIMITATIONS / ASSUMPTIONS (flagging, not silently deciding for you):
+//  * Bidirectional (BUY + SELL) -- "take trade" wasn't restricted to one
+//    side this time, unlike some earlier builds that were explicitly
+//    sell-only.
+//  * No profit target and no end-of-day square-off were specified, so
+//    neither is implemented.
+//  * Applied on a 1-MINUTE chart -- resolution isn't a script input since
+//    it wasn't described as one; the 15m Supertrend is fetched via MTF
+//    regardless of chart resolution.
+// ============================================================================
+strategy("Supertrend 15m-Filter Fixed-SL (1m)", overlay=true, pyramiding=0, initial_capital=10000, default_qty_type=strategy.fixed, default_qty_value=1, process_orders_on_close=true, calc_on_every_tick=false, commission_type=strategy.commission.percent, commission_value=0.0, max_labels_count=500)
+
+// ------------------------------------------------------------------
+// Inputs
+// ------------------------------------------------------------------
+grpST = "Supertrend (1m, entry + fixed SL source)"
+atrPeriod = input.int(10, "ATR Period", minval=1, group=grpST)
+factor    = input.float(3.0, "Multiplier", minval=0.1, group=grpST)
+
+grpST15 = "Supertrend (15m, confirmation filter)"
+atrPeriod15 = input.int(10, "15m ATR Period", minval=1, group=grpST15)
+factor15    = input.float(3.0, "15m Multiplier", minval=0.1, group=grpST15)
+
+// ------------------------------------------------------------------
+// Primary Supertrend(10,3), this chart's own resolution.
+// ------------------------------------------------------------------
+[st, dir] = ta.supertrend(factor, atrPeriod)
+plot(st, "Supertrend (1m)", color = dir < 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+
+isRed   = dir > 0    // downtrend -- Supertrend above price
+isGreen = dir < 0    // uptrend -- Supertrend below price
+
+// ------------------------------------------------------------------
+// 15-minute Supertrend -- MTF confirmation filter only, never a trade
+// trigger on its own.
+// ------------------------------------------------------------------
+f_supertrend15() =>
+    [st15, dir15] = ta.supertrend(factor15, atrPeriod15)
+    [st15, dir15]
+
+[st15, dir15] = request.security(syminfo.tickerid, "15", f_supertrend15())
+isRed15   = dir15 > 0
+isGreen15 = dir15 < 0
+
+plot(st15, "Supertrend (15m)", color = dir15 < 0 ? color.new(color.green, 60) : color.new(color.red, 60), linewidth=2, style=plot.style_circles)
+
+// ------------------------------------------------------------------
+// Entry: a fresh 1-minute flip, confirmed by the 15-minute filter already
+// agreeing at that same moment. SL: frozen at THIS flip candle's own
+// Supertrend value.
+// ------------------------------------------------------------------
+dirFlipped = ta.change(dir) != 0
+
+sellEntry = dirFlipped and isRed and isRed15 and strategy.position_size == 0
+buyEntry  = dirFlipped and isGreen and isGreen15 and strategy.position_size == 0
+
+var float activeSL = na
+
+sellExit = strategy.position_size < 0 and not na(activeSL) and high >= activeSL
+buyExit  = strategy.position_size > 0 and not na(activeSL) and low  <= activeSL
+
+if sellExit
+    strategy.close("Short", comment="SL hit")
+    activeSL := na
+if buyExit
+    strategy.close("Long", comment="SL hit")
+    activeSL := na
+
+if sellEntry
+    strategy.entry("Short", strategy.short, comment="1m flip red + 15m red")
+    activeSL := st
+if buyEntry
+    strategy.entry("Long", strategy.long, comment="1m flip green + 15m green")
+    activeSL := st
+
+// ------------------------------------------------------------------
+// Plotting / markers
+// ------------------------------------------------------------------
+bothRed   = isRed and isRed15
+bothGreen = isGreen and isGreen15
+bgcolor(bothRed ? color.new(color.red, 90) : bothGreen ? color.new(color.green, 90) : na, title="Both agree (1m+15m)")
+
+plot(strategy.position_size != 0 ? activeSL : na, "Frozen SL", color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
+
+plotshape(sellEntry, title="SELL marker", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.small)
+plotshape(buyEntry, title="BUY marker", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+plotshape(sellExit, title="Short SL marker", style=shape.xcross, location=location.abovebar, color=color.new(color.gray, 0), size=size.tiny)
+plotshape(buyExit, title="Long SL marker", style=shape.xcross, location=location.belowbar, color=color.new(color.gray, 0), size=size.tiny)
+
+if sellEntry
+    label.new(bar_index, high, text="SELL", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
+if buyEntry
+    label.new(bar_index, low, text="BUY", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.normal)
+if sellExit
+    label.new(bar_index, high, text="SL", style=label.style_label_down, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+if buyExit
+    label.new(bar_index, low, text="SL", style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)

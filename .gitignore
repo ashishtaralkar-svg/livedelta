@@ -11,6 +11,7 @@
 .env.supertrend
 .env.range_fade
 .env.sar
+.env.st15f
 state/
 
 # Python
