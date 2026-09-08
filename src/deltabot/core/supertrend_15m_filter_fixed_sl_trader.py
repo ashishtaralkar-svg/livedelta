@@ -39,11 +39,21 @@ bug (see the strategy's own docstring): it blocks new entries until the
 target is done then no new trade until 15 min supertrend is not change".
 
 NO AUTO-REVERSE on a stop-out (unlike strategy="sar") -- a plain close.
-NO DAILY SQUARE-OFF, NO ROLLOVER -- neither was described and the validated
-backtest has neither; a still-open leg just runs until its own SL/target
-fires, or (live-only, not modeled in the backtest) the exchange's own
-settlement plus this bot's regular self-heal/reconcile below catches an
-expired contract and force-flattens.
+NO ROLLOVER. NO DAILY SQUARE-OFF BY DEFAULT (st15f_eod_square_off=False) --
+neither was described and the validated backtest has neither; a still-open
+leg just runs until its own SL/target fires, or (live-only, not modeled in
+the backtest) the exchange's own settlement plus this bot's regular
+self-heal/reconcile below catches an expired contract and force-flattens.
+
+OPT-IN EOD SQUARE-OFF (st15f_eod_square_off=True, on-request comparison
+variant, backtested 2026-09-08): force-closes whatever's open at
+square_off_hour:square_off_minute IST (the shared field, default 17:25)
+every day, reason "EOD" -- pair with st15f_target_pct=0 to fully disable
+the premium target and hold to end of day instead. Backtested statistically
+a WASH vs target 70% on real candles (1mo $242.36 vs $243.25, 3mo $629.86
+vs $635.26 at 25 lots) with MORE variance and capital held longer per
+trade -- not a proven improvement, just a variant the user asked to run
+live too. See config.py's st15f_eod_square_off comment for the full number.
 
 EXPIRY needed MINUTE precision ("if at 17:26 you should take trade in next
 day option") that the shared OptionsExecutor._select_expiry() can't express
@@ -126,6 +136,8 @@ class Supertrend15mFilterFixedSlEngine:
         self._last_closed_start: int | None = None
         self._tasks: set[asyncio.Task] = set()
         self._selfheal_task: asyncio.Task | None = None
+        self._sq_off_task: asyncio.Task | None = None
+        self._sq_off_date: date | None = None
 
         self._entry_premium: float | None = None
         self._current_is_short: bool | None = None
@@ -157,6 +169,8 @@ class Supertrend15mFilterFixedSlEngine:
         )
         if self.settings.position_verify_seconds > 0:
             self._selfheal_task = asyncio.create_task(self._selfheal_loop())
+        if self.settings.st15f_eod_square_off:
+            self._sq_off_task = asyncio.create_task(self._square_off_scheduler())
         log.info("Supertrend15mFilterFixedSlEngine: starting live (SELL side)")
         await self.ws.run()
 
@@ -165,6 +179,8 @@ class Supertrend15mFilterFixedSlEngine:
             self.ws.stop()
         if self._selfheal_task is not None:
             self._selfheal_task.cancel()
+        if self._sq_off_task is not None:
+            self._sq_off_task.cancel()
         if self.settings.close_on_shutdown and self.executor.has_open_position:
             try:
                 lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
@@ -517,3 +533,59 @@ class Supertrend15mFilterFixedSlEngine:
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
         return datetime.now(_IST).weekday() in self.settings.skip_weekday_ints
+
+    # ------------------------------------------------------------------ #
+    # OPT-IN (st15f_eod_square_off) -- see module/config.py docstrings. Off
+    # by default; the base strategy has no square-off concept at all.
+    # ------------------------------------------------------------------ #
+    async def _square_off_scheduler(self) -> None:
+        while True:
+            now = datetime.now(_IST)
+            target = now.replace(hour=self.settings.square_off_hour,
+                                 minute=self.settings.square_off_minute, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_s = (target - now).total_seconds()
+            log.info("St15f: next EOD square-off",
+                     extra={"extra": {"at": target.isoformat(), "in_s": int(wait_s)}})
+            try:
+                await asyncio.sleep(wait_s)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self._square_off()
+            except Exception as exc:  # noqa: BLE001
+                log.error("St15f: square-off failed", extra={"extra": {"error": str(exc)}})
+            await asyncio.sleep(60)
+
+    async def _square_off(self) -> None:
+        now = datetime.now(_IST)
+        self._sq_off_date = now.date()
+        log.info("St15f: EOD square-off firing", extra={"extra": {"date": str(self._sq_off_date)}})
+        if self._closing or not self.executor.has_open_position:
+            self.strategy.force_flat()
+            return
+        self._closing = True
+        try:
+            contract = self.executor.tracked_symbol
+            lots = self.executor.tracked_size   # captured BEFORE close_option() clears tracked state
+            try:
+                fill = await self.executor.close_option()
+            except Exception as exc:  # noqa: BLE001
+                log.error("St15f: square-off close failed", extra={"extra": {"error": str(exc)}})
+                await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"EOD close: {exc}")
+                await self._sync_options_to_exchange()
+                return
+            if self.settings.state_file:
+                position_state.clear(self.settings.state_file)
+            entry_prem = self._entry_premium
+            gross = self._pnl(entry_prem, fill, lots)
+            self._entry_premium = self._current_is_short = None
+            await self.notifier.notify(
+                NotifyEvent.EXIT, reason="EOD", contract=contract or "?",
+                entry_premium=entry_prem, exit_premium=fill, pnl=round(gross, 2), size=lots,
+                side="sell",
+            )
+        finally:
+            self._closing = False
+        self.strategy.force_flat()

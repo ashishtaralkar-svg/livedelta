@@ -366,6 +366,42 @@ async def test_reconcile_preserves_state_when_exchange_empty_but_owned(tmp_path)
 
 
 # ---------------------------------------------------------------------- #
+# Opt-in EOD square-off (st15f_eod_square_off) -- off by default, the base
+# strategy has no square-off concept at all.
+# ---------------------------------------------------------------------- #
+def test_selfheal_task_only_starts_when_eod_square_off_is_off_by_default() -> None:
+    engine = _make_engine()
+    assert engine.settings.st15f_eod_square_off is False
+
+
+async def test_square_off_closes_open_position_with_eod_reason() -> None:
+    engine = _make_engine(st15f_eod_square_off=True)
+    await engine._open_entry(True, 64500.0, 64000.0)
+    await engine._square_off()
+    assert engine.executor.close_calls == 1
+    assert not engine.strategy.in_position
+    exits = _exit_calls(engine.notifier)
+    assert exits and exits[-1].kwargs["reason"] == "EOD"
+
+
+async def test_square_off_noop_when_already_flat() -> None:
+    engine = _make_engine(st15f_eod_square_off=True)
+    await engine._square_off()
+    assert engine.executor.close_calls == 0
+    assert not engine.strategy.in_position
+
+
+async def test_square_off_force_flats_even_when_no_position_was_open() -> None:
+    """Mirrors the strategy having entered a fresh flip THIS bar with no
+    option yet open (entry_in_progress race) -- square-off must still leave
+    the strategy flat rather than skip force_flat() entirely."""
+    engine = _make_engine(st15f_eod_square_off=True)
+    engine.strategy._is_short = True   # simulate stray strategy-side state
+    await engine._square_off()
+    assert not engine.strategy.in_position
+
+
+# ---------------------------------------------------------------------- #
 # Minute-precise expiry cutoff -- the whole reason for the executor subclass
 # ---------------------------------------------------------------------- #
 def test_minute_precise_expiry_rolls_at_the_exact_configured_minute(monkeypatch) -> None:

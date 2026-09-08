@@ -469,6 +469,18 @@ class Settings(BaseSettings):
     st15f_expiry_cutoff_hour: int = 17
     st15f_expiry_cutoff_minute: int = 26
     st15f_target_pct: float = 70.0   # REDUCTION convention -- see block comment above. 0 = no target.
+    # On-request comparison variant, backtested 2026-09-08: instead of
+    # exiting on the premium target, hold whatever's open and force-close it
+    # at square_off_hour:square_off_minute IST (the shared field, default
+    # 17:25) every day -- pair with st15f_target_pct=0 to fully disable the
+    # target. NOT the validated base strategy (neither was ever described)
+    # -- backtested statistically a WASH vs target 70% on real candles (1mo
+    # $242.36 vs $243.25, 3mo $629.86 vs $635.26 at 25 lots) with MORE
+    # variance (fewer, bigger daily-mark swings instead of many small early
+    # profit-takes) and capital held longer per trade -- and WORSE on
+    # Heikin Ashi candles on every window. Off by default -- the live
+    # st15fbot config is unchanged unless this is explicitly turned on.
+    st15f_eod_square_off: bool = False
     st15f_debug_state: bool = False  # log a full strategy-state snapshot on every closed 1m candle
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on

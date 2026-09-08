@@ -160,6 +160,44 @@ def test_notify_target_hit_blocks_entries_until_15m_flips() -> None:
     assert s.in_position
 
 
+def test_heikin_ashi_mode_off_by_default() -> None:
+    s = _strategy()
+    assert s._ha1 is None and s._ha15 is None
+
+
+def test_heikin_ashi_mode_reported_entry_price_stays_real() -> None:
+    """HA governs the Supertrend's own direction/SL-value computation and
+    the frozen-SL crossing check (see module docstring), but a reported
+    entry fires at the REAL candle close, mirroring how Pine's own strategy
+    fills always use real price even on an HA-displayed chart."""
+    s = _strategy(use_heikin_ashi=True)
+    assert s._ha1 is not None and s._ha15 is not None
+    _ready(s)
+    s._st15._direction = 1   # 15m red -- agrees with the coming sell flip
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(0, 100, 101, 99, 100))
+    s._st.update = lambda h, l, c: (105.0, 1)   # fresh flip to downtrend
+    real_close = 987.65
+    d = s.update(_c(T, 100, 102, 98, real_close))
+    assert d is not None and d.has_entry
+    assert d.entry_price == real_close   # never an HA-converted value
+
+
+def test_heikin_ashi_mode_15m_gets_its_own_independent_ha_state() -> None:
+    """The 15m HA series must be a fresh HA conversion of the real
+    15-minute bucket, NOT a rollup of the primary timeframe's own
+    (separately-stated) HA candles -- confirmed by the two _HeikinAshi
+    instances being distinct objects with independently-evolving state."""
+    s = _strategy(use_heikin_ashi=True)
+    assert s._ha1 is not s._ha15
+    _ready(s)
+    for i in range(20):
+        s.update(_c(i * T, 100 + i, 101 + i, 99 + i, 100 + i))
+    # Both have processed bars, but from different input series (1m candles
+    # vs the aggregated 15m bucket) -- their recursive state must diverge.
+    assert (s._ha1._ha_open, s._ha1._ha_close) != (s._ha15._ha_open, s._ha15._ha_close)
+
+
 def test_same_bar_stop_out_and_fresh_qualifying_flip_can_both_fire() -> None:
     s = _strategy()
     _ready(s)

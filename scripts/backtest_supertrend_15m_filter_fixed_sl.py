@@ -85,6 +85,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     strategy = Supertrend15mFilterFixedSlStrategy(
         atr_period=args.atr_period, factor=args.factor,
         atr_period_15m=args.atr_period_15m, factor_15m=args.factor_15m,
+        use_heikin_ashi=args.heikin_ashi,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
     interval = settings.option_strike_interval
@@ -158,11 +159,28 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     # tp_pct/100) -- do not port one script's target math to the other
     # without converting it.
     target_frac = (1 - args.target_pct / 100.0) if args.target_pct > 0 else None
+    last_squareoff_date = None   # only used when args.eod_square_off -- fires once per calendar day
 
     with httpx.Client(base_url=settings.rest_base_url, timeout=30.0) as client:
         for c in candles:
             dec = strategy.update(c)
             decision_ts = c.start_time + bar_seconds
+
+            # On-request comparison variant: hold to end of day instead of
+            # exiting on the premium target (see --eod-square-off help).
+            # Fires once per calendar day at the configured IST time,
+            # force-closing whatever happens to be open at that moment --
+            # NOT part of the validated base strategy.
+            if args.eod_square_off:
+                ist_dt = datetime.fromtimestamp(decision_ts, tz=_IST)
+                if ((ist_dt.hour, ist_dt.minute) >= (args.square_off_hour, args.square_off_minute)
+                        and last_squareoff_date != ist_dt.date()):
+                    last_squareoff_date = ist_dt.date()
+                    if pos is not None:
+                        exit_prem = buyback_prem(decision_ts, c.close)
+                        close("EOD", exit_prem if exit_prem is not None else pos["entry_prem"],
+                              decision_ts, c.close)
+                        strategy.force_flat()
 
             # Expiry handling: a still-open leg whose contract has passed
             # its own real expiry moment (tracked at entry, see open_leg())
@@ -218,7 +236,10 @@ def report(trades: list[dict], args) -> None:
     print(f"\n{'=' * 112}")
     tgt_frac = 100 - args.target_pct
     tgt_desc = f"target {args.target_pct:.0f}% reduction (->{tgt_frac:.0f}% of entry)" if args.target_pct > 0 else "no target"
+    if args.eod_square_off:
+        tgt_desc += f", hold to EOD {args.square_off_hour:02d}:{args.square_off_minute:02d} IST"
     print(f"Supertrend 15m-Filter Fixed-SL [OPTION SELL] -- {args.days}d, {args.resolution}, "
+          f"{'HEIKIN ASHI' if args.heikin_ashi else 'real'} candles, "
           f"Supertrend({args.atr_period},{args.factor:.0f}) + 15m({args.atr_period_15m},{args.factor_15m:.0f}) filter, "
           f"expiry cutoff {args.expiry_cutoff_hour:02d}:{args.expiry_cutoff_minute:02d} IST, "
           f"premium ~{args.target_premium:.0f}, {tgt_desc}, {args.lots} lots, floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
@@ -236,7 +257,7 @@ def report(trades: list[dict], args) -> None:
     print(f"Legs: {len(closed)} closed" + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "TARGET", "EXPIRED", "OPEN_AT_END"):
+    for reason in ("SL", "TARGET", "EOD", "EXPIRED", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -274,9 +295,21 @@ def main() -> None:
     p.add_argument("--factor", type=float, default=3.0)
     p.add_argument("--atr-period-15m", type=int, default=10)
     p.add_argument("--factor-15m", type=float, default=3.0)
+    p.add_argument("--heikin-ashi", action="store_true",
+                    help="Run both Supertrends (1m + 15m) on Heikin Ashi OHLC instead of real "
+                         "candles -- see the strategy module docstring's OPT-IN HEIKIN ASHI MODE "
+                         "note. Reported entry price stays REAL regardless.")
     p.add_argument("--expiry-cutoff-hour", type=int, default=17)
     p.add_argument("--expiry-cutoff-minute", type=int, default=26)
     p.add_argument("--target-premium", type=float, default=1400.0)
+    p.add_argument("--eod-square-off", action="store_true",
+                    help="Force-close whatever's open at --square-off-hour:--square-off-minute IST "
+                         "each day, INSTEAD of exiting on the premium target -- pair with "
+                         "--target-pct 0 to fully disable the target and hold to end of day. Not "
+                         "part of the base strategy/backtest (neither was ever described or "
+                         "validated) -- this is an on-request comparison variant only.")
+    p.add_argument("--square-off-hour", type=int, default=17)
+    p.add_argument("--square-off-minute", type=int, default=25)
     p.add_argument("--target-pct", type=float, default=70.0,
                     help="Profit target as a REDUCTION from entry (e.g. 70 -> target = 30%% of entry, "
                          "\"if sold at 100 then target is 30\"). 0 disables.")

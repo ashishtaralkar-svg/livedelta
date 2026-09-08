@@ -40,6 +40,25 @@ Strict single position -- never a CE and PE open at once; a same-bar
 close-then-reopen can still happen if a stop-out and a qualifying fresh
 flip land on the exact same candle (checked in that order, matching every
 other flip/reversal strategy in this package).
+
+OPT-IN HEIKIN ASHI MODE (use_heikin_ashi=False by default -- the LIVE
+st15fbot config, unchanged): when enabled, BOTH Supertrends (1-minute
+primary and 15-minute confirmation) run on Heikin Ashi open/high/low/close
+instead of real OHLC, mirroring supertrend_flip.py's own v11 HA conversion
+and the same "each timeframe gets its OWN independent recursive HA state"
+rule (the 15m HA series is a fresh HA conversion of the real 15-minute
+aggregated bar, NOT a rollup of the primary's own HA candles). The frozen
+SL crossing check ALSO uses HA high/low in this mode (consistent with
+supertrend_flip.py's breakout-level checks also being HA-based) -- i.e. in
+HA mode this strategy behaves exactly as if it were running on a genuine
+Heikin Ashi chart end to end. The one thing that stays REAL regardless:
+entry_price is always candle.close (never HA close), mirroring how Pine's
+own strategy fills always use real market price even on an HA-displayed
+chart -- the caller needs real price to resolve option strikes/premiums.
+exit_price is unaffected either way: it was already the frozen SL LEVEL
+itself (a literal stop price the caller uses to close the option), not a
+candle close, so there's no separate "real vs HA" version of it to choose
+between.
 """
 
 from __future__ import annotations
@@ -112,6 +131,27 @@ class _Supertrend:
         return value, direction
 
 
+class _HeikinAshi:
+    """Standard recursive Heikin Ashi conversion: ha_close = (o+h+l+c)/4,
+    ha_open = (prev_ha_open + prev_ha_close)/2 (seeded with (o+c)/2 on the
+    first bar), ha_high = max(h, ha_open, ha_close), ha_low = min(l,
+    ha_open, ha_close) -- same formula as supertrend_flip.py's own
+    conversion. Each instance holds its OWN independent recursive state,
+    since HA is timeframe-specific (see module docstring)."""
+
+    def __init__(self) -> None:
+        self._ha_open: float | None = None
+        self._ha_close: float | None = None
+
+    def convert(self, o: float, h: float, low: float, c: float) -> tuple[float, float, float, float]:
+        ha_close = (o + h + low + c) / 4.0
+        ha_open = (o + c) / 2.0 if self._ha_open is None else (self._ha_open + self._ha_close) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(low, ha_open, ha_close)
+        self._ha_open, self._ha_close = ha_open, ha_close
+        return ha_open, ha_high, ha_low, ha_close
+
+
 @dataclass(frozen=True)
 class Supertrend15mFilterFixedSlDecision:
     candle: Candle
@@ -141,17 +181,22 @@ class Supertrend15mFilterFixedSlStrategy:
         atr_period_15m: int = 10,
         factor_15m: float = 3.0,
         bucket_seconds: int = 900,   # 15 minutes -- the confirmation timeframe's own bar width
+        use_heikin_ashi: bool = False,   # see module docstring's OPT-IN HEIKIN ASHI MODE note
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
         self.atr_period_15m = atr_period_15m
         self.factor_15m = factor_15m
         self.bucket_seconds = bucket_seconds
+        self.use_heikin_ashi = use_heikin_ashi
         self.reset()
 
     def reset(self) -> None:
         self._st = _Supertrend(self.atr_period, self.factor)
         self._st15 = _Supertrend(self.atr_period_15m, self.factor_15m)
+        # Independent recursive HA state per timeframe -- see module docstring.
+        self._ha1 = _HeikinAshi() if self.use_heikin_ashi else None
+        self._ha15 = _HeikinAshi() if self.use_heikin_ashi else None
         self._prev_dir = 0
         self._is_short: bool | None = None   # None=flat, True=short/CE, False=long/PE
         self._active_sl: float | None = None
@@ -234,7 +279,14 @@ class Supertrend15mFilterFixedSlStrategy:
             return False
         if bucket_id != self._bucket_id:
             prev_dir15 = self._st15._direction
-            self._st15.update(self._bucket_high, self._bucket_low, self._bucket_close)
+            if self._ha15 is not None:
+                # Fresh HA conversion of the REAL 15-minute bucket -- NOT a
+                # rollup of the primary's own (separately-stated) HA candles.
+                _, ha_h, ha_l, ha_c = self._ha15.convert(
+                    self._bucket_open, self._bucket_high, self._bucket_low, self._bucket_close)
+                self._st15.update(ha_h, ha_l, ha_c)
+            else:
+                self._st15.update(self._bucket_high, self._bucket_low, self._bucket_close)
             flipped15 = prev_dir15 != 0 and self._st15._direction != prev_dir15
             self._bucket_id = bucket_id
             self._bucket_open = candle.open
@@ -249,7 +301,16 @@ class Supertrend15mFilterFixedSlStrategy:
 
     # ------------------------------------------------------------------ #
     def update(self, candle: Candle) -> Supertrend15mFilterFixedSlDecision | None:
-        st_value, direction = self._st.update(candle.high, candle.low, candle.close)
+        if self._ha1 is not None:
+            _, ha_h, ha_l, ha_c = self._ha1.convert(candle.open, candle.high, candle.low, candle.close)
+            st_value, direction = self._st.update(ha_h, ha_l, ha_c)
+            # The frozen SL's crossing check also uses HA high/low in this
+            # mode -- see module docstring (mirrors supertrend_flip.py's own
+            # breakout-level checks, which are HA-based too).
+            check_high, check_low = ha_h, ha_l
+        else:
+            st_value, direction = self._st.update(candle.high, candle.low, candle.close)
+            check_high, check_low = candle.high, candle.low
         dir15_flipped = self._feed_15m(candle)
         if dir15_flipped and self._blocked_until_15m_flip:
             self._blocked_until_15m_flip = False
@@ -274,11 +335,11 @@ class Supertrend15mFilterFixedSlStrategy:
         # ---- 1. Exit: real price crosses the FROZEN (non-trailing) SL.
         #         Checked before entry so a same-bar stop-out + fresh
         #         qualifying flip can still open a new leg this bar. ----
-        if self._is_short is True and self._active_sl is not None and candle.high >= self._active_sl:
+        if self._is_short is True and self._active_sl is not None and check_high >= self._active_sl:
             exit_, exit_price, exit_was_short = True, self._active_sl, True
             self._is_short = None
             self._active_sl = None
-        elif self._is_short is False and self._active_sl is not None and candle.low <= self._active_sl:
+        elif self._is_short is False and self._active_sl is not None and check_low <= self._active_sl:
             exit_, exit_price, exit_was_short = True, self._active_sl, False
             self._is_short = None
             self._active_sl = None
