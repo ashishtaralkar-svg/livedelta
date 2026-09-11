@@ -68,15 +68,22 @@ class FakeExecutor:
 
 
 class FakeRest:
-    def __init__(self, positions=None, mark=None) -> None:
+    def __init__(self, positions=None, mark=None, balance=0.0, raises_balance=False) -> None:
         self._positions = positions or []
         self._mark = mark
+        self._balance = balance
+        self._raises_balance = raises_balance
 
     def get_option_positions(self, underlying):
         return self._positions
 
     def get_mark_price(self, symbol):
         return self._mark
+
+    def get_available_balance(self, asset_symbol=None):
+        if self._raises_balance:
+            raise RuntimeError("flaky api")
+        return self._balance
 
 
 def _make_engine(**kw) -> Supertrend15mFilterFixedSlEngine:
@@ -399,6 +406,79 @@ async def test_square_off_force_flats_even_when_no_position_was_open() -> None:
     engine.strategy._is_short = True   # simulate stray strategy-side state
     await engine._square_off()
     assert not engine.strategy.in_position
+
+
+# ---------------------------------------------------------------------- #
+# Compounding lot-sizing (st15f_compound_capital) -- off by default; when on,
+# recomputes floor(real balance / capital_per_lot), capped at max_lots, once
+# per day-close (piggybacks on _square_off()).
+# ---------------------------------------------------------------------- #
+async def test_compounding_off_by_default_keeps_static_option_contracts() -> None:
+    engine = _make_engine(option_contracts=25)
+    assert engine.settings.st15f_compound_capital is False
+    await engine._maybe_recompute_compounded_lots()
+    assert engine._current_lots == 25   # unchanged -- no-op when disabled
+    await engine._open_entry(True, 64500.0, 64000.0)
+    assert engine.settings.option_contracts == 25   # never overwritten
+
+
+async def test_compounding_recomputes_lots_from_real_balance() -> None:
+    engine = _make_engine(st15f_compound_capital=True, st15f_capital_per_lot=3.0, st15f_max_lots=100)
+    engine.rest = FakeRest(balance=60.0)   # 60 / 3 = 20 lots
+    await engine._maybe_recompute_compounded_lots()
+    assert engine._current_lots == 20
+
+
+async def test_compounding_caps_at_max_lots() -> None:
+    engine = _make_engine(st15f_compound_capital=True, st15f_capital_per_lot=3.0, st15f_max_lots=100)
+    engine.rest = FakeRest(balance=100_000.0)   # would be 33,333 lots uncapped
+    await engine._maybe_recompute_compounded_lots()
+    assert engine._current_lots == 100   # the hard safety ceiling wins
+
+
+async def test_compounding_balance_fetch_failure_keeps_current_lots() -> None:
+    engine = _make_engine(st15f_compound_capital=True)
+    engine._current_lots = 15
+    engine.rest = FakeRest(raises_balance=True)
+    await engine._maybe_recompute_compounded_lots()
+    assert engine._current_lots == 15   # untouched, not reset to 0 or crashed
+
+
+async def test_compounding_zero_lots_skips_entry_and_force_flats() -> None:
+    """Balance too small for even 1 lot -- must NOT place a 0-lot order."""
+    engine = _make_engine(st15f_compound_capital=True)
+    engine._current_lots = 0
+    engine.strategy._is_short = True
+    await engine._open_entry(True, 64500.0, 64000.0)
+    assert engine.executor.open_calls == []
+    assert not engine.strategy.in_position
+
+
+async def test_compounding_entry_uses_current_lots_via_option_contracts() -> None:
+    """OptionsExecutor.open_option_by_premium has no explicit-lots
+    parameter -- it always sizes off settings.option_contracts, so this
+    engine overwrites that field (its own private Settings instance) right
+    before the entry call when compounding is on."""
+    engine = _make_engine(st15f_compound_capital=True, option_contracts=25)
+    engine._current_lots = 47
+    await engine._open_entry(True, 64500.0, 64000.0)
+    assert engine.settings.option_contracts == 47
+
+
+async def test_square_off_recomputes_compounded_lots_after_closing() -> None:
+    engine = _make_engine(st15f_eod_square_off=True, st15f_compound_capital=True, st15f_capital_per_lot=3.0)
+    await engine._open_entry(True, 64500.0, 64000.0)
+    engine.rest = FakeRest(balance=150.0)   # 150 / 3 = 50 lots
+    await engine._square_off()
+    assert engine._current_lots == 50
+
+
+async def test_square_off_recomputes_compounded_lots_even_when_already_flat() -> None:
+    """The daily checkpoint must still fire on a day with no trade at all."""
+    engine = _make_engine(st15f_eod_square_off=True, st15f_compound_capital=True, st15f_capital_per_lot=3.0)
+    engine.rest = FakeRest(balance=9.0)   # 9 / 3 = 3 lots
+    await engine._square_off()
+    assert engine._current_lots == 3
 
 
 # ---------------------------------------------------------------------- #

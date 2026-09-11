@@ -55,6 +55,20 @@ vs $635.26 at 25 lots) with MORE variance and capital held longer per
 trade -- not a proven improvement, just a variant the user asked to run
 live too. See config.py's st15f_eod_square_off comment for the full number.
 
+OPT-IN COMPOUNDING LOT-SIZING (st15f_compound_capital=True, on-request
+variant, added 2026-09-11): resizes every NEW entry to
+floor(real available balance / st15f_capital_per_lot) lots, capped at
+st15f_max_lots (a HARD SAFETY CEILING, not a target -- see config.py's
+st15f_compound_capital comment for why: an uncapped 3-month backtest of
+this exact ratio reached 3,447 lots / +31,860%, a number driven by
+unconstrained compounding, not proven edge, with a genuine 58% single-day
+drawdown baked into that same run). Recomputed once per day, piggybacking
+on the st15f_eod_square_off checkpoint (requires that to be True too, or
+the lot size never updates -- logged as a startup warning if
+misconfigured). Uses the REAL, LIVE account balance (RestClient.
+get_available_balance) -- unlike the backtest script's own --start-capital,
+which has to simulate a running figure since it has no real account.
+
 EXPIRY needed MINUTE precision ("if at 17:26 you should take trade in next
 day option") that the shared OptionsExecutor._select_expiry() can't express
 (hour-only, via option_expiry_cutoff_hour) -- see _MinutePreciseOptionsExecutor
@@ -149,13 +163,24 @@ class Supertrend15mFilterFixedSlEngine:
         self._closing = False
         self._verify_misses = 0
         self._last_verify = 0.0
+        # Compounding lot-sizing (st15f_compound_capital) -- see config.py's
+        # own comment for the full rationale/safety-cap discussion. Falls
+        # back to the static option_contracts until the first real-balance
+        # fetch (in start(), below) succeeds.
+        self._current_lots = settings.option_contracts
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         mode = "TESTNET" if self.settings.testnet else "LIVE"
         await self.notifier.notify(NotifyEvent.RESTART, mode=mode)
+        if self.settings.st15f_compound_capital and not self.settings.st15f_eod_square_off:
+            log.warning("St15f: st15f_compound_capital=True but st15f_eod_square_off=False -- "
+                        "the lot size will NEVER update (compounding piggybacks on the daily "
+                        "square-off checkpoint). Enable st15f_eod_square_off too if this is "
+                        "unintentional.")
         await self._warmup()
         await self._sync_options_to_exchange()
+        await self._maybe_recompute_compounded_lots()
 
         self.ws = WebSocketManager(
             ws_url=self.settings.ws_url,
@@ -428,6 +453,17 @@ class Supertrend15mFilterFixedSlEngine:
         SignalDir.LONG -> PUT."""
         if self._entry_in_progress or self.executor.has_open_position:
             return
+        if self.settings.st15f_compound_capital:
+            if self._current_lots <= 0:
+                log.warning("St15f: compounding lot size is 0 — balance too small to trade, skipping entry")
+                self.strategy.force_flat()
+                return
+            # OptionsExecutor.open_option_by_premium always sizes off
+            # settings.option_contracts (no explicit-lots parameter exists)
+            # -- this engine owns its own Settings instance exclusively (one
+            # per container), so overwriting it here is safe and takes
+            # effect immediately on the very next call below.
+            self.settings.option_contracts = self._current_lots
         self._entry_in_progress = True
         try:
             signal_dir = SignalDir.SHORT.value if is_short else SignalDir.LONG.value
@@ -564,6 +600,7 @@ class Supertrend15mFilterFixedSlEngine:
         log.info("St15f: EOD square-off firing", extra={"extra": {"date": str(self._sq_off_date)}})
         if self._closing or not self.executor.has_open_position:
             self.strategy.force_flat()
+            await self._maybe_recompute_compounded_lots()
             return
         self._closing = True
         try:
@@ -589,3 +626,27 @@ class Supertrend15mFilterFixedSlEngine:
         finally:
             self._closing = False
         self.strategy.force_flat()
+        # "at every day close check deposit and update lots" -- checked here,
+        # AFTER the close above realizes today's last trade (if any) into the
+        # real account balance, so the fetch below reflects the true
+        # end-of-day deposit. See config.py's st15f_compound_capital comment.
+        await self._maybe_recompute_compounded_lots()
+
+    async def _maybe_recompute_compounded_lots(self) -> None:
+        if not self.settings.st15f_compound_capital:
+            return
+        try:
+            balance = await asyncio.to_thread(
+                self.rest.get_available_balance, self.settings.option_margin_asset or None
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("St15f: compounding balance fetch failed — keeping current lot size",
+                        extra={"extra": {"error": str(exc), "current_lots": self._current_lots}})
+            return
+        raw_lots = int(balance // self.settings.st15f_capital_per_lot)
+        new_lots = max(0, min(self.settings.st15f_max_lots, raw_lots))
+        if new_lots != self._current_lots:
+            log.info("St15f: compounding lot-size update", extra={"extra": {
+                "balance": round(balance, 2), "old_lots": self._current_lots, "new_lots": new_lots,
+                "capped": raw_lots > self.settings.st15f_max_lots}})
+        self._current_lots = new_lots

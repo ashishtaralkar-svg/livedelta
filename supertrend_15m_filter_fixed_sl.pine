@@ -37,8 +37,17 @@
 //  * Bidirectional (BUY + SELL) -- "take trade" wasn't restricted to one
 //    side this time, unlike some earlier builds that were explicitly
 //    sell-only.
-//  * No profit target and no end-of-day square-off were specified, so
-//    neither is implemented.
+//  * No profit target -- the LIVE (Python) engine's premium target is an
+//    OPTION-PREMIUM mechanic with no BTC-price representation, so it can't
+//    be shown here (same reason supertrend_sar_strategy.pine's TP-roll
+//    isn't in that script either).
+//  * EOD SQUARE-OFF (added on request, matches the live engine's
+//    st15f_eod_square_off=true / st15f_target_pct=0 config): force-closes
+//    whatever's open at sqHr:sqMin (default 17:25) in dayTZ every day,
+//    INSTEAD OF a premium target -- the live bot now holds every trade to
+//    end of day rather than banking profit early. Uses the same
+//    hour()/minute()+timezone crossing pattern as every other square-off
+//    in this repo (see supertrend_sar_strategy.pine).
 //  * Applied on a 1-MINUTE chart -- resolution isn't a script input since
 //    it wasn't described as one; the 15m Supertrend is fetched via MTF
 //    regardless of chart resolution.
@@ -55,6 +64,11 @@ factor    = input.float(3.0, "Multiplier", minval=0.1, group=grpST)
 grpST15 = "Supertrend (15m, confirmation filter)"
 atrPeriod15 = input.int(10, "15m ATR Period", minval=1, group=grpST15)
 factor15    = input.float(3.0, "15m Multiplier", minval=0.1, group=grpST15)
+
+grpEOD = "EOD Square-Off (hold to end of day instead of a premium target)"
+dayTZ  = input.string("Asia/Kolkata", "Timezone", group=grpEOD)
+sqHr   = input.int(17, "Square-off hour", minval=0, maxval=23, group=grpEOD)
+sqMin  = input.int(25, "Square-off minute", minval=0, maxval=59, group=grpEOD)
 
 // ------------------------------------------------------------------
 // Primary Supertrend(10,3), this chart's own resolution.
@@ -80,6 +94,14 @@ isGreen15 = dir15 < 0
 plot(st15, "Supertrend (15m)", color = dir15 < 0 ? color.new(color.green, 60) : color.new(color.red, 60), linewidth=2, style=plot.style_circles)
 
 // ------------------------------------------------------------------
+// EOD square-off timing -- same hour()/minute()+timezone crossing pattern
+// as every other square-off in this repo (see supertrend_sar_strategy.pine).
+// ------------------------------------------------------------------
+sqMins       = sqHr * 60 + sqMin
+nowMins      = hour(time, dayTZ) * 60 + minute(time, dayTZ)
+squareOffNow = not na(nowMins[1]) and nowMins >= sqMins and nowMins[1] < sqMins
+
+// ------------------------------------------------------------------
 // Entry: a fresh 1-minute flip, confirmed by the 15-minute filter already
 // agreeing at that same moment. SL: frozen at THIS flip candle's own
 // Supertrend value.
@@ -94,6 +116,9 @@ var float activeSL = na
 sellExit = strategy.position_size < 0 and not na(activeSL) and high >= activeSL
 buyExit  = strategy.position_size > 0 and not na(activeSL) and low  <= activeSL
 
+squareOffFired = false
+
+// ----- 1. Frozen SL touched -> flat, no reversal. -----
 if sellExit
     strategy.close("Short", comment="SL hit")
     activeSL := na
@@ -101,12 +126,23 @@ if buyExit
     strategy.close("Long", comment="SL hit")
     activeSL := na
 
-if sellEntry
-    strategy.entry("Short", strategy.short, comment="1m flip red + 15m red")
-    activeSL := st
-if buyEntry
-    strategy.entry("Long", strategy.long, comment="1m flip green + 15m green")
-    activeSL := st
+// ----- 2. EOD square-off: force flat unconditionally, INSTEAD OF a
+//          premium target (see grpEOD inputs above). -----
+if squareOffNow and strategy.position_size != 0
+    strategy.close_all(comment="EOD square-off")
+    activeSL := na
+    squareOffFired := true
+
+// ----- 3. Entry -- only while flat, and not on the square-off bar itself
+//          (mirrors every other square-off script's ordering: exits at
+//          the boundary, no same-bar re-entry). -----
+if strategy.position_size == 0 and not squareOffNow
+    if sellEntry
+        strategy.entry("Short", strategy.short, comment="1m flip red + 15m red")
+        activeSL := st
+    if buyEntry
+        strategy.entry("Long", strategy.long, comment="1m flip green + 15m green")
+        activeSL := st
 
 // ------------------------------------------------------------------
 // Plotting / markers
@@ -114,6 +150,7 @@ if buyEntry
 bothRed   = isRed and isRed15
 bothGreen = isGreen and isGreen15
 bgcolor(bothRed ? color.new(color.red, 90) : bothGreen ? color.new(color.green, 90) : na, title="Both agree (1m+15m)")
+bgcolor(squareOffNow ? color.new(color.gray, 85) : na, title="Square-off moment")
 
 plot(strategy.position_size != 0 ? activeSL : na, "Frozen SL", color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=2)
 plot(strategy.position_size != 0 ? strategy.position_avg_price : na, "Entry", color=color.gray, style=plot.style_linebr, linewidth=1)
@@ -122,6 +159,7 @@ plotshape(sellEntry, title="SELL marker", style=shape.triangledown, location=loc
 plotshape(buyEntry, title="BUY marker", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.small)
 plotshape(sellExit, title="Short SL marker", style=shape.xcross, location=location.abovebar, color=color.new(color.gray, 0), size=size.tiny)
 plotshape(buyExit, title="Long SL marker", style=shape.xcross, location=location.belowbar, color=color.new(color.gray, 0), size=size.tiny)
+plotshape(squareOffFired, title="EOD square-off marker", style=shape.square, location=location.abovebar, color=color.new(color.gray, 0), size=size.tiny)
 
 if sellEntry
     label.new(bar_index, high, text="SELL", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.normal)
@@ -131,3 +169,5 @@ if sellExit
     label.new(bar_index, high, text="SL", style=label.style_label_down, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
 if buyExit
     label.new(bar_index, low, text="SL", style=label.style_label_up, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)
+if squareOffFired
+    label.new(bar_index, high, text="EOD", style=label.style_label_down, color=color.new(color.gray, 0), textcolor=color.white, size=size.small)

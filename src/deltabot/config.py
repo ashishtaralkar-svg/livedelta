@@ -481,6 +481,41 @@ class Settings(BaseSettings):
     # Heikin Ashi candles on every window. Off by default -- the live
     # st15fbot config is unchanged unless this is explicitly turned on.
     st15f_eod_square_off: bool = False
+    # On-request compounding variant, added 2026-09-11: instead of a static
+    # option_contracts lot size, resize every NEW entry to
+    # floor(REAL available balance / st15f_capital_per_lot) lots, capped at
+    # st15f_max_lots -- "at every $3 capital take 1 lot" / "once we have $30
+    # profit increase lot by 10" (both describe the same $3-per-lot ratio).
+    # Recomputed once per day, at the st15f_eod_square_off checkpoint (so
+    # this REQUIRES st15f_eod_square_off=True to ever update -- logged as a
+    # warning at startup if misconfigured) -- intraday SL/target P&L still
+    # lands on the real account balance immediately, it just doesn't change
+    # the lot size used for a same-day re-entry until the next day-close.
+    #
+    # DELIBERATE DIVERGENCE FROM THE BACKTEST SCRIPT'S OWN --start-capital:
+    # the backtest has no real account, so it SIMULATES a running capital
+    # figure seeded from --start-capital. Live, there's no need to simulate
+    # anything -- st15f_capital_per_lot divides the REAL, LIVE available
+    # balance (fetched via RestClient.get_available_balance, the same call
+    # OptionsExecutor's own margin pre-check uses), which automatically
+    # reflects actual deposits/withdrawals/fees/fills. There is no
+    # st15f_start_capital setting -- it would be meaningless here.
+    #
+    # st15f_max_lots (default 100, chosen over 25/50 on request) exists
+    # because the raw rule has NO ceiling of its own: a 3-month backtest of
+    # this same $3/lot ratio (simulated $30 start, uncapped) reached 3,447
+    # lots and a nominal +31,860% return -- a number driven entirely by
+    # unconstrained exponential compounding, not evidence the strategy
+    # itself is that good. That run also had a genuine 58% single-day
+    # drawdown baked into its own equity curve, and modeled zero
+    # margin/liquidity/slippage impact at scale (a real account would hit
+    # margin or exchange order-size limits long before reaching lot counts
+    # like that). st15f_max_lots keeps growth bounded to a size that's
+    # merely aggressive rather than certain to eventually blow up -- it is
+    # a HARD safety ceiling, not a target to reach.
+    st15f_compound_capital: bool = False
+    st15f_capital_per_lot: float = 3.0
+    st15f_max_lots: int = 100
     st15f_debug_state: bool = False  # log a full strategy-state snapshot on every closed 1m candle
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on
