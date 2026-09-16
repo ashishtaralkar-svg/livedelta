@@ -62,12 +62,22 @@ st15f_max_lots (a HARD SAFETY CEILING, not a target -- see config.py's
 st15f_compound_capital comment for why: an uncapped 3-month backtest of
 this exact ratio reached 3,447 lots / +31,860%, a number driven by
 unconstrained compounding, not proven edge, with a genuine 58% single-day
-drawdown baked into that same run). Recomputed once per day, piggybacking
-on the st15f_eod_square_off checkpoint (requires that to be True too, or
-the lot size never updates -- logged as a startup warning if
-misconfigured). Uses the REAL, LIVE account balance (RestClient.
-get_available_balance) -- unlike the backtest script's own --start-capital,
-which has to simulate a running figure since it has no real account.
+drawdown baked into that same run). Uses the REAL, LIVE account balance
+(RestClient.get_available_balance) -- unlike the backtest script's own
+--start-capital, which has to simulate a running figure since it has no
+real account.
+
+Recomputed FRESH right before EVERY entry attempt (changed 2026-09-17,
+see config.py's own comment for the full incident that prompted this): a
+once-daily-only snapshot went stale the moment a manual trade outside the
+bot moved the account balance mid-day, silently skipping every qualifying
+signal for hours. The daily st15f_eod_square_off checkpoint still also
+recomputes (purely for its own log line -- requires that setting True or
+a startup warning fires), but the value actually used to size an order is
+always freshly fetched at _open_entry() time. The floor is 1 lot, never
+0 -- a qualifying signal is always ATTEMPTED; a genuinely unaffordable
+trade is rejected by the exchange's own margin check (OptionsMarginError,
+already handled safely), not pre-empted by this bot's own balance guess.
 
 EXPIRY needed MINUTE precision ("if at 17:26 you should take trade in next
 day option") that the shared OptionsExecutor._select_expiry() can't express
@@ -454,15 +464,22 @@ class Supertrend15mFilterFixedSlEngine:
         if self._entry_in_progress or self.executor.has_open_position:
             return
         if self.settings.st15f_compound_capital:
-            if self._current_lots <= 0:
-                log.warning("St15f: compounding lot size is 0 — balance too small to trade, skipping entry")
-                self.strategy.force_flat()
-                return
-            # OptionsExecutor.open_option_by_premium always sizes off
-            # settings.option_contracts (no explicit-lots parameter exists)
-            # -- this engine owns its own Settings instance exclusively (one
-            # per container), so overwriting it here is safe and takes
-            # effect immediately on the very next call below.
+            # Fresh balance check RIGHT HERE, not the once-daily cached
+            # value -- a manual trade (or anything else moving the account
+            # balance mid-day) must be reflected at the moment of THIS
+            # entry, not wait for the next day-close checkpoint. Real
+            # request, confirmed by a real incident: a manual position ate
+            # into the balance, the stale daily snapshot then read as
+            # near-zero, and every signal for the rest of the day was
+            # silently skipped instead of sized off the current reality.
+            await self._maybe_recompute_compounded_lots()
+            # Never pre-emptively refuse to trade -- _maybe_recompute_
+            # compounded_lots() now floors at 1, not 0, specifically so a
+            # qualifying signal always gets ATTEMPTED. The exchange's own
+            # margin check (OptionsMarginError below) is the real, final
+            # gate -- it already handles a genuine insufficient-margin
+            # rejection safely (no partial fill, no stuck state), so this
+            # bot no longer second-guesses it in advance.
             self.settings.option_contracts = self._current_lots
         self._entry_in_progress = True
         try:
@@ -644,7 +661,12 @@ class Supertrend15mFilterFixedSlEngine:
                         extra={"extra": {"error": str(exc), "current_lots": self._current_lots}})
             return
         raw_lots = int(balance // self.settings.st15f_capital_per_lot)
-        new_lots = max(0, min(self.settings.st15f_max_lots, raw_lots))
+        # Floored at 1, NEVER 0 -- on request, after a real incident where a
+        # thin-balance day (from a manual trade eating margin) made this
+        # compute to 0 and silently skipped every signal for hours. A
+        # qualifying signal must always be ATTEMPTED; the exchange's own
+        # margin check is the real, final gate (see _open_entry()).
+        new_lots = max(1, min(self.settings.st15f_max_lots, raw_lots))
         if new_lots != self._current_lots:
             log.info("St15f: compounding lot-size update", extra={"extra": {
                 "balance": round(balance, 2), "old_lots": self._current_lots, "new_lots": new_lots,

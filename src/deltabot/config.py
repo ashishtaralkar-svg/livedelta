@@ -486,11 +486,21 @@ class Settings(BaseSettings):
     # floor(REAL available balance / st15f_capital_per_lot) lots, capped at
     # st15f_max_lots -- "at every $3 capital take 1 lot" / "once we have $30
     # profit increase lot by 10" (both describe the same $3-per-lot ratio).
-    # Recomputed once per day, at the st15f_eod_square_off checkpoint (so
-    # this REQUIRES st15f_eod_square_off=True to ever update -- logged as a
-    # warning at startup if misconfigured) -- intraday SL/target P&L still
-    # lands on the real account balance immediately, it just doesn't change
-    # the lot size used for a same-day re-entry until the next day-close.
+    #
+    # Recomputed FRESH right before every entry attempt (updated 2026-09-17,
+    # on request after a real incident): a manual trade outside the bot ate
+    # into the account balance mid-day; the balance was then only ever
+    # re-checked once daily at the st15f_eod_square_off checkpoint, so the
+    # stale snapshot read as near-zero and every qualifying signal for
+    # hours afterward was silently SKIPPED instead of attempted. Two fixes:
+    # (1) _open_entry() now re-fetches the real balance immediately before
+    # every entry, not just once a day (the daily checkpoint still runs
+    # too, purely for the log trail); (2) the floor is 1 lot, never 0 -- a
+    # qualifying signal is always ATTEMPTED, and the exchange's own margin
+    # check (already handled safely, no partial fill/stuck state) is the
+    # real, final gate, not this bot's own advance guess. Still requires
+    # st15f_eod_square_off=True for the daily checkpoint's own log line
+    # (logged as a startup warning if misconfigured).
     #
     # DELIBERATE DIVERGENCE FROM THE BACKTEST SCRIPT'S OWN --start-capital:
     # the backtest has no real account, so it SIMULATES a running capital

@@ -444,25 +444,42 @@ async def test_compounding_balance_fetch_failure_keeps_current_lots() -> None:
     assert engine._current_lots == 15   # untouched, not reset to 0 or crashed
 
 
-async def test_compounding_zero_lots_skips_entry_and_force_flats() -> None:
-    """Balance too small for even 1 lot -- must NOT place a 0-lot order."""
-    engine = _make_engine(st15f_compound_capital=True)
-    engine._current_lots = 0
-    engine.strategy._is_short = True
-    await engine._open_entry(True, 64500.0, 64000.0)
-    assert engine.executor.open_calls == []
-    assert not engine.strategy.in_position
+async def test_compounding_floors_at_1_lot_never_0() -> None:
+    """On request, after a real incident: a manual trade ate into the
+    balance, the (then daily-only) recompute floored to 0 lots, and every
+    signal for hours afterward was silently skipped instead of attempted.
+    floor(balance / capital_per_lot) must never produce 0 -- 1 is the
+    floor, so a qualifying signal is always ATTEMPTED and the exchange's
+    own margin check is the real, final gate."""
+    engine = _make_engine(st15f_compound_capital=True, st15f_capital_per_lot=3.0)
+    engine.rest = FakeRest(balance=0.56)   # far too little for even 1 lot's $3
+    await engine._maybe_recompute_compounded_lots()
+    assert engine._current_lots == 1   # NOT 0
 
 
-async def test_compounding_entry_uses_current_lots_via_option_contracts() -> None:
-    """OptionsExecutor.open_option_by_premium has no explicit-lots
-    parameter -- it always sizes off settings.option_contracts, so this
-    engine overwrites that field (its own private Settings instance) right
-    before the entry call when compounding is on."""
-    engine = _make_engine(st15f_compound_capital=True, option_contracts=25)
-    engine._current_lots = 47
+async def test_compounding_entry_always_fetches_balance_fresh_not_stale() -> None:
+    """_open_entry() must re-check the REAL balance at the moment of THIS
+    entry, not trust a possibly-stale cached _current_lots from an earlier
+    daily checkpoint -- a manual trade (or anything else) can move the
+    balance in between, and the live-traded size must reflect that."""
+    engine = _make_engine(st15f_compound_capital=True, st15f_capital_per_lot=3.0)
+    engine._current_lots = 47   # stale value from an earlier checkpoint
+    engine.rest = FakeRest(balance=60.0)   # the REAL balance right now: 60/3 = 20 lots
     await engine._open_entry(True, 64500.0, 64000.0)
-    assert engine.settings.option_contracts == 47
+    assert engine.settings.option_contracts == 20   # freshly recomputed, not the stale 47
+    assert engine.executor.open_calls == [(SignalDir.SHORT.value, 1400.0)]
+
+
+async def test_compounding_thin_balance_still_attempts_entry_with_1_lot() -> None:
+    """The bot must never pre-emptively refuse a signal because its own
+    balance math looks thin -- it always attempts (here with the floored
+    1 lot), and only a real exchange rejection (OptionsMarginError) stops
+    it, exactly like any other live order failure."""
+    engine = _make_engine(st15f_compound_capital=True, st15f_capital_per_lot=3.0)
+    engine.rest = FakeRest(balance=0.56)
+    await engine._open_entry(True, 64500.0, 64000.0)
+    assert engine.settings.option_contracts == 1
+    assert engine.executor.open_calls == [(SignalDir.SHORT.value, 1400.0)]
 
 
 async def test_square_off_recomputes_compounded_lots_after_closing() -> None:
