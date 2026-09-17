@@ -217,6 +217,95 @@ class OptionsExecutor:
         )
         return result.average_fill_price, best["symbol"]
 
+    async def select_by_otm_pct(
+        self, signal_dir: int, btc_price: float, otm_pct: float
+    ) -> dict | None:
+        """Pick the listed contract whose STRIKE is closest to a target strike
+        ``otm_pct``%% away from ``btc_price``, OTM in the natural direction for
+        each side (CALL strike ABOVE spot, PUT strike BELOW spot), WITHOUT
+        placing any order. Mirrors :meth:`select_by_premium` exactly, just
+        selecting on strike distance instead of mark-price distance -- added
+        for the daily strangle bot, which picks its legs by a fixed %-OTM
+        rule rather than a target premium.
+
+        Returns the winning chain entry dict or ``None`` if the chain is
+        empty/unpriced.
+        """
+        option_type = self._option_type_for(signal_dir)
+        expiry = self._select_expiry()
+        underlying = self.underlying
+
+        raw_target = (btc_price * (1 + otm_pct / 100.0) if option_type == OptionType.CALL
+                      else btc_price * (1 - otm_pct / 100.0))
+        interval = self._settings.option_strike_interval
+        target_strike = int(round(raw_target / interval) * interval)
+
+        try:
+            chain = await asyncio.to_thread(
+                self._rest.get_option_chain, underlying, expiry, option_type
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("get_option_chain failed in select_by_otm_pct", extra={"extra": {"error": str(exc)}})
+            return None
+
+        candidates = [c for c in chain if c.get("strike") is not None]
+        if not candidates:
+            log.warning("No option contracts with strike — cannot select by OTM %")
+            return None
+
+        best = min(candidates, key=lambda c: abs(c["strike"] - target_strike))
+        log.info(
+            "Selected option by OTM %",
+            extra={"extra": {
+                "symbol": best["symbol"], "strike": best["strike"],
+                "target_strike": target_strike, "otm_pct": otm_pct, "btc_price": btc_price,
+            }},
+        )
+        return best
+
+    async def open_option_by_otm_pct(
+        self, signal_dir: int, btc_price: float, otm_pct: float
+    ) -> tuple[float | None, str | None]:
+        """Open a short option at the listed strike closest to ``otm_pct``%%
+        OTM from ``btc_price``. Mirrors :meth:`open_option_by_premium` exactly
+        (same failure/return shape), just via :meth:`select_by_otm_pct`."""
+        if self._product_id is not None:
+            log.warning(
+                "open_option_by_otm_pct called while position already tracked — skipping",
+                extra={"extra": {"existing_product_id": self._product_id}},
+            )
+            return None, None
+
+        best = await self.select_by_otm_pct(signal_dir, btc_price, otm_pct)
+        if best is None:
+            return None, None
+        option_type = self._option_type_for(signal_dir)
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
+
+        await self._check_balance()
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(best["product_id"])
+
+        size = self._settings.option_contracts
+        result = await asyncio.to_thread(
+            self._rest.place_market_order, best["product_id"], size, open_side
+        )
+
+        self._product_id = best["product_id"]
+        self._size = size
+        self._option_type = option_type
+        self._symbol = best["symbol"]
+        self._strike = best["strike"]
+
+        log.info(
+            f"Option {open_side.value.upper()} (by OTM %) placed",
+            extra={"extra": {
+                "product_id": best["product_id"], "size": size,
+                "fill_price": result.average_fill_price, "strike": best["strike"],
+            }},
+        )
+        return result.average_fill_price, best["symbol"]
+
     async def _open_by_balance_fraction_from_candidate(
         self, best: dict, signal_dir: int, balance_fraction: float, margin_asset: str | None,
     ) -> tuple[float | None, str | None, int]:

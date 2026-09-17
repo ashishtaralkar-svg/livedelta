@@ -283,3 +283,33 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Daily 9PM IST Short Strangle bot -- pure TIME-based, no BTC candle signal
+  # at all. Once daily at 21:00 IST, SELLS a CALL+PUT strangle together, each
+  # leg at the listed strike closest to 2% OTM from spot. Combined (not
+  # per-leg) target/SL on the SUM of both legs' premium: target 70% decay, SL
+  # 50% rise, fallback square-off next-day 17:00 IST if neither fires first.
+  # Own Delta SUB-ACCOUNT, in parallel with the other bots which it NEVER
+  # touches (separate capital, DELTA_STATE_FILE=state/strangle9pm_pos.json --
+  # the engine derives two per-leg files from this). Fill .env.strangle9pm
+  # first (cp .env.strangle9pm.example .env.strangle9pm, add the sub-account
+  # API keys). Backtested 1wk/1mo/3mo, all positive, ~62-77% win rate (see
+  # .env.strangle9pm.example for the numbers) -- this engine has NEVER
+  # executed a real order, watch it closely. Bring it up ALONE so the other
+  # running bots are not recreated:
+  #   docker compose up -d --build strangle9pmbot
+  strangle9pmbot:
+    build: .
+    image: deltabot:latest
+    container_name: strangle9pmbot
+    restart: always
+    env_file:
+      - .env.strangle9pm
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

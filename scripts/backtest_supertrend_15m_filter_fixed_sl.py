@@ -71,6 +71,16 @@ def _ist(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=_IST).strftime("%Y-%m-%d %H:%M")
 
 
+def _next_session_start(ts: int, hour: int, minute: int) -> int:
+    """The next hour:minute IST moment strictly after ``ts`` -- on-request
+    variant for --block-until-session-start (see its own --help)."""
+    dt = datetime.fromtimestamp(ts, tz=_IST)
+    candidate = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= dt:
+        candidate += timedelta(days=1)
+    return int(candidate.timestamp())
+
+
 def _select_expiry(ts: int, cutoff_hour: int, cutoff_minute: int) -> datetime:
     """Minute-precise expiry cutoff, local to this script -- see module
     docstring's EXPIRY CUTOFF note for why option_pricing.select_expiry_date
@@ -85,7 +95,12 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     strategy = Supertrend15mFilterFixedSlStrategy(
         atr_period=args.atr_period, factor=args.factor,
         atr_period_15m=args.atr_period_15m, factor_15m=args.factor_15m,
+        bucket_seconds=args.confirm_minutes * 60,
         use_heikin_ashi=args.heikin_ashi,
+        exit_on_15m_flip_against=args.exit_on_15m_flip_against,
+        use_1h_filter=args.use_1h_filter,
+        atr_period_1h=args.atr_period_1h, factor_1h=args.factor_1h,
+        sl_on_close_only=args.sl_on_close_only,
     )
     underlying = settings.symbol.replace("USDT", "").replace("USD", "")
     interval = settings.option_strike_interval
@@ -202,6 +217,11 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
     # without converting it.
     target_frac = (1 - args.target_pct / 100.0) if args.target_pct > 0 else None
     last_squareoff_date = None   # only used when args.eod_square_off -- fires once per calendar day
+    # On-request variant: after a target hit, block new entries until the
+    # next session_start_hour:minute IST crossing (default 17:30) instead
+    # of the strategy's own default 15m-flip-based block -- see
+    # --block-until-session-start's own --help.
+    blocked_until_ts: int | None = None
 
     with httpx.Client(base_url=settings.rest_base_url, timeout=30.0) as client:
         for c in candles:
@@ -243,8 +263,13 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                 strategy.force_flat()
 
             if dec is not None and dec.has_exit and pos is not None:
+                # dec.exit_reason is "SL" (frozen price-level stop) or, with
+                # --exit-on-15m-flip-against, "15M_FLIP" (the 15m Supertrend
+                # itself flipped against the position -- a pure trend-change
+                # exit, no price level involved).
                 exit_prem = buyback_prem(decision_ts, dec.exit_price)
-                close("SL", exit_prem if exit_prem is not None else dec.exit_price, decision_ts, dec.exit_price)
+                close(dec.exit_reason or "SL",
+                      exit_prem if exit_prem is not None else dec.exit_price, decision_ts, dec.exit_price)
 
             # Partial profit-booking (on-request comparison variant, added
             # 2026-09-11): book --partial-lots of the leg at
@@ -280,14 +305,35 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                     # strategy stays permanently "in position" and NEVER
                     # enters again; this was a real, confirmed bug: a
                     # 90-day backtest showed 1979 qualifying entries after
-                    # one target hit, 0 of which fired). Then
-                    # notify_target_hit() layers the 15m-flip block on top.
+                    # one target hit, 0 of which fired).
                     strategy.force_flat()
-                    strategy.notify_target_hit()
+                    if args.block_until_session_start:
+                        # REPLACES the strategy's own 15m-flip-based block
+                        # (notify_target_hit() is deliberately NOT called --
+                        # that would layer its own unblock condition on top)
+                        # with a plain session-boundary block, external to
+                        # the strategy entirely.
+                        blocked_until_ts = _next_session_start(
+                            decision_ts, args.session_start_hour, args.session_start_minute)
+                    else:
+                        # Default: "once target is done then no new trade
+                        # until 15 min supertrend changes".
+                        strategy.notify_target_hit()
 
             if dec is not None and dec.has_entry and pos is None:
+                still_blocked = blocked_until_ts is not None and decision_ts < blocked_until_ts
                 if c.start_time < sim_start:
                     strategy.force_flat()   # warmup-window entry: don't take it
+                elif still_blocked:
+                    # The strategy's own update() has ALREADY set its
+                    # internal _is_short/_active_sl for this entry (it has
+                    # no idea this external session-block exists) -- without
+                    # force_flat() here it would sit "phantom in position"
+                    # until that frozen SL happens to get crossed by chance,
+                    # silently blocking every real signal until then. Same
+                    # bug class as the missing-force_flat() incidents
+                    # already found and fixed elsewhere this session.
+                    strategy.force_flat()
                 elif not open_leg(client, decision_ts, c.close, dec.entry_is_short):
                     strategy.force_flat()   # couldn't price the contract; stay flat, retry next bar
 
@@ -310,11 +356,19 @@ def report(trades: list[dict], args, capital_trace: list[tuple[int, float, int]]
     if args.partial_lots > 0:
         tgt_desc += (f", book {args.partial_lots}/{args.lots} lots at "
                      f"{args.partial_target_pct:.0f}% reduction, rest as above")
+    if args.exit_on_15m_flip_against:
+        tgt_desc += ", +15m-flip-against exit"
+    if args.block_until_session_start:
+        tgt_desc += (f", block until next {args.session_start_hour:02d}:"
+                     f"{args.session_start_minute:02d} IST after a target hit")
+    if args.use_1h_filter:
+        tgt_desc += f", +1h({args.atr_period_1h},{args.factor_1h:.0f}) filter"
     lots_desc = (f"start capital ${args.start_capital:.2f} @ ${args.capital_per_lot:.0f}/lot"
                  if args.start_capital > 0 else f"{args.lots} lots")
     print(f"Supertrend 15m-Filter Fixed-SL [OPTION SELL] -- {args.days}d, {args.resolution}, "
           f"{'HEIKIN ASHI' if args.heikin_ashi else 'real'} candles, "
-          f"Supertrend({args.atr_period},{args.factor:.0f}) + 15m({args.atr_period_15m},{args.factor_15m:.0f}) filter, "
+          f"Supertrend({args.atr_period},{args.factor:.0f}) + {args.confirm_minutes}m"
+          f"({args.atr_period_15m},{args.factor_15m:.0f}) filter, "
           f"expiry cutoff {args.expiry_cutoff_hour:02d}:{args.expiry_cutoff_minute:02d} IST, "
           f"premium ~{args.target_premium:.0f}, {tgt_desc}, {lots_desc}, floor {'OFF' if args.no_intrinsic_floor else 'ON'}")
     print(f"{'=' * 112}")
@@ -331,7 +385,7 @@ def report(trades: list[dict], args, capital_trace: list[tuple[int, float, int]]
     print(f"Legs: {len(closed)} closed" + (" (+1 still open at data end)" if len(trades) != len(closed) else ""))
     if closed:
         print(f"Win rate: {len(wins)}/{len(closed)} = {100.0 * len(wins) / len(closed):.1f}%")
-    for reason in ("SL", "TARGET", "PARTIAL", "EOD", "EXPIRED", "OPEN_AT_END"):
+    for reason in ("SL", "15M_FLIP", "TARGET", "PARTIAL", "EOD", "EXPIRED", "OPEN_AT_END"):
         rs = [t for t in trades if t["reason"] == reason]
         if rs:
             print(f"  {reason:<12} n={len(rs):<4} net ${sum(t['net'] for t in rs):>11.2f}")
@@ -384,10 +438,35 @@ def main() -> None:
     p.add_argument("--factor", type=float, default=3.0)
     p.add_argument("--atr-period-15m", type=int, default=10)
     p.add_argument("--factor-15m", type=float, default=3.0)
+    p.add_argument("--confirm-minutes", type=int, default=15,
+                    help="Width (in minutes) of the confirmation Supertrend's own bucket -- "
+                         "Supertrend15mFilterFixedSlStrategy takes this as bucket_seconds, so "
+                         "changing it needs no strategy code change. Default 15 (the validated "
+                         "config); e.g. 5 for a 5-minute confirmation instead. The --atr-period-15m/"
+                         "--factor-15m params above still apply to whatever this width is.")
     p.add_argument("--heikin-ashi", action="store_true",
                     help="Run both Supertrends (1m + 15m) on Heikin Ashi OHLC instead of real "
                          "candles -- see the strategy module docstring's OPT-IN HEIKIN ASHI MODE "
                          "note. Reported entry price stays REAL regardless.")
+    p.add_argument("--exit-on-15m-flip-against", action="store_true",
+                    help="Add a SECOND, independent exit trigger on top of the frozen SL: close "
+                         "immediately (at candle.close, no price level) the moment the 15-minute "
+                         "Supertrend itself has a fresh flip AGAINST the open position -- whichever "
+                         "of the two (frozen SL or this) fires first. Off by default -- the "
+                         "validated backtest/live st15fbot has only the frozen SL.")
+    p.add_argument("--sl-on-close-only", action="store_true",
+                    help="Change what the frozen SL crossing check compares against: by default the "
+                         "closed 1m candle's high/low (a wick through the level still stops out even "
+                         "if the candle closes back safe). With this flag, only that candle's CLOSE "
+                         "is compared -- a wick through the frozen SL that closes back safe no longer "
+                         "exits. Off by default -- matches the live st15fbot config unchanged.")
+    p.add_argument("--use-1h-filter", action="store_true",
+                    help="Add a THIRD confirmation layer on top of the 1m+15m pair: a 1-hour "
+                         "Supertrend must ALSO agree at the exact moment of the 1m flip. Entry-only "
+                         "-- plays no role in exits. Off by default -- unchanged from before this "
+                         "existed.")
+    p.add_argument("--atr-period-1h", type=int, default=10)
+    p.add_argument("--factor-1h", type=float, default=3.0)
     p.add_argument("--expiry-cutoff-hour", type=int, default=17)
     p.add_argument("--expiry-cutoff-minute", type=int, default=26)
     p.add_argument("--target-premium", type=float, default=1400.0)
@@ -402,6 +481,14 @@ def main() -> None:
     p.add_argument("--target-pct", type=float, default=70.0,
                     help="Profit target as a REDUCTION from entry (e.g. 70 -> target = 30%% of entry, "
                          "\"if sold at 100 then target is 30\"). 0 disables.")
+    p.add_argument("--block-until-session-start", action="store_true",
+                    help="On-request variant: after a target hit, block new entries until the next "
+                         "--session-start-hour:--session-start-minute IST crossing (default 17:30), "
+                         "REPLACING the strategy's own default block (which clears on the 15-minute "
+                         "Supertrend's own next fresh flip -- could unblock the same day). Off "
+                         "(default) = the validated/live behavior, unchanged.")
+    p.add_argument("--session-start-hour", type=int, default=17)
+    p.add_argument("--session-start-minute", type=int, default=30)
     p.add_argument("--partial-lots", type=int, default=0,
                     help="On-request variant: book this many lots early at --partial-target-pct, "
                          "leaving (--lots minus this) open for the normal exits (SL / --target-pct / "

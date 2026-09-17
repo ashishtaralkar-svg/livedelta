@@ -526,7 +526,40 @@ class Settings(BaseSettings):
     st15f_compound_capital: bool = False
     st15f_capital_per_lot: float = 3.0
     st15f_max_lots: int = 100
+    # On-request variant, added 2026-09-17: the SL already only ever gets
+    # checked once per CLOSED 1-minute candle (this engine has no
+    # intracandle/tick path at all). This flag instead changes WHAT that
+    # check compares against the frozen level: by default it's the closed
+    # candle's high/low (a wick through the level that closes back safe
+    # still stops out, since price genuinely traded through it). With this
+    # on, only that candle's CLOSE is compared -- a wick through the frozen
+    # SL that closes back on the safe side no longer exits; the position
+    # only stops out once a 1-minute candle actually CLOSES beyond the
+    # level. Off by default -- the live st15fbot config is unchanged unless
+    # this is explicitly turned on.
+    st15f_sl_on_close_only: bool = False
     st15f_debug_state: bool = False  # log a full strategy-state snapshot on every closed 1m candle
+
+    # --- Daily 9PM IST Short Strangle (strangle9pm) ---
+    # New bot, built + backtested 2026-09-17 (scripts/backtest_daily_strangle_9pm.py,
+    # 1wk/1mo/3mo all positive, ~62-77% win rate). Pure TIME-based entry, no
+    # BTC candle signal -- sells a CALL+PUT strangle once daily, both legs at
+    # the listed strike closest to strangle9pm_otm_pct%% OTM from spot.
+    # Combined (not per-leg) target/SL: evaluated on the SUM of both legs'
+    # current buyback premium against the SUM of both legs' entry premium.
+    strangle9pm_entry_hour: int = 21
+    strangle9pm_entry_minute: int = 0
+    # Next-day fallback square-off if neither the target nor SL has fired by
+    # this IST time -- matches the backtest's own "exit next-day 17:00 IST" rule.
+    strangle9pm_exit_hour: int = 17
+    strangle9pm_exit_minute: int = 0
+    strangle9pm_otm_pct: float = 2.0
+    strangle9pm_target_pct: float = 70.0   # REDUCTION convention, combined premium.
+    strangle9pm_sl_pct: float = 50.0       # RISE convention, combined premium.
+    # How often (seconds) to poll both legs' mark price for the combined
+    # target/SL. 0 disables the poll loop entirely (only the next-day
+    # fallback would then ever close a position -- not recommended).
+    strangle9pm_poll_seconds: float = 30.0
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),

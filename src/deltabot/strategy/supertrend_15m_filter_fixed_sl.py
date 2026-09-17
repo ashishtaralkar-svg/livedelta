@@ -59,6 +59,52 @@ exit_price is unaffected either way: it was already the frozen SL LEVEL
 itself (a literal stop price the caller uses to close the option), not a
 candle close, so there's no separate "real vs HA" version of it to choose
 between.
+
+OPT-IN SECOND EXIT: 15m-FLIP-AGAINST (exit_on_15m_flip_against=False by
+default -- the LIVE st15fbot config, unchanged): when enabled, a position
+now closes on whichever of TWO independent triggers fires first --
+(1) the existing frozen 1m-SL being crossed by real price, or (2) the
+15-minute confirmation Supertrend itself having a FRESH flip AGAINST the
+position (a short's 15m turning green, or a long's 15m turning red) --
+checked EVERY bar, immediately, regardless of where price sits relative to
+the frozen SL. This is a pure trend-change exit (no price level involved),
+so exit_price is candle.close, not the frozen SL -- same distinction
+supertrend_flip.py already draws between its own price-level and
+trend-change exits. The Decision's exit_reason field ("SL" vs "15M_FLIP")
+tells the caller which of the two fired. SL is checked FIRST -- if both
+would fire on the same bar, the price-level stop wins (matches the
+existing convention that a same-bar stop-out can still be followed by a
+fresh qualifying re-entry on that same bar).
+
+OPT-IN THIRD CONFIRMATION LAYER: 1-HOUR (use_1h_filter=False by default --
+the LIVE st15fbot config, unchanged): when enabled, an entry requires the
+1-minute flip, the 15-minute filter, AND a 1-hour Supertrend to ALL agree
+at that exact moment -- a third AND-gate stacked on top of the existing
+pair, entry-only (it plays no role in exits, blocking, or anything else).
+Uses its own independent bucket-aggregation state, deliberately
+DUPLICATED from the 15-minute filter's own _bucket_id/_bucket_open/etc.
+machinery rather than sharing it, so the already-tested 15-minute path
+(many existing tests poke its internals directly) is completely
+untouched by this addition. Same LOCKED (not live-repainting) bucket-
+boundary pattern as the 15-minute filter, just a 3600-second bucket
+instead of 900. Disabled by default: ready, is_red1h/is_green1h all
+degrade to a no-op (always True) so the entry condition is byte-for-byte
+identical to before this existed.
+
+OPT-IN CLOSE-ONLY SL (sl_on_close_only=False by default -- the LIVE
+st15fbot config, unchanged): the SL check already only ever RUNS once per
+CLOSED 1-minute candle (this strategy has no intracandle/tick method at
+all -- the live engine's own on_closed handler is the only caller). What
+this flag changes is what that check compares against the frozen level:
+by default it's the closed candle's high/low (a same-candle wick that
+pokes through the frozen SL and closes back on the safe side still stops
+the position out, since the wick did genuinely trade through the level).
+With this enabled, the check instead compares the frozen SL only to that
+candle's CLOSE price -- a wick through the level with a close back on the
+safe side no longer exits; the position only stops out once a 1-minute
+candle actually CLOSES beyond the frozen level. In HA mode the HA close is
+used instead of the real close, consistent with the HA mode's existing
+"crossing check uses the same series as the chart" rule.
 """
 
 from __future__ import annotations
@@ -156,8 +202,9 @@ class _HeikinAshi:
 class Supertrend15mFilterFixedSlDecision:
     candle: Candle
     exit: bool
-    exit_price: float          # the frozen SL level itself, not candle.close (a real price-level stop)
+    exit_price: float          # frozen SL level for "SL", candle.close for "15M_FLIP" (no price level)
     exit_was_short: bool
+    exit_reason: str | None    # "SL" or "15M_FLIP" (None when exit is False)
     entry_signal: bool
     entry_is_short: bool
     entry_price: float
@@ -182,6 +229,12 @@ class Supertrend15mFilterFixedSlStrategy:
         factor_15m: float = 3.0,
         bucket_seconds: int = 900,   # 15 minutes -- the confirmation timeframe's own bar width
         use_heikin_ashi: bool = False,   # see module docstring's OPT-IN HEIKIN ASHI MODE note
+        exit_on_15m_flip_against: bool = False,   # see module docstring's OPT-IN SECOND EXIT note
+        use_1h_filter: bool = False,   # see module docstring's OPT-IN THIRD CONFIRMATION LAYER note
+        atr_period_1h: int = 10,
+        factor_1h: float = 3.0,
+        bucket_seconds_1h: int = 3600,   # 1 hour
+        sl_on_close_only: bool = False,   # see module docstring's OPT-IN CLOSE-ONLY SL note
     ) -> None:
         self.atr_period = atr_period
         self.factor = factor
@@ -189,6 +242,12 @@ class Supertrend15mFilterFixedSlStrategy:
         self.factor_15m = factor_15m
         self.bucket_seconds = bucket_seconds
         self.use_heikin_ashi = use_heikin_ashi
+        self.exit_on_15m_flip_against = exit_on_15m_flip_against
+        self.use_1h_filter = use_1h_filter
+        self.atr_period_1h = atr_period_1h
+        self.factor_1h = factor_1h
+        self.bucket_seconds_1h = bucket_seconds_1h
+        self.sl_on_close_only = sl_on_close_only
         self.reset()
 
     def reset(self) -> None:
@@ -206,6 +265,17 @@ class Supertrend15mFilterFixedSlStrategy:
         self._bucket_high: float | None = None
         self._bucket_low: float | None = None
         self._bucket_close: float | None = None
+        # 1-hour confirmation layer (opt-in) -- own independent Supertrend,
+        # HA state, and bucket-aggregation state, deliberately DUPLICATED
+        # from the 15-minute filter's own machinery rather than shared
+        # (see module docstring's OPT-IN THIRD CONFIRMATION LAYER note).
+        self._st1h = _Supertrend(self.atr_period_1h, self.factor_1h) if self.use_1h_filter else None
+        self._ha1h = _HeikinAshi() if (self.use_1h_filter and self.use_heikin_ashi) else None
+        self._bucket_id_1h: int | None = None
+        self._bucket_open_1h: float | None = None
+        self._bucket_high_1h: float | None = None
+        self._bucket_low_1h: float | None = None
+        self._bucket_close_1h: float | None = None
         # "once target is done then no new trade until 15 min supertrend
         # changes" -- set by notify_target_hit() (an OPTION-PREMIUM event
         # this BTC-price-only class can't see on its own), cleared the
@@ -215,7 +285,10 @@ class Supertrend15mFilterFixedSlStrategy:
 
     @property
     def ready(self) -> bool:
-        return self._st._bars_seen >= self.atr_period and self._st15._bars_seen >= self.atr_period_15m
+        base = self._st._bars_seen >= self.atr_period and self._st15._bars_seen >= self.atr_period_15m
+        if self._st1h is not None:
+            return base and self._st1h._bars_seen >= self.atr_period_1h
+        return base
 
     @property
     def in_position(self) -> bool:
@@ -300,6 +373,42 @@ class Supertrend15mFilterFixedSlStrategy:
         return False
 
     # ------------------------------------------------------------------ #
+    def _feed_1h(self, candle: Candle) -> bool:
+        """Opt-in 1-hour confirmation layer -- same LOCKED bucket-boundary
+        pattern as _feed_15m() above, deliberately duplicated rather than
+        shared (see module docstring's OPT-IN THIRD CONFIRMATION LAYER
+        note). Only ever called when self._st1h is not None. Return value
+        is unused today (no notify_target_hit()-style blocking is tied to
+        the 1h layer), kept for symmetry with _feed_15m()."""
+        bucket_id = candle.start_time // self.bucket_seconds_1h
+        if self._bucket_id_1h is None:
+            self._bucket_id_1h = bucket_id
+            self._bucket_open_1h = candle.open
+            self._bucket_high_1h = candle.high
+            self._bucket_low_1h = candle.low
+            self._bucket_close_1h = candle.close
+            return False
+        if bucket_id != self._bucket_id_1h:
+            prev_dir1h = self._st1h._direction
+            if self._ha1h is not None:
+                _, ha_h, ha_l, ha_c = self._ha1h.convert(
+                    self._bucket_open_1h, self._bucket_high_1h, self._bucket_low_1h, self._bucket_close_1h)
+                self._st1h.update(ha_h, ha_l, ha_c)
+            else:
+                self._st1h.update(self._bucket_high_1h, self._bucket_low_1h, self._bucket_close_1h)
+            flipped1h = prev_dir1h != 0 and self._st1h._direction != prev_dir1h
+            self._bucket_id_1h = bucket_id
+            self._bucket_open_1h = candle.open
+            self._bucket_high_1h = candle.high
+            self._bucket_low_1h = candle.low
+            self._bucket_close_1h = candle.close
+            return flipped1h
+        self._bucket_high_1h = max(self._bucket_high_1h, candle.high)
+        self._bucket_low_1h = min(self._bucket_low_1h, candle.low)
+        self._bucket_close_1h = candle.close
+        return False
+
+    # ------------------------------------------------------------------ #
     def update(self, candle: Candle) -> Supertrend15mFilterFixedSlDecision | None:
         if self._ha1 is not None:
             _, ha_h, ha_l, ha_c = self._ha1.convert(candle.open, candle.high, candle.low, candle.close)
@@ -308,12 +417,22 @@ class Supertrend15mFilterFixedSlStrategy:
             # mode -- see module docstring (mirrors supertrend_flip.py's own
             # breakout-level checks, which are HA-based too).
             check_high, check_low = ha_h, ha_l
+            if self.sl_on_close_only:
+                check_high = check_low = ha_c
         else:
             st_value, direction = self._st.update(candle.high, candle.low, candle.close)
             check_high, check_low = candle.high, candle.low
+            if self.sl_on_close_only:
+                # OPT-IN CLOSE-ONLY SL: ignore the wick, only react to where
+                # the 1-minute candle actually closed -- a same-candle wick
+                # through the frozen SL that closes back on the safe side no
+                # longer triggers a stop-out.
+                check_high = check_low = candle.close
         dir15_flipped = self._feed_15m(candle)
         if dir15_flipped and self._blocked_until_15m_flip:
             self._blocked_until_15m_flip = False
+        if self._st1h is not None:
+            self._feed_1h(candle)
 
         dir_flipped = self._prev_dir != 0 and direction != self._prev_dir
         self._prev_dir = direction
@@ -321,6 +440,7 @@ class Supertrend15mFilterFixedSlStrategy:
         exit_ = False
         exit_price = candle.close
         exit_was_short = False
+        exit_reason: str | None = None
         entry_signal = False
         entry_is_short = False
         entry_price = candle.close
@@ -331,30 +451,48 @@ class Supertrend15mFilterFixedSlStrategy:
 
         is_red, is_green = direction > 0, direction < 0
         is_red15, is_green15 = self._st15._direction > 0, self._st15._direction < 0
+        # No-op (always True) when the 1h filter is disabled -- see module
+        # docstring's OPT-IN THIRD CONFIRMATION LAYER note.
+        is_red1h = self._st1h._direction > 0 if self._st1h is not None else True
+        is_green1h = self._st1h._direction < 0 if self._st1h is not None else True
 
-        # ---- 1. Exit: real price crosses the FROZEN (non-trailing) SL.
+        # ---- 1. Exit A: real price crosses the FROZEN (non-trailing) SL.
         #         Checked before entry so a same-bar stop-out + fresh
         #         qualifying flip can still open a new leg this bar. ----
         if self._is_short is True and self._active_sl is not None and check_high >= self._active_sl:
-            exit_, exit_price, exit_was_short = True, self._active_sl, True
+            exit_, exit_price, exit_was_short, exit_reason = True, self._active_sl, True, "SL"
             self._is_short = None
             self._active_sl = None
         elif self._is_short is False and self._active_sl is not None and check_low <= self._active_sl:
-            exit_, exit_price, exit_was_short = True, self._active_sl, False
+            exit_, exit_price, exit_was_short, exit_reason = True, self._active_sl, False, "SL"
             self._is_short = None
             self._active_sl = None
+
+        # ---- 1b. Exit B (opt-in): the 15m Supertrend itself has a FRESH
+        #          flip AGAINST the still-open position -- a pure trend-
+        #          change exit (no price level, so exit_price is
+        #          candle.close). Only checked if the SL above didn't
+        #          already close this bar. ----
+        if (self.exit_on_15m_flip_against and not exit_ and self._is_short is not None
+                and dir15_flipped):
+            against = ((self._is_short is True and is_green15)
+                       or (self._is_short is False and is_red15))
+            if against:
+                exit_, exit_price, exit_was_short, exit_reason = True, candle.close, self._is_short, "15M_FLIP"
+                self._is_short = None
+                self._active_sl = None
 
         # ---- 2. Entry: a FRESH flip, confirmed by the 15m filter already
         #         agreeing at this exact moment. SL frozen at THIS flip
         #         candle's own Supertrend value. Blocked entirely after a
         #         target hit until the 15m itself has its own next flip. ----
         if self._is_short is None and dir_flipped and not self._blocked_until_15m_flip:
-            if is_red and is_red15:
+            if is_red and is_red15 and is_red1h:
                 self._is_short = True
                 self._active_sl = st_value
                 entry_signal, entry_is_short = True, True
                 entry_price, sl_level = candle.close, st_value
-            elif is_green and is_green15:
+            elif is_green and is_green15 and is_green1h:
                 self._is_short = False
                 self._active_sl = st_value
                 entry_signal, entry_is_short = True, False
@@ -364,6 +502,6 @@ class Supertrend15mFilterFixedSlStrategy:
             return None
         return Supertrend15mFilterFixedSlDecision(
             candle=candle, exit=exit_, exit_price=exit_price, exit_was_short=exit_was_short,
-            entry_signal=entry_signal, entry_is_short=entry_is_short,
+            exit_reason=exit_reason, entry_signal=entry_signal, entry_is_short=entry_is_short,
             entry_price=entry_price, sl_level=sl_level,
         )

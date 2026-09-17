@@ -198,6 +198,141 @@ def test_heikin_ashi_mode_15m_gets_its_own_independent_ha_state() -> None:
     assert (s._ha1._ha_open, s._ha1._ha_close) != (s._ha15._ha_open, s._ha15._ha_close)
 
 
+def test_1h_filter_off_by_default() -> None:
+    s = _strategy()
+    assert s._st1h is None
+
+
+def test_1h_filter_uses_independent_bucket_state_from_15m() -> None:
+    s = _strategy(use_1h_filter=True)
+    assert s._st1h is not None
+    assert s._st1h is not s._st15
+
+
+def test_entry_blocked_when_1h_disagrees_even_if_15m_agrees() -> None:
+    s = _strategy(use_1h_filter=True, atr_period_1h=1)
+    _ready(s)
+    s._st1h._bars_seen = 10
+    s._st15._direction = 1    # 15m red -- agrees with the coming sell flip
+    s._st1h._direction = -1   # 1h green -- DISAGREES
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(0, 100, 101, 99, 100))
+    s._st.update = lambda h, l, c: (105.0, 1)   # fresh flip to downtrend
+    d = s.update(_c(T, 100, 102, 98, 99))
+    assert d is None
+    assert not s.in_position
+
+
+def test_entry_fires_when_1h_also_agrees() -> None:
+    s = _strategy(use_1h_filter=True, atr_period_1h=1)
+    _ready(s)
+    s._st1h._bars_seen = 10
+    s._st15._direction = 1   # 15m red -- agrees
+    s._st1h._direction = 1   # 1h red -- ALSO agrees
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(0, 100, 101, 99, 100))
+    s._st.update = lambda h, l, c: (105.0, 1)
+    d = s.update(_c(T, 100, 102, 98, 99))
+    assert d is not None and d.has_entry and d.entry_is_short is True
+    assert s.in_position
+
+
+def test_15m_flip_against_short_exits_immediately_when_enabled() -> None:
+    """The 15m Supertrend flipping AGAINST an open SHORT (turning green)
+    closes it immediately at candle.close -- a pure trend-change exit, no
+    price level, independent of the frozen SL."""
+    s = _strategy(exit_on_15m_flip_against=True)
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 200.0   # far away -- price will NOT cross this
+    s._st15._direction = 1   # currently red (agrees with the short)
+    s._st.update = lambda h, l, c: (95.0, -1)
+
+    s.update(_c(0, 100, 101, 99, 100))   # establishes the initial 15m bucket
+
+    # Mock the 15m Supertrend's OWN update -- must mutate _direction itself,
+    # exactly like the real method (a plain lambda return value alone has no
+    # side effect, see this file's target-hit-block test for the same need).
+    def _mock_st15_flip_green(h, l, c):
+        s._st15._direction = -1
+        return (105.0, -1)
+    s._st15.update = _mock_st15_flip_green
+
+    # Next candle lands in a NEW 15-minute bucket -- forces _feed_15m to
+    # step the 15m Supertrend and detect the flip.
+    d = s.update(_c(900, 100, 102, 98, 101))
+    assert d is not None
+    assert d.has_exit and d.exit_was_short is True
+    assert d.exit_reason == "15M_FLIP"
+    assert d.exit_price == 101.0   # candle.close, NOT the frozen SL (200.0)
+    assert not s.in_position
+
+
+def test_15m_flip_against_long_exits_immediately_when_enabled() -> None:
+    s = _strategy(exit_on_15m_flip_against=True)
+    _ready(s)
+    s._is_short = False
+    s._active_sl = 0.0   # far away -- price will NOT cross this
+    s._st15._direction = -1   # currently green (agrees with the long)
+    s._st.update = lambda h, l, c: (95.0, -1)
+
+    s.update(_c(0, 100, 101, 99, 100))
+
+    def _mock_st15_flip_red(h, l, c):
+        s._st15._direction = 1
+        return (95.0, 1)
+    s._st15.update = _mock_st15_flip_red
+
+    d = s.update(_c(900, 100, 102, 98, 101))
+    assert d is not None
+    assert d.has_exit and d.exit_was_short is False
+    assert d.exit_reason == "15M_FLIP"
+    assert d.exit_price == 101.0
+    assert not s.in_position
+
+
+def test_15m_flip_against_disabled_by_default_does_not_exit() -> None:
+    s = _strategy()   # exit_on_15m_flip_against defaults to False
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 200.0
+    s._st15._direction = 1
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(0, 100, 101, 99, 100))
+
+    def _mock_st15_flip_green(h, l, c):
+        s._st15._direction = -1
+        return (105.0, -1)
+    s._st15.update = _mock_st15_flip_green
+
+    d = s.update(_c(900, 100, 102, 98, 101))
+    assert d is None   # no exit fires -- feature is off
+    assert s.in_position and s.is_short is True   # still short, untouched
+
+
+def test_sl_takes_priority_over_15m_flip_on_same_bar() -> None:
+    """If the frozen SL crossing AND a 15m-flip-against would both fire on
+    the exact same bar, the price-level SL wins -- exit_reason must be
+    'SL', not '15M_FLIP'."""
+    s = _strategy(exit_on_15m_flip_against=True)
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 100.0   # WILL be crossed this bar
+    s._st15._direction = 1
+    s._st.update = lambda h, l, c: (95.0, -1)
+    s.update(_c(0, 95, 96, 94, 95))   # stays well below SL(100) -- no exit yet
+
+    def _mock_st15_flip_green(h, l, c):
+        s._st15._direction = -1
+        return (105.0, -1)
+    s._st15.update = _mock_st15_flip_green
+
+    d = s.update(_c(900, 100, 102, 98, 101))   # high(102) >= SL(100) -- SL also fires
+    assert d is not None and d.has_exit
+    assert d.exit_reason == "SL"
+    assert d.exit_price == 100.0   # the frozen level, not candle.close
+
+
 def test_same_bar_stop_out_and_fresh_qualifying_flip_can_both_fire() -> None:
     s = _strategy()
     _ready(s)
@@ -211,3 +346,53 @@ def test_same_bar_stop_out_and_fresh_qualifying_flip_can_both_fire() -> None:
     assert d.has_exit and d.exit_was_short is True
     assert d.has_entry and d.entry_is_short is False
     assert s.in_position and s.is_short is False
+
+
+def test_sl_on_close_only_off_by_default_wick_alone_exits() -> None:
+    """Default (unchanged live) behaviour: a wick through the frozen SL
+    exits even if the candle closes back on the safe side."""
+    s = _strategy()
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 100.0
+    s._st.update = lambda h, l, c: (95.0, -1)
+    d = s.update(_c(0, 98, 101, 97, 99))   # high(101) >= SL(100), closes back at 99
+    assert d is not None and d.has_exit
+    assert d.exit_price == 100.0
+
+
+def test_sl_on_close_only_wick_through_level_does_not_exit_if_close_is_safe() -> None:
+    s = _strategy(sl_on_close_only=True)
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 100.0
+    s._st.update = lambda h, l, c: (95.0, -1)
+    d = s.update(_c(0, 98, 101, 97, 99))   # wick to 101, but closes at 99 -- no exit
+    assert d is None
+    assert s.in_position and s._active_sl == 100.0
+
+
+def test_sl_on_close_only_exits_once_a_candle_actually_closes_beyond_level() -> None:
+    s = _strategy(sl_on_close_only=True)
+    _ready(s)
+    s._is_short = True
+    s._active_sl = 100.0
+    s._st.update = lambda h, l, c: (95.0, -1)
+    d = s.update(_c(0, 99, 102, 98, 101))   # closes at 101 >= SL(100) -- exit fires
+    assert d is not None and d.has_exit and d.exit_was_short is True
+    assert d.exit_price == 100.0   # still the frozen level, not candle.close
+    assert not s.in_position
+
+
+def test_sl_on_close_only_long_side_uses_close_not_low() -> None:
+    s = _strategy(sl_on_close_only=True)
+    _ready(s)
+    s._is_short = False
+    s._active_sl = 100.0
+    s._st.update = lambda h, l, c: (105.0, 1)
+    d = s.update(_c(0, 101, 103, 98, 101))   # wick to 98, closes at 101 -- no exit
+    assert d is None
+    assert s.in_position
+    d = s.update(_c(T, 100, 102, 97, 99))   # closes at 99 <= SL(100) -- exit fires
+    assert d is not None and d.has_exit and d.exit_was_short is False
+    assert d.exit_price == 100.0

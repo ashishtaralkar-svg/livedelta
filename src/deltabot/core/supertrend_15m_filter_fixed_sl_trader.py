@@ -150,6 +150,7 @@ class Supertrend15mFilterFixedSlEngine:
             factor=settings.st15f_factor,
             atr_period_15m=settings.st15f_atr_period_15m,
             factor_15m=settings.st15f_factor_15m,
+            sl_on_close_only=settings.st15f_sl_on_close_only,
         )
         self.executor = _MinutePreciseOptionsExecutor(
             rest, settings, settings.st15f_expiry_cutoff_hour, settings.st15f_expiry_cutoff_minute,
