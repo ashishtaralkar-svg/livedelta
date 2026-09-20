@@ -560,6 +560,23 @@ class Settings(BaseSettings):
     # target/SL. 0 disables the poll loop entirely (only the next-day
     # fallback would then ever close a position -- not recommended).
     strangle9pm_poll_seconds: float = 30.0
+    # Opt-in dynamic lot sizing (added 2026-09-20, on request): instead of the
+    # static option_contracts below, resize EVERY entry to
+    # floor(REAL available balance / strangle9pm_capital_per_lot) lots, capped
+    # at strangle9pm_max_lots -- "$1 per lot" (user's own ratio). Recomputed
+    # FRESH right before every entry attempt (mirrors the st15f fix: never a
+    # stale once-a-day snapshot). Floor is 1 lot, never 0 -- a qualifying
+    # entry is always ATTEMPTED, the exchange's own margin check is the real,
+    # final gate. BOTH legs (CE and PE) get the SAME computed lot count (one
+    # balance check up front, before either leg opens) so the strangle never
+    # ends up mismatched (e.g. 15 CE / 12 PE) from the CE leg's margin lock
+    # shrinking the balance the PE leg would otherwise see.
+    strangle9pm_compound_capital: bool = False
+    strangle9pm_capital_per_lot: float = 1.0
+    # Hard safety ceiling, not a target -- start conservative (matches the
+    # 20-lot size this bot was first deployed at) and raise explicitly on
+    # request, same discipline as st15f_max_lots's own history in this file.
+    strangle9pm_max_lots: int = 20
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),

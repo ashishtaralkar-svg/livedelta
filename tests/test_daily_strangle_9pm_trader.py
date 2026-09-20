@@ -54,10 +54,11 @@ class FakeExecutor:
 
 
 class FakeRest:
-    def __init__(self, positions=None, marks=None, candles=None) -> None:
+    def __init__(self, positions=None, marks=None, candles=None, balance=1000.0) -> None:
         self._positions = positions or []
         self._marks = marks or {}
         self._candles = candles if candles is not None else [Candle(0, 60000, 60100, 59900, 60000, 1.0)]
+        self._balance = balance
 
     def get_option_positions(self, underlying):
         return self._positions
@@ -67,6 +68,9 @@ class FakeRest:
 
     def get_candles(self, symbol, resolution, start, end):
         return self._candles
+
+    def get_available_balance(self, asset_symbol=None):
+        return self._balance
 
 
 def _make_engine(**kw) -> DailyStrangle9pmEngine:
@@ -141,6 +145,62 @@ async def test_pe_fill_failure_unwinds_the_now_unhedged_ce_leg() -> None:
     assert engine.entry_premium_pe is None
     exits = _entry_calls(engine.notifier, NotifyEvent.EXIT)
     assert any(c.kwargs.get("reason") == "PE_FAILED" for c in exits)
+
+
+# ---------------------------------------------------------------------- #
+# Dynamic lot sizing ("$1 per lot", opt-in)
+# ---------------------------------------------------------------------- #
+async def test_dynamic_sizing_off_by_default_keeps_static_lots() -> None:
+    engine = _make_engine(option_contracts=10)
+    engine.rest._balance = 500.0
+    await engine._maybe_recompute_lots()
+    assert engine.settings.option_contracts == 10   # untouched -- feature disabled
+
+
+async def test_dynamic_sizing_computes_lots_from_balance() -> None:
+    engine = _make_engine(option_contracts=10, strangle9pm_compound_capital=True,
+                          strangle9pm_capital_per_lot=1.0, strangle9pm_max_lots=1000)
+    engine.rest._balance = 237.0
+    await engine._maybe_recompute_lots()
+    assert engine.settings.option_contracts == 237
+
+
+async def test_dynamic_sizing_caps_at_max_lots() -> None:
+    engine = _make_engine(option_contracts=10, strangle9pm_compound_capital=True,
+                          strangle9pm_capital_per_lot=1.0, strangle9pm_max_lots=20)
+    engine.rest._balance = 5000.0
+    await engine._maybe_recompute_lots()
+    assert engine.settings.option_contracts == 20
+
+
+async def test_dynamic_sizing_floors_at_1_lot_never_0() -> None:
+    engine = _make_engine(option_contracts=10, strangle9pm_compound_capital=True,
+                          strangle9pm_capital_per_lot=1.0, strangle9pm_max_lots=1000)
+    engine.rest._balance = 0.40   # less than $1 -- would floor to 0 lots
+    await engine._maybe_recompute_lots()
+    assert engine.settings.option_contracts == 1
+
+
+async def test_dynamic_sizing_balance_fetch_failure_keeps_current_lots() -> None:
+    engine = _make_engine(option_contracts=15, strangle9pm_compound_capital=True,
+                          strangle9pm_capital_per_lot=1.0)
+    def _boom(asset=None):
+        raise RuntimeError("balance API down")
+    engine.rest.get_available_balance = _boom
+    await engine._maybe_recompute_lots()
+    assert engine.settings.option_contracts == 15   # unchanged, not crashed
+
+
+async def test_maybe_enter_uses_dynamic_lots_for_both_legs() -> None:
+    engine = _make_engine(option_contracts=10, strangle9pm_compound_capital=True,
+                          strangle9pm_capital_per_lot=1.0, strangle9pm_max_lots=1000)
+    engine.rest._balance = 88.0
+    await engine._maybe_enter()
+    assert engine.settings.option_contracts == 88
+    # Both legs opened -- position_state saves would use the SAME lot count
+    # (CE and PE never get mismatched sizes from a mid-entry balance shift).
+    assert engine.executor_ce.open_calls == [(SignalDir.SHORT.value, 60000.0, 2.0)]
+    assert engine.executor_pe.open_calls == [(SignalDir.LONG.value, 60000.0, 2.0)]
 
 
 # ---------------------------------------------------------------------- #

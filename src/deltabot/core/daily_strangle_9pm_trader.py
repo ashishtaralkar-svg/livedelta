@@ -173,6 +173,30 @@ class DailyStrangle9pmEngine:
                 log.error("Strangle9pm: entry failed", extra={"extra": {"error": str(exc)}})
             await asyncio.sleep(60)   # clear the boundary before recomputing "next"
 
+    async def _maybe_recompute_lots(self) -> None:
+        """Opt-in dynamic sizing (see config.py's strangle9pm_compound_capital
+        block comment): resize option_contracts to
+        floor(REAL available balance / strangle9pm_capital_per_lot), capped
+        at strangle9pm_max_lots, floored at 1 -- called ONCE per entry,
+        before either leg opens, so CE and PE always get the SAME lot count."""
+        if not self.settings.strangle9pm_compound_capital:
+            return
+        try:
+            balance = await asyncio.to_thread(
+                self.rest.get_available_balance, self.settings.option_margin_asset or None
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strangle9pm: dynamic-lot balance fetch failed — keeping current lot size",
+                       extra={"extra": {"error": str(exc)}})
+            return
+        raw_lots = int(balance // self.settings.strangle9pm_capital_per_lot)
+        new_lots = max(1, min(self.settings.strangle9pm_max_lots, raw_lots))
+        if new_lots != self.settings.option_contracts:
+            log.info("Strangle9pm: dynamic lot-size update", extra={"extra": {
+                "balance": round(balance, 2), "old_lots": self.settings.option_contracts,
+                "new_lots": new_lots, "capped": raw_lots > self.settings.strangle9pm_max_lots}})
+        self.settings.option_contracts = new_lots
+
     async def _maybe_enter(self) -> None:
         if self.entry_in_progress or self.has_open_strangle:
             log.info("Strangle9pm: entry window fired but already positioned/in-progress — skipping")
@@ -183,6 +207,7 @@ class DailyStrangle9pmEngine:
             if spot is None:
                 log.error("Strangle9pm: no spot price — skipping today's entry")
                 return
+            await self._maybe_recompute_lots()
 
             try:
                 ce_fill, ce_symbol = await self.executor_ce.open_option_by_otm_pct(
