@@ -191,10 +191,14 @@ class DailyStrangle9pmEngine:
             return
         raw_lots = int(balance // self.settings.strangle9pm_capital_per_lot)
         new_lots = max(1, min(self.settings.strangle9pm_max_lots, raw_lots))
-        if new_lots != self.settings.option_contracts:
-            log.info("Strangle9pm: dynamic lot-size update", extra={"extra": {
-                "balance": round(balance, 2), "old_lots": self.settings.option_contracts,
-                "new_lots": new_lots, "capped": raw_lots > self.settings.strangle9pm_max_lots}})
+        # Always logged (not just on change) -- a recompute that lands on the
+        # SAME lot count as before is still worth seeing (e.g. confirms the
+        # max_lots ceiling is what's holding it there, rather than leaving
+        # that ambiguous).
+        log.info("Strangle9pm: dynamic lot-size recompute", extra={"extra": {
+            "balance": round(balance, 2), "old_lots": self.settings.option_contracts,
+            "new_lots": new_lots, "raw_lots": raw_lots,
+            "capped": raw_lots > self.settings.strangle9pm_max_lots}})
         self.settings.option_contracts = new_lots
 
     async def _maybe_enter(self) -> None:
