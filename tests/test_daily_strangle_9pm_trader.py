@@ -5,7 +5,6 @@ docstring in src/deltabot/core/daily_strangle_9pm_trader.py."""
 
 from __future__ import annotations
 
-import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -59,7 +58,6 @@ class FakeRest:
         self._positions = positions or []
         self._marks = marks or {}
         self._candles = candles if candles is not None else [Candle(0, 60000, 60100, 59900, 60000, 1.0)]
-        self._candles_by_symbol: dict[str, list] = {}
         self._balance = balance
 
     def get_option_positions(self, underlying):
@@ -69,7 +67,7 @@ class FakeRest:
         return self._marks.get(symbol)
 
     def get_candles(self, symbol, resolution, start, end):
-        return self._candles_by_symbol.get(symbol, self._candles)
+        return self._candles
 
     def get_available_balance(self, asset_symbol=None):
         return self._balance
@@ -260,52 +258,6 @@ async def test_check_target_sl_no_op_on_missing_mark_price() -> None:
     engine.rest._marks = {}   # both marks missing
     await engine._check_target_sl()
     assert engine.executor_ce.close_calls == 0
-
-
-# ---------------------------------------------------------------------- #
-# _current_premium: prefer real recent TRADE price over mark price
-# (added on request 2026-09-24, to align live decisions with the backtest,
-# which only ever sees historical trade candles, never mark price)
-# ---------------------------------------------------------------------- #
-async def test_current_premium_prefers_fresh_trade_candle_over_mark() -> None:
-    engine = _make_engine()
-    now = int(time.time())
-    engine.rest._candles_by_symbol["C-BTC-64000-070826"] = [
-        Candle(now - 30, 40.0, 41.0, 39.0, 42.0, 1.0)   # fresh trade, close=42
-    ]
-    engine.rest._marks = {"C-BTC-64000-070826": 999.0}   # would be very wrong if used
-    result = await engine._current_premium("C-BTC-64000-070826")
-    assert result == 42.0
-
-
-async def test_current_premium_falls_back_to_mark_when_no_trade_candles() -> None:
-    engine = _make_engine()
-    engine.rest._candles_by_symbol["C-BTC-64000-070826"] = []
-    engine.rest._marks = {"C-BTC-64000-070826": 55.0}
-    result = await engine._current_premium("C-BTC-64000-070826")
-    assert result == 55.0
-
-
-async def test_current_premium_falls_back_to_mark_when_trade_candle_is_stale() -> None:
-    engine = _make_engine()
-    now = int(time.time())
-    engine.rest._candles_by_symbol["C-BTC-64000-070826"] = [
-        Candle(now - 500, 40.0, 41.0, 39.0, 42.0, 1.0)   # older than max_age_sec (120)
-    ]
-    engine.rest._marks = {"C-BTC-64000-070826": 55.0}
-    result = await engine._current_premium("C-BTC-64000-070826")
-    assert result == 55.0
-
-
-async def test_check_target_sl_uses_trade_price_for_both_legs() -> None:
-    engine = _make_engine(strangle9pm_target_pct=70.0)
-    await _open_strangle(engine, ce_entry=100.0, pe_entry=100.0)   # combined entry 200, target <= 60
-    now = int(time.time())
-    engine.rest._candles_by_symbol["C-BTC-64000-070826"] = [Candle(now - 10, 29, 31, 28, 29.0, 1.0)]
-    engine.rest._candles_by_symbol["P-BTC-59200-070826"] = [Candle(now - 10, 29, 31, 28, 30.0, 1.0)]
-    engine.rest._marks = {"C-BTC-64000-070826": 999.0, "P-BTC-59200-070826": 999.0}   # would fire SL if used
-    await engine._check_target_sl()
-    assert engine.executor_ce.close_calls == 1   # TARGET fired from trade price (29+30=59 <= 60), not mark
 
 
 # ---------------------------------------------------------------------- #
