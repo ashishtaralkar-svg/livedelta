@@ -306,6 +306,33 @@ class DailyStrangle9pmEngine:
             except Exception as exc:  # noqa: BLE001
                 log.error("Strangle9pm: poll check failed", extra={"extra": {"error": str(exc)}})
 
+    async def _current_premium(self, symbol: str, max_age_sec: int = 120) -> float | None:
+        """Prefer the symbol's most recent REAL TRADED price (the same data
+        source the backtest itself uses via op.premium_at()) over the live
+        theoretical mark price -- added on request 2026-09-24, to align live
+        target/SL decisions more closely with what the backtest predicts.
+        Falls back to mark price if no recent trade exists (illiquid leg) or
+        the most recent one is older than max_age_sec (stale)."""
+        now = int(time.time())
+        try:
+            candles = await asyncio.to_thread(
+                self.rest.get_candles, symbol, "1m", now - max_age_sec, now
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strangle9pm: trade-price candle fetch failed — falling back to mark price",
+                       extra={"extra": {"symbol": symbol, "error": str(exc)}})
+            candles = None
+        if candles:
+            latest = candles[-1]
+            if now - latest.start_time <= max_age_sec:
+                return latest.close
+        try:
+            return await asyncio.to_thread(self.rest.get_mark_price, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strangle9pm: mark price fallback fetch failed",
+                       extra={"extra": {"symbol": symbol, "error": str(exc)}})
+            return None
+
     async def _check_target_sl(self) -> None:
         if self.closing or not self.has_open_strangle or self.combined_entry_premium is None:
             return
@@ -313,12 +340,8 @@ class DailyStrangle9pmEngine:
         pe_symbol = self.executor_pe.tracked_symbol
         if not ce_symbol or not pe_symbol:
             return
-        try:
-            ce_mark = await asyncio.to_thread(self.rest.get_mark_price, ce_symbol)
-            pe_mark = await asyncio.to_thread(self.rest.get_mark_price, pe_symbol)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Strangle9pm: mark price fetch failed", extra={"extra": {"error": str(exc)}})
-            return
+        ce_mark = await self._current_premium(ce_symbol)
+        pe_mark = await self._current_premium(pe_symbol)
         if ce_mark is None or pe_mark is None:
             return
         combined = ce_mark + pe_mark
