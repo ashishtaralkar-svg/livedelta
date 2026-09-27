@@ -185,6 +185,7 @@ def resolve_by_premium(
     expiry: datetime, interval: int, target_premium: float,
     entry_ts: int, exit_ts: int, win_start: int, win_end: int,
     resolution: str, step: int, cache: dict,
+    otm_steps: int = 30, itm_steps: int = 20,
 ) -> tuple[str, int, dict[int, Candle]] | None:
     """Pick the strike whose ENTRY premium is closest to ``target_premium`` --
     mirrors ``OptionsExecutor.select_by_premium``'s GLOBAL minimum over the
@@ -205,7 +206,10 @@ def resolve_by_premium(
     target_premium can genuinely sit many strikes ITM.
 
     Returns ``(symbol, strike, candles)`` or None. ``cache`` keyed by symbol
-    avoids refetching across trades.
+    avoids refetching across trades. ``otm_steps``/``itm_steps`` bound how far
+    the walk searches in each direction (defaults tuned for the same/next-day
+    expiries most callers use); a longer-dated hold needs a wider search since
+    a given premium sits much further OTM when there's more time value.
     """
     ddmmyy = expiry.strftime("%d%m%y")
     atm = int(round(entry_btc / interval) * interval)
@@ -235,7 +239,7 @@ def resolve_by_premium(
 
     strike = atm
     crossed_at: int | None = None
-    for i in range(30):
+    for i in range(otm_steps):
         r = ev(strike)
         consider(r)
         if r is not None and r[3] <= target_premium and crossed_at is None:
@@ -245,7 +249,7 @@ def resolve_by_premium(
         strike += otm
 
     strike = atm - otm
-    for _ in range(20):
+    for _ in range(itm_steps):
         consider(ev(strike))
         strike -= otm
 
