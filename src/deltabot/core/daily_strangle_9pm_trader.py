@@ -295,16 +295,51 @@ class DailyStrangle9pmEngine:
     # Combined premium TARGET / SL poll loop
     # ------------------------------------------------------------------ #
     async def _poll_loop(self) -> None:
-        interval = self.settings.strangle9pm_poll_seconds
+        # Fixed at 60s regardless of strangle9pm_poll_seconds (added on
+        # request 2026-09-29): checks now read the most recent CLOSED
+        # 1-minute trade candle, matching the backtest's own methodology
+        # exactly (backtest checks once per closed 1m candle, using that
+        # candle's close) -- polling faster than one minute would just
+        # re-read the same closed candle repeatedly.
         while True:
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 raise
             try:
                 await self._check_target_sl()
             except Exception as exc:  # noqa: BLE001
                 log.error("Strangle9pm: poll check failed", extra={"extra": {"error": str(exc)}})
+
+    async def _closed_candle_premium(self, symbol: str, max_age_sec: int = 120) -> float | None:
+        """The close of the symbol's most recent CLOSED 1-minute trade
+        candle -- the exact same data source and grain
+        scripts/backtest_daily_strangle_9pm.py uses (op.premium_at against
+        1-minute option candles), replacing the live mark-price polling
+        this engine used before 2026-09-29. Falls back to live mark price
+        only if the leg has no recent trade at all (illiquid, no candle to
+        read) or the most recent one is older than max_age_sec -- so the
+        bot is never left blind on a leg that simply hasn't traded
+        recently, rather than a routine data source."""
+        now = int(time.time())
+        try:
+            candles = await asyncio.to_thread(
+                self.rest.get_candles, symbol, "1m", now - max_age_sec, now
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strangle9pm: closed-candle fetch failed — falling back to mark price",
+                       extra={"extra": {"symbol": symbol, "error": str(exc)}})
+            candles = None
+        if candles:
+            latest = candles[-1]
+            if now - latest.start_time <= max_age_sec:
+                return latest.close
+        try:
+            return await asyncio.to_thread(self.rest.get_mark_price, symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strangle9pm: mark price fallback fetch failed",
+                       extra={"extra": {"symbol": symbol, "error": str(exc)}})
+            return None
 
     async def _check_target_sl(self) -> None:
         if self.closing or not self.has_open_strangle or self.combined_entry_premium is None:
@@ -313,15 +348,11 @@ class DailyStrangle9pmEngine:
         pe_symbol = self.executor_pe.tracked_symbol
         if not ce_symbol or not pe_symbol:
             return
-        try:
-            ce_mark = await asyncio.to_thread(self.rest.get_mark_price, ce_symbol)
-            pe_mark = await asyncio.to_thread(self.rest.get_mark_price, pe_symbol)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Strangle9pm: mark price fetch failed", extra={"extra": {"error": str(exc)}})
+        ce_price = await self._closed_candle_premium(ce_symbol)
+        pe_price = await self._closed_candle_premium(pe_symbol)
+        if ce_price is None or pe_price is None:
             return
-        if ce_mark is None or pe_mark is None:
-            return
-        combined = ce_mark + pe_mark
+        combined = ce_price + pe_price
         entry = self.combined_entry_premium
         target_level = entry * (1 - self.settings.strangle9pm_target_pct / 100.0)
         sl_level = entry * (1 + self.settings.strangle9pm_sl_pct / 100.0)

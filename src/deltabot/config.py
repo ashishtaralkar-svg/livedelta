@@ -556,9 +556,12 @@ class Settings(BaseSettings):
     strangle9pm_otm_pct: float = 2.0
     strangle9pm_target_pct: float = 70.0   # REDUCTION convention, combined premium.
     strangle9pm_sl_pct: float = 50.0       # RISE convention, combined premium.
-    # How often (seconds) to poll both legs' mark price for the combined
-    # target/SL. 0 disables the poll loop entirely (only the next-day
-    # fallback would then ever close a position -- not recommended).
+    # On/off switch for the combined target/SL poll loop -- any value > 0
+    # enables it (the actual check interval is now fixed at 60s internally,
+    # updated 2026-09-29 to match the backtest's own once-per-closed-1m-
+    # candle methodology; this field no longer controls the interval, only
+    # whether the loop runs at all). 0 disables it entirely (only the
+    # next-day fallback would then ever close a position -- not recommended).
     strangle9pm_poll_seconds: float = 30.0
     # Opt-in dynamic lot sizing (added 2026-09-20, on request): instead of the
     # static option_contracts below, resize EVERY entry to
