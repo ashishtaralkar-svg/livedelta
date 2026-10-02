@@ -627,9 +627,21 @@ class OptionsExecutor:
 
         log.info("Options exit", extra={"extra": {"product_id": product_id, "size": size}})
 
-        result = await asyncio.to_thread(
-            self._rest.place_market_order, product_id, size, close_side, True  # reduce_only=True
-        )
+        try:
+            result = await asyncio.to_thread(
+                self._rest.place_market_order, product_id, size, close_side, True  # reduce_only=True
+            )
+        except DeltaRestError as exc:
+            # Position is already gone on the exchange (manual close, expiry, liquidation):
+            # stop tracking it, otherwise the leg stays "open" forever and blocks new entries.
+            if "no_position_for_reduce_only" not in str(exc):
+                raise
+            log.warning("Options exit: position already gone on exchange — clearing tracked leg",
+                        extra={"extra": {"product_id": product_id, "size": size}})
+            self._product_id = None
+            self._size = 0
+            self._option_type = None
+            return None
 
         # Clear state only AFTER the close has been accepted.
         self._product_id = None

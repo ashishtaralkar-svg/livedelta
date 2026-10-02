@@ -11,6 +11,7 @@ import pytest
 from deltabot.config import Settings
 from deltabot.core.options_executor import OptionsExecutor
 from deltabot.enums import OptionType, Side, SignalDir
+from deltabot.exchange.rest_client import DeltaRestError
 from deltabot.models import OrderResult
 
 
@@ -69,6 +70,24 @@ async def test_sell_side_close_buys_back_reduce_only() -> None:
     await ex.close_option()
     args = ex._rest.place_market_order.call_args
     assert args.args[2] == Side.BUY and args.args[3] is True   # reduce_only
+
+
+async def test_close_when_position_already_gone_clears_tracking() -> None:
+    ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell"))
+    await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    ex._rest.place_market_order = MagicMock(side_effect=DeltaRestError(
+        'POST /v2/orders -> 400: {"error":{"code":"no_position_for_reduce_only"},"success":false}'))
+    assert await ex.close_option() is None
+    assert not ex.has_open_position
+
+
+async def test_close_other_errors_still_raise_and_keep_tracking() -> None:
+    ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell"))
+    await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    ex._rest.place_market_order = MagicMock(side_effect=DeltaRestError("POST /v2/orders -> 500: boom"))
+    with pytest.raises(DeltaRestError):
+        await ex.close_option()
+    assert ex.has_open_position
 
 
 async def test_buy_side_close_sells_reduce_only() -> None:
