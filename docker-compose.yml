@@ -347,3 +347,38 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Daily 9PM IST 2-TIER LADDERED Short Strangle bot -- SAME engine as
+  # strangle9pmladderbot above (DELTA_STRATEGY=strangle9pmladder), just
+  # configured for TWO OTM%% tiers (1%/1.5%, 4 legs total) instead of three,
+  # on its OWN separate sub-account. Backtested as the BEST of every ladder
+  # variant tested (1%/1.5%, 1%/1.5%/2%, 1.5%/2%, and the plain 2-leg bot) at
+  # matched 60 total lots over 90 days: +$143.02, vs +$121.55 for the
+  # 3-tier version and +$102.80 for the plain 2-leg strangle9pmbot -- see
+  # .env.strangle9pmladder2.example for the full comparison table. Lot
+  # sizing: same dynamic $-per-lot formula, divided by 2 tiers (not 3) so
+  # total exposure still matches what strangle9pmbot would deploy at the
+  # same balance. Own Delta SUB-ACCOUNT, in parallel with the other bots
+  # which it NEVER touches (separate capital, DELTA_STATE_FILE=
+  # state/strangle9pmladder2_pos.json -- the engine derives FOUR per-leg
+  # files from this). Fill .env.strangle9pmladder2 first (cp
+  # .env.strangle9pmladder2.example .env.strangle9pmladder2, add the
+  # sub-account API keys). This engine has NEVER executed a real order --
+  # watch it closely. Bring it up ALONE so the other running bots are not
+  # recreated:
+  #   docker compose up -d --build strangle9pmladder2bot
+  strangle9pmladder2bot:
+    build: .
+    image: deltabot:latest
+    container_name: strangle9pmladder2bot
+    restart: always
+    env_file:
+      - .env.strangle9pmladder2
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
