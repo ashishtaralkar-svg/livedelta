@@ -581,6 +581,19 @@ class Settings(BaseSettings):
     # request, same discipline as st15f_max_lots's own history in this file.
     strangle9pm_max_lots: int = 20
 
+    # --- Daily 9PM IST LADDERED Short Strangle (strangle9pmladder) ---
+    # New bot, built 2026-10-02 (scripts/backtest_daily_strangle_9pm_laddered.py):
+    # sells a CALL+PUT pair at EACH OTM%% tier below (default "1,1.5,2" -- 3
+    # tiers x 2 legs = 6 legs total), all opened/closed together as ONE
+    # combined position, same target/SL/entry/exit-hour convention as the
+    # 2-leg strangle9pm bot above. Backtested beating the 2-leg bot at
+    # matched TOTAL exposure (+$89.34 vs +$67.43 over 30 days, 60 total lots
+    # either way) -- reuses strangle9pm_entry_hour/minute, exit_hour/minute,
+    # target_pct, sl_pct, compound_capital, capital_per_lot, max_lots,
+    # poll_seconds from above (same values, same meaning -- only the OTM
+    # ladder itself is new config surface).
+    strangle9pm_laddered_otm_pcts: str = "1,1.5,2"
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

@@ -313,3 +313,37 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Daily 9PM IST LADDERED Short Strangle bot -- same timing/target/SL rules
+  # as strangle9pmbot above, but sells a CALL+PUT pair at EACH of THREE OTM%%
+  # tiers (1%/1.5%/2% from spot, 6 legs total) instead of just one 2% pair,
+  # all opened/closed together as ONE combined position. Backtested beating
+  # the 2-leg bot at matched TOTAL exposure (60 lots either way, 30 days):
+  # +$89.34 laddered vs +$67.43 2-leg (see .env.strangle9pmladder.example
+  # for the full comparison). Lot sizing: same dynamic $-per-lot formula as
+  # strangle9pmbot, divided by the number of tiers (3) so total exposure
+  # matches what the 2-leg bot would deploy at the same balance -- per
+  # request, NOT 3x the 2-leg bot's size. Own Delta SUB-ACCOUNT, in parallel
+  # with the other bots which it NEVER touches (separate capital,
+  # DELTA_STATE_FILE=state/strangle9pmladder_pos.json -- the engine derives
+  # SIX per-leg files from this). Fill .env.strangle9pmladder first (cp
+  # .env.strangle9pmladder.example .env.strangle9pmladder, add the
+  # sub-account API keys). This engine has NEVER executed a real order --
+  # watch it closely. Bring it up ALONE so the other running bots are not
+  # recreated:
+  #   docker compose up -d --build strangle9pmladderbot
+  strangle9pmladderbot:
+    build: .
+    image: deltabot:latest
+    container_name: strangle9pmladderbot
+    restart: always
+    env_file:
+      - .env.strangle9pmladder
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

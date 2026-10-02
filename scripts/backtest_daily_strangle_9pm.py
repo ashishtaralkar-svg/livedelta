@@ -131,6 +131,7 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
             decision_ts = c.start_time + bar_seconds
             dt_ist = datetime.fromtimestamp(decision_ts, tz=_IST)
             is_weekend = dt_ist.weekday() >= 5 and not args.include_weekends   # Sat=5, Sun=6 IST
+            is_skipped_day = dt_ist.weekday() in args.skip_weekday_ints
 
             # 1. Hard square-off at next-day exit time, regardless of target/SL.
             if exit_crossed and pos is not None:
@@ -152,8 +153,9 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                     elif combined >= pos["combined_entry"] * sl_frac:
                         close("SL", decision_ts, ce_p, pe_p, c.close)
 
-            # 3. Entry: exactly entry_hour:entry_minute IST, weekdays only.
-            if (entry_crossed and pos is None and not is_weekend
+            # 3. Entry: exactly entry_hour:entry_minute IST, weekdays only
+            #    (plus any explicitly --skip-weekdays days).
+            if (entry_crossed and pos is None and not is_weekend and not is_skipped_day
                     and c.start_time >= sim_start):
                 btc_price = c.close
                 expiry = dt_ist + timedelta(days=1)   # ALWAYS next day
@@ -278,12 +280,22 @@ def main() -> None:
                     help="Trade Saturday/Sunday entries too, instead of the default weekday-only "
                          "gate. Real weekend option data exists (verified) -- the default skip is "
                          "a deliberate design choice, not a data limitation.")
+    p.add_argument("--skip-weekdays", default="",
+                    help="Comma-separated day abbreviations (mon,tue,wed,thu,fri,sat,sun) to skip "
+                         "NEW entries on, on top of whatever --include-weekends already allows -- "
+                         "e.g. --skip-weekdays fri,sat to also skip Friday and Saturday entries. "
+                         "Exits/EOD square-off still run on skipped days for anything already open.")
     p.add_argument("--lot-size", type=float, default=0.0)
     p.add_argument("--entry-slippage-pct", type=float, default=0.0)
     p.add_argument("--exit-slippage-pct", type=float, default=0.0)
     p.add_argument("--no-intrinsic-floor", action="store_true")
     p.add_argument("--out", default="")
     args = p.parse_args()
+
+    _day_idx = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    args.skip_weekday_ints = {
+        _day_idx[t.strip().lower()[:3]] for t in args.skip_weekdays.replace(";", ",").split(",") if t.strip()
+    }
 
     setup_logging("WARNING")
     settings = load_settings()

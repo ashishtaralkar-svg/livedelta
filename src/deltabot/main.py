@@ -6,6 +6,7 @@ import asyncio
 import signal
 
 from .config import Settings, load_settings
+from .core.daily_strangle_9pm_laddered_trader import DailyStrangle9pmLadderedEngine
 from .core.daily_strangle_9pm_trader import DailyStrangle9pmEngine
 from .core.dchannel_trader import DchannelEngine
 from .core.dcv2_trader import DCv2Engine
@@ -58,6 +59,8 @@ async def run(settings: Settings) -> None:
         engine = RangeEngulfingFadeSellEngine(settings, rest, notifier)
     elif settings.strategy == "strangle9pm":
         engine = DailyStrangle9pmEngine(settings, rest, notifier)
+    elif settings.strategy == "strangle9pmladder":
+        engine = DailyStrangle9pmLadderedEngine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)
