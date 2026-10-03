@@ -50,9 +50,10 @@ class OptionsExecutor:
     """Manages entry and exit for a single option leg (SELL short or BUY long,
     per ``settings.option_side``)."""
 
-    def __init__(self, rest: RestClient, settings: Settings) -> None:
+    def __init__(self, rest: RestClient, settings: Settings, side: str | None = None) -> None:
         self._rest = rest
         self._settings = settings
+        self._side = side  # "buy"/"sell" overrides settings.option_side for this leg only
         # Tracked open position (cleared on close / reconcile-flat).
         self._product_id: int | None = None
         self._size: int = 0
@@ -68,7 +69,7 @@ class OptionsExecutor:
 
     @property
     def is_buy_side(self) -> bool:
-        return self._settings.option_side == "buy"
+        return (self._side or self._settings.option_side) == "buy"
 
     def _option_type_for(self, signal_dir: int) -> OptionType:
         """SELL: bullish -> sell PUT, bearish -> sell CALL. BUY: bullish -> buy
@@ -305,6 +306,33 @@ class OptionsExecutor:
             }},
         )
         return result.average_fill_price, best["symbol"]
+
+    async def open_option_at_strike(
+        self, option_type: OptionType, expiry: date, target_strike: float
+    ) -> tuple[float | None, str | None]:
+        """Open ``option_type`` on a specific ``expiry`` at the listed strike nearest
+        ``target_strike`` (BUY or SELL per this leg's side). Returns ``(fill, symbol)``."""
+        if self._product_id is not None:
+            log.warning("open_option_at_strike called while position already tracked — skipping",
+                        extra={"extra": {"existing_product_id": self._product_id}})
+            return None, None
+        product_id, strike, symbol = await self._select_contract(
+            self.underlying, expiry, int(round(target_strike)), option_type)
+        open_side = Side.BUY if self.is_buy_side else Side.SELL
+        await self._check_balance()
+        if not self.is_buy_side:
+            await self._maybe_set_leverage(product_id)
+        size = self._settings.option_contracts
+        result = await asyncio.to_thread(self._rest.place_market_order, product_id, size, open_side)
+        self._product_id = product_id
+        self._size = size
+        self._option_type = option_type
+        self._symbol = symbol
+        self._strike = strike
+        log.info(f"Option {open_side.value.upper()} (at strike) placed", extra={"extra": {
+            "symbol": symbol, "strike": strike, "target_strike": target_strike,
+            "size": size, "fill_price": result.average_fill_price}})
+        return result.average_fill_price, symbol
 
     async def _open_by_balance_fraction_from_candidate(
         self, best: dict, signal_dir: int, balance_fraction: float, margin_asset: str | None,

@@ -19,6 +19,7 @@ from .core.supertrend_15m_filter_fixed_sl_trader import Supertrend15mFilterFixed
 from .core.supertrend_sar_trader import SupertrendSarEngine
 from .core.supertrend_trader import SupertrendFixedSlEngine
 from .core.tcp_trader import TCPEngine
+from .core.weekly_strangle_hedge_trader import WeeklyStrangleHedgeEngine
 from .enums import NotifyEvent
 from .exchange.rest_client import RestClient
 from .logging_setup import get_logger, setup_logging
@@ -61,6 +62,8 @@ async def run(settings: Settings) -> None:
         engine = DailyStrangle9pmEngine(settings, rest, notifier)
     elif settings.strategy == "strangle9pmladder":
         engine = DailyStrangle9pmLadderedEngine(settings, rest, notifier)
+    elif settings.strategy == "weeklyhedge":
+        engine = WeeklyStrangleHedgeEngine(settings, rest, notifier)
     else:
         engine = RevBreakSellEngine(settings, rest, notifier)
     scheduler = DailyScheduler(settings.daily_summary_hour_utc, engine.daily_summary)

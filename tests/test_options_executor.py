@@ -90,6 +90,17 @@ async def test_close_other_errors_still_raise_and_keep_tracking() -> None:
     assert ex.has_open_position
 
 
+async def test_side_override_buys_at_strike_and_closes_by_selling() -> None:
+    from datetime import date
+    ex = OptionsExecutor(_fake_rest(), _settings(option_side="sell"), side="buy")
+    fill, symbol = await ex.open_option_at_strike(OptionType.CALL, date(2026, 7, 18), 64100)
+    assert symbol == "C-BTC-64000-180726" and ex.tracked_strike == 64000
+    assert ex._rest.place_market_order.call_args.args[2] == Side.BUY
+    await ex.close_option()
+    args = ex._rest.place_market_order.call_args
+    assert args.args[2] == Side.SELL and args.args[3] is True
+
+
 async def test_buy_side_close_sells_reduce_only() -> None:
     ex = OptionsExecutor(_fake_rest(), _settings(option_side="buy"))
     await ex.open_option_by_premium(SignalDir.LONG.value, 500.0)

@@ -594,6 +594,22 @@ class Settings(BaseSettings):
     # ladder itself is new config surface).
     strangle9pm_laddered_otm_pcts: str = "1,1.5,2"
 
+    # --- Weekly short strangle + breakeven hedge (weeklyhedge) ---
+    # scripts/backtest_weekly_strangle_breakeven_hedge.py --hedge-offset 2000:
+    # every entry weekday (Fri) sell CE+PE ~otm_pct%% away on NEXT Friday's
+    # weekly expiry; breakevens = CE strike + combined premium / PE strike -
+    # combined premium. A closed 1m BTC candle beyond a breakeven buys ONE
+    # hedge on that side (strike = breakeven +/- hedge_offset, same expiry,
+    # same lots), held to expiry. Everything closes at exit_hour:minute on
+    # expiry Friday. No target / SL.
+    weekly_entry_weekday: int = 4
+    weekly_entry_hour: int = 21
+    weekly_entry_minute: int = 0
+    weekly_exit_hour: int = 17
+    weekly_exit_minute: int = 25
+    weekly_otm_pct: float = 2.0
+    weekly_hedge_offset: float = 2000.0
+
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
     # the bot force-flattens and resumes hunting instead of polling a dead position

@@ -382,3 +382,26 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # Weekly short strangle + breakeven hedge (DELTA_STRATEGY=weeklyhedge) on its
+  # OWN sub-account. Every Friday 21:00 IST sells CE+PE ~2% away on NEXT
+  # Friday's weekly expiry; a closed 1m BTC candle beyond a breakeven buys one
+  # hedge 2000 further out (held to expiry); everything closes Fri 17:25.
+  # Backtest (12 months, 15 lots): +$200.52, max drawdown -$222.95, worst week
+  # -$92.68. Never executed a real order -- start at 1 lot. Bring up alone:
+  #   docker compose up -d --build weeklyhedgebot
+  weeklyhedgebot:
+    build: .
+    image: deltabot:latest
+    container_name: weeklyhedgebot
+    restart: always
+    env_file:
+      - .env.weeklyhedge
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
