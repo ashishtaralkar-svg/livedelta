@@ -166,3 +166,27 @@ async def test_reconcile_adopts_only_own_state_symbols(tmp_path):
     assert not eng.legs["pe"].executor.has_open_position
     assert position_state.load(eng.legs["pe"].state_file) is None
     assert eng.meta["upper"] == 88522
+
+
+def test_daily_cycle_next_entry_is_every_day():
+    eng, _, _ = _engine(weekly_cycle="daily")
+    mon_10pm = datetime(2026, 10, 5, 22, 0, tzinfo=_IST)
+    assert eng._next_entry(mon_10pm) == datetime(2026, 10, 6, 21, 0, tzinfo=_IST)
+    mon_8pm = datetime(2026, 10, 5, 20, 0, tzinfo=_IST)
+    assert eng._next_entry(mon_8pm) == datetime(2026, 10, 5, 21, 0, tzinfo=_IST)
+
+
+async def test_daily_cycle_sells_next_day_expiry():
+    eng, _, _ = _engine(weekly_cycle="daily")
+    await eng._maybe_enter()
+    expiry = eng.legs["ce"].executor.open_calls[0][1]
+    assert expiry == (datetime.now(_IST) + timedelta(days=1)).date()
+
+
+async def test_hedge_offset_pct_of_entry_spot():
+    eng, rest, _ = _engine(weekly_hedge_offset_pct=1.0)
+    await eng._maybe_enter()
+    rest.btc = eng.meta["lower"] - 100
+    await eng._tick()
+    h = eng.legs["hpe"].executor
+    assert h.open_calls[0][2] == eng.meta["lower"] - 800.0   # 1% of 80000 entry spot

@@ -1,4 +1,8 @@
-"""Weekly short strangle + breakeven-triggered hedge -- live engine (strategy ``weeklyhedge``).
+"""Weekly (or daily) short strangle + breakeven-triggered hedge -- live engine (strategy ``weeklyhedge``).
+
+``weekly_cycle="daily"``: enter every day at the entry time on the NEXT-DAY expiry instead of
+Friday-only on next Friday's; ``weekly_hedge_offset_pct`` puts the hedge that % of entry spot
+beyond the breakeven instead of a fixed point offset.
 
 Port of scripts/backtest_weekly_strangle_breakeven_hedge.py --hedge-offset 2000:
   * Every ``weekly_entry_weekday`` (Fri) at ``weekly_entry_hour:minute`` IST, SELL a CALL
@@ -106,6 +110,8 @@ class WeeklyStrangleHedgeEngine:
     def _next_entry(self, now: datetime) -> datetime:
         s = self.settings
         target = now.replace(hour=s.weekly_entry_hour, minute=s.weekly_entry_minute, second=0, microsecond=0)
+        if s.weekly_cycle == "daily":
+            return target if target > now else target + timedelta(days=1)
         target += timedelta(days=(s.weekly_entry_weekday - now.weekday()) % 7)
         if target <= now:
             target += timedelta(days=7)
@@ -180,7 +186,9 @@ class WeeklyStrangleHedgeEngine:
             if spot is None:
                 log.error("WeeklyHedge: no BTC price — skipping this week's entry")
                 return
-            expiry = next_friday_expiry(datetime.now(_IST))
+            now = datetime.now(_IST)
+            expiry = ((now + timedelta(days=1)).date() if self.settings.weekly_cycle == "daily"
+                      else next_friday_expiry(now))
             off = spot * self.settings.weekly_otm_pct / 100.0
             ce, pe = self.legs["ce"], self.legs["pe"]
 
@@ -260,6 +268,8 @@ class WeeklyStrangleHedgeEngine:
     async def _open_hedge(self, side: str, btc: float) -> None:
         leg = self.legs["hce" if side == "CE" else "hpe"]
         offset = self.settings.weekly_hedge_offset
+        if self.settings.weekly_hedge_offset_pct > 0 and self.meta.get("entry_spot"):
+            offset = self.meta["entry_spot"] * self.settings.weekly_hedge_offset_pct / 100.0
         strike = self.meta["upper"] + offset if side == "CE" else self.meta["lower"] - offset
         expiry = date.fromisoformat(self.meta["expiry"])
         self.busy = True

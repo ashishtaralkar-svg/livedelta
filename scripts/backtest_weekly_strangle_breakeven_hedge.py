@@ -126,7 +126,9 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                             del pos["hedged"][side]
                             continue
                         if hit and side not in pos["hedged"] and (args.exit_hedge_inside or side not in pos["ever"]):
-                            strike = lvl + args.hedge_offset if side == "CE" else lvl - args.hedge_offset
+                            off = (pos["entry_btc"] * args.hedge_offset_pct / 100.0
+                                   if args.hedge_offset_pct > 0 else args.hedge_offset)
+                            strike = lvl + off if side == "CE" else lvl - off
                             h = resolve(client, otype, snap(strike), ts)
                             if h is None:
                                 continue
@@ -139,13 +141,14 @@ def run(candles: list[Candle], settings, args, sim_start: int) -> list[dict]:
                             pos["ever"].add(side)
 
             entry_min = args.entry_hour * 60 + args.entry_minute
-            is_cycle_day = args.daily_entry or (d.weekday() == _FRIDAY and (
+            is_cycle_day = args.daily_entry or args.daily_expiry or (d.weekday() == _FRIDAY and (
                 not args.monthly or (d + timedelta(days=7)).month != d.month))
             if (pos is None and is_cycle_day and key[1] >= entry_min
                     and (prev_key is None or prev_key[0] != key[0] or prev_key[1] < entry_min)
                     and c.start_time >= sim_start):
                 btc = c.close
-                exp = d + timedelta(days=(_FRIDAY - d.weekday()) % 7 or 7)
+                exp = (d + timedelta(days=1) if args.daily_expiry
+                       else d + timedelta(days=(_FRIDAY - d.weekday()) % 7 or 7))
                 if args.monthly:
                     while (exp + timedelta(days=7)).month == exp.month:
                         exp += timedelta(days=7)
@@ -245,6 +248,10 @@ def main() -> None:
                    help="Enter at the entry time on ANY day when flat, selling the coming Friday's weekly expiry.")
     p.add_argument("--monthly", action="store_true",
                    help="Enter on the last Friday of each month and sell next month's last-Friday expiry.")
+    p.add_argument("--daily-expiry", action="store_true",
+                   help="Enter EVERY day and sell the NEXT-DAY expiry (closes 17:25 next day).")
+    p.add_argument("--hedge-offset-pct", type=float, default=0.0,
+                   help="Hedge strike this %% of entry BTC beyond the breakeven (overrides --hedge-offset).")
     p.add_argument("--hedge-offset", type=float, default=0.0,
                    help="Buy the hedge this many points FURTHER out than the breakeven (trigger unchanged).")
     p.add_argument("--exit-hedge-inside", action="store_true",

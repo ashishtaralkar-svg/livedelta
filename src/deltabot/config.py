@@ -609,6 +609,10 @@ class Settings(BaseSettings):
     weekly_exit_minute: int = 25
     weekly_otm_pct: float = 2.0
     weekly_hedge_offset: float = 2000.0
+    # "daily": enter EVERY day at entry_hour:minute on the NEXT-DAY expiry (closes 17:25 next day).
+    weekly_cycle: str = "weekly"
+    # >0: hedge strike is this %% of entry spot beyond the breakeven (overrides weekly_hedge_offset).
+    weekly_hedge_offset_pct: float = 0.0
 
     # Self-heal: how often (seconds) to verify the tracked position still exists on
     # the exchange. If it vanished (closed manually / settled / any external exit),
