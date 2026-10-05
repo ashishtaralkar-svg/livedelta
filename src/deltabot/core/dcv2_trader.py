@@ -2,7 +2,7 @@
 
 Runs DCv2Strategy on 5-minute BTC candles (synthetic Heikin Ashi computed
 internally) and sells options as the execution vehicle -- BUY signal -> SELL a
-PUT near ``target_premium`` (900), SELL signal -> SELL a CALL. This is the
+PUT near ``target_premium`` (1400 in the live config), SELL signal -> SELL a CALL. This is the
 "5m + 70% TP + fri-flat + 25 lots" config validated in scripts/backtest_dcv2.py
 (6mo: +$1,056 net at 25 lots).
 
@@ -102,6 +102,14 @@ class DCv2Engine:
         # Self-heal.
         self._verify_misses = 0
         self._last_verify = 0.0
+        # Strategy trade state saved with the option (state file) -> restored after a restart.
+        self._saved_trade: dict | None = None
+        # Rollover pending across a restart in the 17:25-17:30 gap: (date, trade snapshot).
+        self._saved_roll: dict | None = None
+        # Strategy exit fired but the buy-back order failed -> retried every tick.
+        self._exit_pending: str | None = None
+        # Option positions on this sub-account that the bot did NOT open -> no new entries.
+        self._foreign_symbols: list[str] = []
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -109,6 +117,7 @@ class DCv2Engine:
         await self.notifier.notify(NotifyEvent.RESTART, mode=mode)
         await self._warmup()
         await self._sync_options_to_exchange()
+        self._align_after_restart()
 
         self.ws = WebSocketManager(
             ws_url=self.settings.ws_url,
@@ -147,7 +156,9 @@ class DCv2Engine:
         pass
 
     # ------------------------------------------------------------------ #
-    async def _warmup(self) -> None:
+    async def _warmup(self, reset: bool = False) -> None:
+        if reset:
+            self.strategy.reset()
         now = int(time.time())
         last_closed_end = (now // _BAR_SECONDS) * _BAR_SECONDS
         longest_ema = max(self.settings.dcv2_ema_long_length, self.settings.dcv2_ema_filter_slow)
@@ -196,7 +207,51 @@ class DCv2Engine:
         current_bar = (now // _BAR_SECONDS) * _BAR_SECONDS
         if current_bar - self._last_closed_start > _BAR_SECONDS:
             log.warning("DCv2: candle gap detected — re-seeding")
-            await self._warmup()
+            await self._reseed()
+
+    async def _reseed(self) -> None:
+        """Rebuild indicators from history WITHOUT losing the live trade: replay into a
+        freshly reset strategy (re-feeding already-seen candles into the live one corrupts
+        it), then re-impose the live trade so its SL/exits keep matching the real option."""
+        snap = self.strategy.position_snapshot()
+        await self._warmup(reset=True)
+        if snap["in_long"] or snap["in_short"]:
+            self.strategy.restore_position(snap)
+        elif self.strategy.position_state != PositionState.FLAT:
+            self.strategy.force_flat()   # replayed virtual trade must not trigger a ROLL
+
+    def _align_after_restart(self) -> None:
+        """After a cold start the replayed strategy may disagree with the real option."""
+        if self.executor.has_open_position:
+            trade = self._saved_trade
+            if trade and (trade.get("in_long") or trade.get("in_short")):
+                self.strategy.restore_position(trade)
+                log.info("DCv2: restored trade SL/exit state from state file",
+                         extra={"extra": {"sl_level": trade.get("sl_level")}})
+            else:
+                self.strategy.force_flat()
+                log.error("DCv2: adopted option has no saved SL — only TP / 17:25 square-off "
+                          "will close it")
+                self._spawn(self.notifier.notify(
+                    NotifyEvent.API_ERROR,
+                    detail="DCv2 restarted with an open option but no saved SL; it will only "
+                           "close on TP or 17:25 square-off -- check it manually"))
+            return
+        roll = self._saved_roll
+        now = datetime.now(_IST)
+        resume = now.replace(hour=self.settings.entry_resume_hour,
+                             minute=self.settings.entry_resume_minute, second=0, microsecond=0)
+        if (roll and roll.get("trade") and roll.get("date") == now.date().isoformat()
+                and now < resume):
+            self.strategy.restore_position(roll["trade"])
+            log.info("DCv2: restored trade awaiting 17:30 rollover")
+        elif self.strategy.position_state != PositionState.FLAT:
+            self.strategy.force_flat()   # replayed virtual trade must not trigger a ROLL
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------------ #
     # Intracandle: ASAP entry + ASAP SL (TRAIL/EMA-cross stay closed-bar).
@@ -209,6 +264,8 @@ class DCv2Engine:
         task.add_done_callback(self._tasks.discard)
 
     async def _handle_forming_candle(self, candle: Candle) -> None:
+        if await self._retry_pending_exit(candle.close):
+            return
         if not self.strategy.ready:
             return
         # ASAP SL: REAL price touching the fixed range level closes the leg NOW.
@@ -247,9 +304,14 @@ class DCv2Engine:
             gap = candle.start_time - self._last_closed_start
             if gap > _BAR_SECONDS:
                 log.warning("DCv2: candle gap — re-seeding")
-                await self._warmup()
+                await self._reseed()
+                if self._last_closed_start is not None and self._last_closed_start >= candle.start_time:
+                    self._last_btc_close = candle.close   # the replay already applied this candle
+                    return
         self._last_closed_start = candle.start_time
         self._last_btc_close = candle.close
+
+        await self._retry_pending_exit(candle.close)   # never skip the strategy update
 
         # Strategy update -> closed-bar exits (SL / EMA_CROSS / TRAIL) + entries.
         dec = self.strategy.update(candle)
@@ -309,6 +371,8 @@ class DCv2Engine:
             except asyncio.CancelledError:
                 raise
             await self._maybe_verify_position()
+            if await self._retry_pending_exit(self._last_btc_close or 0.0):
+                continue
             if self._closing or self._tp_price is None or not self.executor.has_open_position:
                 continue
             symbol = self.executor.tracked_symbol
@@ -375,6 +439,7 @@ class DCv2Engine:
         self._closing = True
         try:
             contract = self.executor.tracked_symbol
+            lots = self.executor.tracked_size or self.settings.option_contracts
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
@@ -385,7 +450,6 @@ class DCv2Engine:
                 position_state.clear(self.settings.state_file)
             exit_prem = fill if fill is not None else mark
             entry_prem = self._entry_premium
-            lots = self.settings.option_contracts
             gross = (entry_prem - exit_prem) * lots * 0.001 if entry_prem is not None else 0.0
             self.strategy.force_flat()
             self._entry_premium = self._tp_price = self._current_dir = None
@@ -398,6 +462,17 @@ class DCv2Engine:
         finally:
             self._closing = False
 
+    async def _retry_pending_exit(self, btc_price: float) -> bool:
+        """A strategy exit whose buy-back failed: keep retrying until it succeeds."""
+        if self._exit_pending is None:
+            return False
+        if not self.executor.has_open_position:
+            self._exit_pending = None
+            return False
+        if not self._closing:
+            await self._close_leg(self._exit_pending, btc_exit_price=btc_price)
+        return True
+
     async def _close_leg(self, reason: str, btc_exit_price: float) -> None:
         """Close the option because a strategy exit (SL / EMA_CROSS / TRAIL) fired
         or an intracandle SL was hit. The strategy is already/also flattened."""
@@ -406,16 +481,20 @@ class DCv2Engine:
         self._closing = True
         try:
             contract = self.executor.tracked_symbol
+            lots = self.executor.tracked_size or self.settings.option_contracts
             try:
                 fill = await self.executor.close_option()
             except Exception as exc:  # noqa: BLE001
-                log.error("DCv2: leg close failed", extra={"extra": {"error": str(exc)}})
-                await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"{reason} close: {exc}")
+                log.error("DCv2: leg close failed — will retry every tick",
+                          extra={"extra": {"error": str(exc), "reason": reason}})
+                if self._exit_pending is None:
+                    await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"{reason} close: {exc} (retrying)")
+                self._exit_pending = reason
                 return
+            self._exit_pending = None
             if self.settings.state_file:
                 position_state.clear(self.settings.state_file)
             entry_prem = self._entry_premium
-            lots = self.settings.option_contracts
             gross = ((entry_prem - fill) * lots * 0.001
                      if (entry_prem is not None and fill is not None) else 0.0)
             self._entry_premium = self._tp_price = self._current_dir = None
@@ -466,6 +545,7 @@ class DCv2Engine:
                     product_id=self.executor.tracked_product_id,
                     size=self.settings.option_contracts, entry_premium=fill,
                     tp_price=self._tp_price, direction=signal_dir,
+                    trade=self.strategy.position_snapshot(),
                 )
             direction = "PUT" if is_buy else "CALL"
             log.info("DCv2 entry", extra={"extra": {
@@ -497,7 +577,10 @@ class DCv2Engine:
         saved = position_state.load(state_file) if state_file else None
         owned_symbol = saved.get("symbol") if saved else None
         believe_owned = owned_symbol is not None or self.executor.has_open_position
+        self._saved_trade = saved.get("trade") if saved else None
+        self._saved_roll = saved.get("roll") if saved else None
 
+        positions: list[dict] = []
         shorts: list[dict] = []
         for attempt in range(3):
             try:
@@ -515,16 +598,29 @@ class DCv2Engine:
                         extra={"extra": {"owned": owned_symbol, "attempt": attempt}})
             await asyncio.sleep(1.5)
 
-        if shorts:
-            match = next((p for p in shorts if p.get("symbol") == owned_symbol), shorts[0])
-            if saved and match.get("symbol") == owned_symbol:
-                self._entry_premium = saved.get("entry_premium")
-                self._tp_price = saved.get("tp_price")
-                self._current_dir = saved.get("direction")
-            opt_type = OptionType.CALL if match["symbol"].startswith("C-") else OptionType.PUT
-            self.executor.adopt(match["product_id"], match["size"], opt_type, match.get("symbol"))
+        # Only the position the state file says we opened is ours. Anything else on this
+        # sub-account is untracked: never adopt it (no SL/TP), and block new entries.
+        mine = next((p for p in shorts if owned_symbol and p.get("symbol") == owned_symbol), None)
+        foreign = sorted(p.get("symbol", "?") for p in positions if p is not mine)
+        if foreign != self._foreign_symbols:
+            self._foreign_symbols = foreign
+            if foreign:
+                log.error("DCv2 reconcile: untracked option positions on account — NOT adopting, "
+                          "new entries blocked until they are closed",
+                          extra={"extra": {"symbols": foreign}})
+                await self.notifier.notify(
+                    NotifyEvent.API_ERROR,
+                    detail=f"DCv2: untracked positions {foreign} on the account -- not adopted, "
+                           "entries blocked until closed")
+
+        if mine is not None:
+            self._entry_premium = saved.get("entry_premium")
+            self._tp_price = saved.get("tp_price")
+            self._current_dir = saved.get("direction")
+            opt_type = OptionType.CALL if mine["symbol"].startswith("C-") else OptionType.PUT
+            self.executor.adopt(mine["product_id"], mine["size"], opt_type, mine.get("symbol"))
             log.info("DCv2 reconcile: adopted open short",
-                     extra={"extra": {"symbol": match["symbol"]}})
+                     extra={"extra": {"symbol": mine["symbol"]}})
             return
 
         if believe_owned:
@@ -557,6 +653,8 @@ class DCv2Engine:
     # handler (re-sells while the directional trade is still open).
     # ------------------------------------------------------------------ #
     def _entries_blocked(self) -> bool:
+        if self._foreign_symbols:
+            return True
         now = datetime.now(_IST)
         if now.weekday() in self.settings.skip_weekday_ints:
             return True
@@ -610,11 +708,11 @@ class DCv2Engine:
         if self.executor.has_open_position:
             try:
                 contract = self.executor.tracked_symbol
+                lots = self.executor.tracked_size or self.settings.option_contracts
                 fill = await self.executor.close_option()
                 if self.settings.state_file:
                     position_state.clear(self.settings.state_file)
                 entry_prem = self._entry_premium
-                lots = self.settings.option_contracts
                 gross = ((entry_prem - fill) * lots * 0.001
                          if (entry_prem is not None and fill is not None) else 0.0)
                 self._entry_premium = self._tp_price = self._current_dir = None
@@ -623,8 +721,12 @@ class DCv2Engine:
                     entry_premium=entry_prem, exit_premium=fill, pnl=round(gross, 2), size=lots,
                 )
             except Exception as exc:  # noqa: BLE001
-                log.error("DCv2: square-off close failed", extra={"extra": {"error": str(exc)}})
-                await self._sync_options_to_exchange()
+                log.error("DCv2: square-off close failed — will retry every tick",
+                          extra={"extra": {"error": str(exc)}})
+                await self.notifier.notify(NotifyEvent.API_ERROR, detail=f"{reason} close: {exc} (retrying)")
+                self._exit_pending = reason
+                if weekend_flat:
+                    self.strategy.force_flat()
                 return
         # Friday: end the directional trade entirely (no weekend rollover).
         if weekend_flat:
@@ -636,6 +738,11 @@ class DCv2Engine:
         # over the gapped version). Mon-Thu, gapped mode (default): leave the
         # option flat here; the 17:30 rollover in _handle_closed_candle re-sells
         # it once _entries_blocked() clears.
+        if still_open and not continuous_roll and self.settings.state_file:
+            # Remember the trade awaiting the 17:30 rollover so a restart in the gap resumes it.
+            position_state.save(self.settings.state_file,
+                                roll={"date": now.date().isoformat(),
+                                      "trade": self.strategy.position_snapshot()})
         if continuous_roll:
             state = self.strategy.position_state
             if state == PositionState.FLAT:

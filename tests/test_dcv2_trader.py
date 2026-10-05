@@ -24,6 +24,7 @@ class FakeExecutor:
         self.has_open_position = False
         self.tracked_symbol: str | None = None
         self.tracked_product_id: int | None = None
+        self.tracked_size = 0
         self.underlying = "BTC"
         self.open_calls: list[tuple[int, float]] = []
         self.close_calls = 0
@@ -409,3 +410,75 @@ def test_entries_not_blocked_on_weekday(monkeypatch) -> None:
     engine = _make_engine(skip_weekdays="Sat,Sun")
     _fake_now(monkeypatch, datetime(2026, 7, 8, 12, 0, tzinfo=_ist))  # Wednesday
     assert engine._entries_blocked() is False
+
+
+# ---------------------------------------------------------------------- #
+# Review fixes: gap replay keeps the live trade, restart restores SL,
+# failed buy-backs retry, untracked positions are never adopted.
+# ---------------------------------------------------------------------- #
+async def test_reseed_keeps_live_trade_even_if_replay_ends_flat(monkeypatch) -> None:
+    engine = _make_engine()
+    engine.strategy._in_long, engine.strategy._sl_level = True, 59000.0
+
+    async def fake_warmup(reset=False):
+        assert reset is True
+        engine.strategy.reset()          # replay ended flat
+    monkeypatch.setattr(engine, "_warmup", fake_warmup)
+    await engine._reseed()
+    assert engine.strategy.position_state == PositionState.LONG
+    assert engine.strategy.sl_level == 59000.0
+
+
+async def test_reseed_drops_replayed_trade_when_live_is_flat(monkeypatch) -> None:
+    engine = _make_engine()
+
+    async def fake_warmup(reset=False):
+        engine.strategy.reset()
+        engine.strategy._in_short, engine.strategy._sl_level = True, 61000.0   # replay's own trade
+    monkeypatch.setattr(engine, "_warmup", fake_warmup)
+    await engine._reseed()
+    assert engine.strategy.position_state == PositionState.FLAT   # no phantom ROLL
+
+
+async def test_restart_restores_saved_sl_for_adopted_option(tmp_path) -> None:
+    from deltabot.core import position_state
+    sf = str(tmp_path / "dcv2.json")
+    engine = _make_engine(state_file=sf)
+    trade = {"in_long": True, "in_short": False, "sl_level": 59000.0, "target_level": None,
+             "exit_mode": "cross", "trail_armed": False}
+    position_state.save(sf, symbol="P-BTC-60000-070726", product_id=123, size=25,
+                        entry_premium=900.0, tp_price=270.0, direction=SignalDir.LONG.value, trade=trade)
+    engine.rest = FakeRest(positions=[{"symbol": "P-BTC-60000-070726", "size": -25, "product_id": 123}])
+    await engine._sync_options_to_exchange()
+    engine._align_after_restart()
+    assert engine.executor.has_open_position
+    assert engine.strategy.position_state == PositionState.LONG and engine.strategy.sl_level == 59000.0
+    assert engine._tp_price == 270.0
+
+
+async def test_restart_never_adopts_untracked_position_and_blocks_entries(tmp_path) -> None:
+    engine = _make_engine(state_file=str(tmp_path / "dcv2.json"))
+    engine.rest = FakeRest(positions=[{"symbol": "P-BTC-85400-021026", "size": -2, "product_id": 9}])
+    await engine._sync_options_to_exchange()
+    assert not engine.executor.has_open_position
+    assert engine._entries_blocked()
+    engine.notifier.notify.assert_awaited()
+
+
+async def test_failed_sl_buyback_is_retried_until_it_succeeds() -> None:
+    engine = _make_engine()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    calls = {"n": 0}
+    real_close = engine.executor.close_option
+
+    async def flaky_close():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("timeout")
+        return await real_close()
+    engine.executor.close_option = flaky_close
+    engine.strategy.force_flat()
+    await engine._close_leg("SL", btc_exit_price=59000.0)
+    assert engine.executor.has_open_position and engine._exit_pending == "SL"
+    assert await engine._retry_pending_exit(58900.0)
+    assert not engine.executor.has_open_position and engine._exit_pending is None

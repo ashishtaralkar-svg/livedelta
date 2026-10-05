@@ -396,6 +396,22 @@ class DCv2Strategy:
         self._clear_pending()
         self._clear_hunts()
 
+    def position_snapshot(self) -> dict:
+        """The open trade's exit-relevant state, for re-imposing after a replay/restart."""
+        return {"in_long": self._in_long, "in_short": self._in_short, "sl_level": self._sl_level,
+                "target_level": self._target_level, "exit_mode": self._exit_mode,
+                "trail_armed": self._trail_armed}
+
+    def restore_position(self, snap: dict) -> None:
+        """Re-impose a live trade (from ``position_snapshot``); pending setups and hunts are cleared."""
+        self.force_flat()
+        self._in_long = bool(snap.get("in_long"))
+        self._in_short = bool(snap.get("in_short")) and not self._in_long
+        self._sl_level = snap.get("sl_level")
+        self._target_level = snap.get("target_level")
+        self._exit_mode = snap.get("exit_mode") or "cross"
+        self._trail_armed = bool(snap.get("trail_armed"))
+
     def enter_tp_cooldown(self) -> None:
         """Called by the runner/engine right after a 70% TP is booked. Arms the
         wait-for-crossover pause (no-op unless tp_cooldown_until_cross is on)."""
