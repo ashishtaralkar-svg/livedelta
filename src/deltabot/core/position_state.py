@@ -18,14 +18,31 @@ from ..logging_setup import get_logger
 log = get_logger(__name__)
 
 
-def save(path: str, **fields: Any) -> None:
-    """Write ``fields`` to the state file at ``path`` (creates parent dirs)."""
+def save(path: str, **fields: Any) -> bool:
+    """Write ``fields`` to the state file at ``path`` (creates parent dirs).
+    Returns False if the write failed (e.g. the mounted dir is not writable)."""
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(fields))
+        return True
     except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to write position state file", extra={"extra": {"path": path, "error": str(exc)}})
+        log.error("Failed to write position state file", extra={"extra": {"path": path, "error": str(exc)}})
+        return False
+
+
+def check_writable(path: str) -> str | None:
+    """Probe that the state file's directory accepts writes. Returns an error
+    string if not (a root-owned bind mount after a fresh clone is the usual cause)."""
+    try:
+        d = Path(path).parent
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / f".{Path(path).name}.probe"
+        probe.write_text("ok")
+        probe.unlink()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
 
 
 def load(path: str) -> dict | None:

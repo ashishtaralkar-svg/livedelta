@@ -482,3 +482,75 @@ async def test_failed_sl_buyback_is_retried_until_it_succeeds() -> None:
     assert engine.executor.has_open_position and engine._exit_pending == "SL"
     assert await engine._retry_pending_exit(58900.0)
     assert not engine.executor.has_open_position and engine._exit_pending is None
+
+
+# ---------------------------------------------------------------------- #
+# Own-position recognition + periodic untracked-position re-check (2026-10-12:
+# an unwritable state dir made a WS reconnect flag the bot's OWN put as
+# "untracked", which blocked entries for 12h and cost a signal).
+# ---------------------------------------------------------------------- #
+async def test_reconnect_recognises_tracked_position_without_state_file(monkeypatch) -> None:
+    _fake_now(monkeypatch, datetime(2026, 10, 12, 10, 0, tzinfo=_ist))   # Monday
+    engine = _make_engine()   # state_file="" -> nothing saved, like the unwritable dir
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.rest = FakeRest(positions=[{"symbol": "P-BTC-60000-070726", "size": -25, "product_id": 123}])
+    await engine._sync_options_to_exchange()
+    assert engine._foreign_symbols == []
+    assert not engine._entries_blocked()
+    assert engine.executor.has_open_position
+    assert engine._tp_price == pytest.approx(270.0)   # live values kept, not wiped
+
+
+async def test_block_lifts_on_periodic_check_once_untracked_position_is_gone(monkeypatch) -> None:
+    _fake_now(monkeypatch, datetime(2026, 10, 12, 10, 0, tzinfo=_ist))
+    engine = _make_engine()
+    engine.rest = FakeRest(positions=[{"symbol": "P-BTC-85400-021026", "size": -2, "product_id": 9}])
+    await engine._sync_options_to_exchange()
+    assert engine._entries_blocked()
+    engine.rest = FakeRest(positions=[])
+    engine._last_foreign_check = 0.0
+    await engine._refresh_foreign()
+    assert not engine._entries_blocked()
+    details = [c.kwargs.get("detail", "") for c in engine.notifier.notify.await_args_list]
+    assert any("unblocked" in d for d in details)
+
+
+async def test_new_untracked_position_blocks_only_after_two_sightings(monkeypatch) -> None:
+    _fake_now(monkeypatch, datetime(2026, 10, 12, 10, 0, tzinfo=_ist))
+    engine = _make_engine()
+    engine.rest = FakeRest(positions=[{"symbol": "C-BTC-90000-121026", "size": -1, "product_id": 7}])
+    engine._last_foreign_check = 0.0
+    await engine._refresh_foreign()
+    assert not engine._entries_blocked()          # first sighting: could be exchange lag
+    engine._last_foreign_check = 0.0
+    await engine._refresh_foreign()
+    assert engine._entries_blocked()              # confirmed
+
+
+async def test_periodic_check_never_flags_the_bots_own_position(monkeypatch) -> None:
+    _fake_now(monkeypatch, datetime(2026, 10, 12, 10, 0, tzinfo=_ist))
+    engine = _make_engine()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.rest = FakeRest(positions=[{"symbol": "P-BTC-60000-070726", "size": -25, "product_id": 123}])
+    for _ in range(3):
+        engine._last_foreign_check = 0.0
+        await engine._refresh_foreign()
+    assert not engine._entries_blocked()
+
+
+async def test_state_write_failure_is_alerted(monkeypatch, tmp_path) -> None:
+    from deltabot.core import position_state
+    monkeypatch.setattr(position_state, "save", lambda *a, **k: False)
+    engine = _make_engine(state_file=str(tmp_path / "dcv2.json"))
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    details = [c.kwargs.get("detail", "") for c in engine.notifier.notify.await_args_list]
+    assert any("could not save" in d for d in details)
+
+
+def test_check_writable_reports_an_unwritable_dir(tmp_path) -> None:
+    from deltabot.core import position_state
+    assert position_state.check_writable(str(tmp_path / "ok" / "dcv2.json")) is None
+    blocker = tmp_path / "file"
+    blocker.write_text("x")                      # a FILE where the dir should be
+    assert position_state.check_writable(str(blocker / "dcv2.json")) is not None
+    assert position_state.save(str(blocker / "dcv2.json"), a=1) is False

@@ -199,9 +199,24 @@ class OptionsExecutor:
             await self._maybe_set_leverage(best["product_id"])   # leverage/margin is a sell-side concept
 
         size = self._settings.option_contracts
-        result = await asyncio.to_thread(
-            self._rest.place_market_order, best["product_id"], size, open_side
-        )
+        try:
+            result = await asyncio.to_thread(
+                self._rest.place_market_order, best["product_id"], size, open_side
+            )
+            fill = result.average_fill_price
+        except OptionsMarginError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # The order may have reached the exchange even though the reply was lost
+            # (timeout / connection reset). Never leave a live position untracked: look
+            # for it, and adopt it if it is there; otherwise the order really failed.
+            await asyncio.sleep(1.5)
+            filled = await self._find_open_position(best["product_id"])
+            if filled is None:
+                raise
+            log.warning("Order reply lost but the position IS open — tracking it",
+                        extra={"extra": {"product_id": best["product_id"], "error": str(exc)}})
+            fill = filled.get("entry_price")
 
         self._product_id = best["product_id"]
         self._size = size
@@ -209,14 +224,29 @@ class OptionsExecutor:
         self._symbol = best["symbol"]
         self._strike = best["strike"]
 
+        if fill is None:
+            # Filled but the reply carried no average price: use the position's entry,
+            # else the mark, so the caller can still set its TP/SL instead of treating
+            # a LIVE position as a failed order.
+            pos = await self._find_open_position(best["product_id"])
+            fill = (pos or {}).get("entry_price") or best["mark_price"]
+
         log.info(
             f"Option {open_side.value.upper()} (by premium) placed",
             extra={"extra": {
                 "product_id": best["product_id"], "size": size,
-                "fill_price": result.average_fill_price, "mark_price": best["mark_price"],
+                "fill_price": fill, "mark_price": best["mark_price"],
             }},
         )
-        return result.average_fill_price, best["symbol"]
+        return fill, best["symbol"]
+
+    async def _find_open_position(self, product_id: int) -> dict | None:
+        try:
+            positions = await asyncio.to_thread(self._rest.get_option_positions, self.underlying)
+        except Exception:  # noqa: BLE001
+            return None
+        return next((p for p in positions
+                     if p.get("product_id") == product_id and p.get("size")), None)
 
     async def select_by_otm_pct(
         self, signal_dir: int, btc_price: float, otm_pct: float

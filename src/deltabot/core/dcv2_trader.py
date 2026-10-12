@@ -110,11 +110,27 @@ class DCv2Engine:
         self._exit_pending: str | None = None
         # Option positions on this sub-account that the bot did NOT open -> no new entries.
         self._foreign_symbols: list[str] = []
+        # Periodic re-check of foreign positions (so the block lifts as soon as they are
+        # gone, and new ones are caught without waiting for a reconnect).
+        self._last_foreign_check = 0.0
+        self._foreign_candidate: list[str] | None = None   # seen once; flagged on 2nd sighting
+        self._state_write_alerted = False
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         mode = "TESTNET" if self.settings.testnet else "LIVE"
         await self.notifier.notify(NotifyEvent.RESTART, mode=mode)
+        if self.settings.state_file and not self.settings.paper_mode:
+            err = position_state.check_writable(self.settings.state_file)
+            if err:
+                self._state_write_alerted = True
+                log.error("DCv2: state file NOT writable — trades will not survive a "
+                          "reconnect/restart", extra={"extra": {"path": self.settings.state_file,
+                                                               "error": err}})
+                await self.notifier.notify(
+                    NotifyEvent.API_ERROR,
+                    detail=f"DCv2: state file {self.settings.state_file} is NOT writable ({err}). "
+                           "Fix on the host: sudo chown -R 10001:10001 state && restart")
         await self._warmup()
         await self._sync_options_to_exchange()
         self._align_after_restart()
@@ -371,6 +387,10 @@ class DCv2Engine:
             except asyncio.CancelledError:
                 raise
             await self._maybe_verify_position()
+            try:
+                await self._refresh_foreign()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("DCv2: foreign refresh error", extra={"extra": {"error": str(exc)}})
             if await self._retry_pending_exit(self._last_btc_close or 0.0):
                 continue
             if self._closing or self._tp_price is None or not self.executor.has_open_position:
@@ -540,13 +560,19 @@ class DCv2Engine:
             self._tp_price = fill * self._tp_mult
             self._current_dir = signal_dir
             if self.settings.state_file:
-                position_state.save(
+                ok = position_state.save(
                     self.settings.state_file, symbol=symbol or "",
                     product_id=self.executor.tracked_product_id,
                     size=self.settings.option_contracts, entry_premium=fill,
                     tp_price=self._tp_price, direction=signal_dir,
                     trade=self.strategy.position_snapshot(),
                 )
+                if not ok and not self._state_write_alerted:
+                    self._state_write_alerted = True
+                    await self.notifier.notify(
+                        NotifyEvent.API_ERROR,
+                        detail=f"DCv2: could not save {self.settings.state_file} -- the open trade "
+                               "will not survive a restart. Fix: sudo chown -R 10001:10001 state")
             direction = "PUT" if is_buy else "CALL"
             log.info("DCv2 entry", extra={"extra": {
                 "tag": tag, "direction": direction, "symbol": symbol, "fill": fill,
@@ -573,9 +599,16 @@ class DCv2Engine:
             self._closing = False
             log.info("DCv2 (paper): reconcile skipped — starting FLAT")
             return
+        # An order in flight (entry fill / buy-back) would show up on the exchange
+        # before the executor tracks it -> it must not be mistaken for a foreign position.
+        for _ in range(60):
+            if not (self._entry_in_progress or self._closing):
+                break
+            await asyncio.sleep(0.5)
         state_file = self.settings.state_file
         saved = position_state.load(state_file) if state_file else None
         owned_symbol = saved.get("symbol") if saved else None
+        tracked_pid = self.executor.tracked_product_id if self.executor.has_open_position else None
         believe_owned = owned_symbol is not None or self.executor.has_open_position
         self._saved_trade = saved.get("trade") if saved else None
         self._saved_roll = saved.get("roll") if saved else None
@@ -598,25 +631,24 @@ class DCv2Engine:
                         extra={"extra": {"owned": owned_symbol, "attempt": attempt}})
             await asyncio.sleep(1.5)
 
-        # Only the position the state file says we opened is ours. Anything else on this
-        # sub-account is untracked: never adopt it (no SL/TP), and block new entries.
-        mine = next((p for p in shorts if owned_symbol and p.get("symbol") == owned_symbol), None)
+        # Ours = the position the state file says we opened, OR the one the executor is
+        # already tracking in memory (covers a state file that could not be written).
+        # Anything else on this sub-account is untracked: never adopt it (no SL/TP), and
+        # block new entries.
+        mine = next((p for p in shorts
+                     if (owned_symbol and p.get("symbol") == owned_symbol)
+                     or (tracked_pid is not None and p.get("product_id") == tracked_pid)), None)
         foreign = sorted(p.get("symbol", "?") for p in positions if p is not mine)
-        if foreign != self._foreign_symbols:
-            self._foreign_symbols = foreign
-            if foreign:
-                log.error("DCv2 reconcile: untracked option positions on account — NOT adopting, "
-                          "new entries blocked until they are closed",
-                          extra={"extra": {"symbols": foreign}})
-                await self.notifier.notify(
-                    NotifyEvent.API_ERROR,
-                    detail=f"DCv2: untracked positions {foreign} on the account -- not adopted, "
-                           "entries blocked until closed")
+        await self._set_foreign(foreign)
+        self._foreign_candidate = None
+        self._last_foreign_check = time.time()
 
         if mine is not None:
-            self._entry_premium = saved.get("entry_premium")
-            self._tp_price = saved.get("tp_price")
-            self._current_dir = saved.get("direction")
+            if saved and saved.get("symbol") == mine.get("symbol"):
+                self._entry_premium = saved.get("entry_premium")
+                self._tp_price = saved.get("tp_price")
+                self._current_dir = saved.get("direction")
+            # else: matched via in-memory tracking -- keep the live entry/TP values.
             opt_type = OptionType.CALL if mine["symbol"].startswith("C-") else OptionType.PUT
             self.executor.adopt(mine["product_id"], mine["size"], opt_type, mine.get("symbol"))
             log.info("DCv2 reconcile: adopted open short",
@@ -647,6 +679,62 @@ class DCv2Engine:
             self.strategy.force_flat()
         self._closing = False
         log.info("DCv2 reconcile: no owned position — state FLAT")
+
+    async def _set_foreign(self, foreign: list[str]) -> None:
+        """Update the untracked-position block; alert when it turns on AND when it lifts."""
+        if foreign == self._foreign_symbols:
+            return
+        was_blocked = bool(self._foreign_symbols)
+        self._foreign_symbols = foreign
+        if foreign:
+            log.error("DCv2 reconcile: untracked option positions on account — NOT adopting, "
+                      "new entries blocked until they are closed",
+                      extra={"extra": {"symbols": foreign}})
+            await self.notifier.notify(
+                NotifyEvent.API_ERROR,
+                detail=f"DCv2: untracked positions {foreign} on the account -- not adopted, "
+                       "entries blocked until closed")
+        elif was_blocked:
+            log.info("DCv2: untracked positions gone — entries unblocked")
+            await self.notifier.notify(
+                NotifyEvent.API_ERROR,
+                detail="DCv2: untracked positions are gone -- entries unblocked")
+
+    async def _refresh_foreign(self) -> None:
+        """Re-check the account for positions the bot does not own, every
+        ``position_verify_seconds`` (not just on reconnect): the block lifts as soon as
+        they are gone, and a new one (manual order, an entry whose response was lost)
+        is caught within a minute. A NEW foreign set must be seen twice in a row before
+        it blocks, so exchange lag right after our own close never blocks entries."""
+        if self.settings.paper_mode:
+            return
+        iv = self.settings.position_verify_seconds
+        if iv <= 0 or self._closing or self._entry_in_progress:
+            return
+        now = time.time()
+        if now - self._last_foreign_check < iv:
+            return
+        self._last_foreign_check = now
+        try:
+            positions = await asyncio.to_thread(
+                self.rest.get_option_positions, self.executor.underlying
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DCv2: foreign-position check failed", extra={"extra": {"error": str(exc)}})
+            return
+        if self._closing or self._entry_in_progress:
+            return   # an order landed while we were fetching; judge on the next pass
+        tracked = self.executor.tracked_product_id if self.executor.has_open_position else None
+        foreign = sorted(p.get("symbol", "?") for p in positions
+                         if tracked is None or p.get("product_id") != tracked)
+        if not foreign or set(foreign) <= set(self._foreign_symbols):
+            self._foreign_candidate = None
+            await self._set_foreign(foreign)        # lifting / shrinking applies at once
+        elif foreign == self._foreign_candidate:
+            self._foreign_candidate = None
+            await self._set_foreign(foreign)        # confirmed on two consecutive checks
+        else:
+            self._foreign_candidate = foreign
 
     # ------------------------------------------------------------------ #
     # Daily 17:25 square-off + Friday-flat; 17:30 rollover is in the closed-bar

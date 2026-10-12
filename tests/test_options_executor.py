@@ -346,3 +346,40 @@ async def test_trade_price_and_balance_fraction_guarded_when_already_open() -> N
         SignalDir.LONG.value, 102.0, 0.10, None)
     assert (fill, symbol, lots) == (None, None, 0)
     ex._rest.place_market_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------- #
+# A live position must never be left untracked (no SL/TP behind it).
+# ---------------------------------------------------------------------- #
+async def test_lost_order_reply_adopts_the_position_that_did_fill(monkeypatch) -> None:
+    monkeypatch.setattr("deltabot.core.options_executor.asyncio.sleep", AsyncMock())
+    rest = _fake_rest()
+    rest.place_market_order = MagicMock(side_effect=TimeoutError("read timeout"))
+    rest.get_option_positions = MagicMock(return_value=[
+        {"product_id": 222, "size": -25, "symbol": "P-BTC-64000-180726", "entry_price": 905.0}])
+    ex = OptionsExecutor(rest, _settings())
+    fill, symbol = await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    assert (fill, symbol) == (905.0, "P-BTC-64000-180726")
+    assert ex.has_open_position and ex.tracked_product_id == 222
+
+
+async def test_lost_order_reply_with_no_position_still_raises(monkeypatch) -> None:
+    monkeypatch.setattr("deltabot.core.options_executor.asyncio.sleep", AsyncMock())
+    rest = _fake_rest()
+    rest.place_market_order = MagicMock(side_effect=TimeoutError("read timeout"))
+    rest.get_option_positions = MagicMock(return_value=[])
+    ex = OptionsExecutor(rest, _settings())
+    with pytest.raises(TimeoutError):
+        await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    assert not ex.has_open_position
+
+
+async def test_fill_without_average_price_uses_position_entry() -> None:
+    rest = _fake_rest()
+    rest.place_market_order = MagicMock(return_value=OrderResult(
+        order_id=1, product_id=222, side=Side.SELL, size=25, average_fill_price=None))
+    rest.get_option_positions = MagicMock(return_value=[
+        {"product_id": 222, "size": -25, "symbol": "P-BTC-64000-180726", "entry_price": 897.5}])
+    ex = OptionsExecutor(rest, _settings())
+    fill, _ = await ex.open_option_by_premium(SignalDir.LONG.value, 900.0)
+    assert fill == 897.5 and ex.has_open_position
