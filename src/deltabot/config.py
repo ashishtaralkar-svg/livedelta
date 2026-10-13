@@ -210,6 +210,9 @@ class Settings(BaseSettings):
     # doesn't simulate intracandle fills, so real live improvement may differ.
     # False (default) = today's live behavior unchanged.
     dcv2_require_ema_direction_at_trigger: bool = False
+    # Drop an armed setup when EMA(trend) crosses EMA(long), so it can't fire against
+    # the new trend. Off by default (backtest-verify before enabling).
+    dcv2_clear_pending_on_trend_flip: bool = False
     # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
     # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
     # missed/unexpected signal be reconstructed minute-by-minute from the live

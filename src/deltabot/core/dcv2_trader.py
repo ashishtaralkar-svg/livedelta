@@ -77,6 +77,7 @@ class DCv2Engine:
             square_off_minute=settings.square_off_minute,
             no_settlement_gap=settings.dcv2_continuous_roll,
             require_ema_direction_at_trigger=settings.dcv2_require_ema_direction_at_trigger,
+            clear_pending_on_trend_flip=settings.dcv2_clear_pending_on_trend_flip,
         )
         self.executor = (PaperExecutor(rest, settings) if settings.paper_mode
                          else OptionsExecutor(rest, settings))
@@ -294,6 +295,9 @@ class DCv2Engine:
                 log.info("DCv2: intracandle SL touch — closing ASAP",
                          extra={"extra": {"sl": sl, "price": candle.close}})
                 self.strategy.force_flat()
+                # The SL bar must not count toward a new setup (the backtest's closed-bar
+                # SL skips it); without this, live armed setups the backtest never had.
+                self.strategy.mark_intracandle_exit()
                 await self._close_leg("SL", btc_exit_price=sl if sl is not None else candle.close)
                 return
         # ASAP entry: the instant REAL price breaks the pending trigger.

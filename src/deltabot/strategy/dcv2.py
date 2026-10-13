@@ -185,6 +185,7 @@ class DCv2Strategy:
         entry_start_hour: int = 0,
         entry_end_hour: int = 24,
         require_ema_direction_at_trigger: bool = False,
+        clear_pending_on_trend_flip: bool = False,
     ) -> None:
         self.dc_period = dc_period
         self.ema_trend_length = ema_trend_length
@@ -294,6 +295,9 @@ class DCv2Strategy:
         # convention as the other trigger-time filters. Off (default) =
         # unchanged behavior.
         self.require_ema_direction_at_trigger = require_ema_direction_at_trigger
+        # A pending setup armed under the old EMA state is dropped when EMA(trend)
+        # crosses EMA(long) (otherwise it can fire AGAINST the new trend).
+        self.clear_pending_on_trend_flip = clear_pending_on_trend_flip
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -343,6 +347,7 @@ class DCv2Strategy:
         # _prev_sign_*: last bar's sign of (fast - slow) for each EMA pair, used
         # to detect a crossover (sign flip). 0 = not yet determined.
         self._tp_cooldown = False
+        self._skip_hunt_bar = False
         self._prev_sign_5020 = 0
         self._prev_sign_150600 = 0
 
@@ -386,6 +391,12 @@ class DCv2Strategy:
             "pos": self.position_state.name, "sl_level": r(self._sl_level),
             "exit_mode": self._exit_mode,
         }
+
+    def mark_intracandle_exit(self) -> None:
+        """Live engine closed the trade INSIDE the current bar (ASAP SL): the bar's
+        close must then be treated like a closed-bar SL bar -- it never counts toward
+        a new setup (just_closed_sl), exactly as the backtest processes it."""
+        self._skip_hunt_bar = True
 
     def force_flat(self) -> None:
         self._in_long = self._in_short = False
@@ -652,9 +663,13 @@ class DCv2Strategy:
             elif ema_trend > ema_long and not self._hunt_bull:
                 self._hunt_bull, self._hunt_bear = True, False
                 self._reset_ranges()
+                if self.clear_pending_on_trend_flip and self._pending_short:
+                    self._clear_pending()
             elif ema_trend < ema_long and not self._hunt_bear:
                 self._hunt_bear, self._hunt_bull = True, False
                 self._reset_ranges()
+                if self.clear_pending_on_trend_flip and self._pending_long:
+                    self._clear_pending()
 
         long_exit = short_exit = False
         long_exit_price = short_exit_price = candle.close
@@ -662,7 +677,8 @@ class DCv2Strategy:
         buy_signal = sell_signal = False
         entry_price = candle.close
         new_sl: float | None = None
-        just_closed_sl = False
+        just_closed_sl = self._skip_hunt_bar   # live intracandle SL on this bar
+        self._skip_hunt_bar = False
 
         # --- 1/2. Exits: fixed SL (REAL price at the range extreme), or the EMA
         #     relationship flipping against the position. session_line mode adds

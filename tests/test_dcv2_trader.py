@@ -565,3 +565,36 @@ async def test_eth_pnl_uses_eth_lot_size() -> None:
     await engine._close_leg("SL", btc_exit_price=2480.0)
     pnl = _exit_calls(engine.notifier)[-1].kwargs["pnl"]
     assert pnl == pytest.approx(14.0)
+
+
+async def test_intracandle_sl_bar_never_counts_toward_a_new_setup() -> None:
+    """Backtest parity: a closed-bar SL skips that bar for hunting; the live ASAP SL
+    must mark the bar the same way (2026-10-14: live armed a setup on the SL bar)."""
+    engine = _make_engine()
+    engine.strategy.mark_intracandle_exit()
+    assert engine.strategy._skip_hunt_bar is True
+    engine.strategy.update(_c(1_000_000))
+    assert engine.strategy._skip_hunt_bar is False   # consumed by exactly one bar
+
+
+def test_pending_cleared_on_trend_flip_only_when_enabled() -> None:
+    """A buy setup armed in an uptrend must not survive EMA(trend) crossing below
+    EMA(long) when the option is on (2026-10-14: a stale buy setup fired into a downtrend)."""
+    from deltabot.strategy.dcv2 import DCv2Strategy
+    noon = int(datetime(2026, 10, 14, 12, 0, tzinfo=_ist).timestamp())
+    for flag, expect_pending in ((False, True), (True, False)):
+        s = DCv2Strategy(dc_period=3, ema_trend_length=2, ema_long_length=4,
+                         clear_pending_on_trend_flip=flag)
+        t = noon
+        for i in range(12):                       # steady rise -> EMA2 > EMA4 (bull)
+            px = 100.0 + i
+            s.update(_c(t, o=px, h=px + 0.5, low=px - 0.5, cl=px + 0.4))
+            t += 300
+        assert s.ready and s._hunt_bull
+        s._clear_pending()
+        s._pending_long, s._pending_trigger, s._pending_sl = True, 1e9, -1e9
+        for _ in range(3):                        # sharp fall -> EMA2 < EMA4 (bear flip)
+            s.update(_c(t, o=90.0, h=90.5, low=80.0, cl=80.0))
+            t += 300
+        assert s._hunt_bear
+        assert s.has_pending is expect_pending
