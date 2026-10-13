@@ -4,6 +4,7 @@
 .env.heikinashi
 .env.dchannel
 .env.dcv2
+.env.dcv2eth
 .env.dcv3
 .env.dcv2sim
 .env.tcp

@@ -48,13 +48,15 @@ def _format(event: NotifyEvent, ctx: dict) -> str:
             verb = "BUY" if is_buy_side else "SELL"
             head = f"ROLLOVER {verb}" if ctx.get("tag") == "ROLL" else f"{verb} {ctx.get('direction')}"
             prem_label = "Buy premium" if is_buy_side else "Sell premium"
+            parts = str(ctx.get("contract")).split("-")
+            asset = parts[1] if len(parts) > 2 else "BTC"   # C-ETH-2500-141026 -> ETH
             msg = (
                 f"{emoji} <b>{head}</b> {ctx.get('contract')}\n"
                 f"{prem_label}: {_num(ctx.get('premium'))}\n"
-                f"BTC: {_num(ctx.get('btc_price'))}"
+                f"{asset}: {_num(ctx.get('btc_price'))}"
             )
             if ctx.get("sl_level") is not None:
-                msg += f"\nBTC stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
+                msg += f"\n{asset} stop: {_num(ctx.get('sl_level'))}  |  Opt TP: {_num(ctx.get('tp_price'))}"
             # Leverage: only shown when option_leverage>0 actually made the
             # executor attempt to set it (leverage_ok is None otherwise --
             # buy-side or option_leverage<=0 -- see OptionsExecutor.

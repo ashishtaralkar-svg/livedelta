@@ -554,3 +554,14 @@ def test_check_writable_reports_an_unwritable_dir(tmp_path) -> None:
     blocker.write_text("x")                      # a FILE where the dir should be
     assert position_state.check_writable(str(blocker / "dcv2.json")) is not None
     assert position_state.save(str(blocker / "dcv2.json"), a=1) is False
+
+
+async def test_eth_pnl_uses_eth_lot_size() -> None:
+    """ETH options are 0.01 ETH per lot (BTC 0.001): a 40 -> 12 buy-back on 50 lots = $14."""
+    engine = _make_engine(symbol="ETHUSD", option_contracts=50)
+    engine.executor._open_result = (40.0, "P-ETH-2500-141026")
+    engine.executor._close_result = 12.0
+    await engine._open_entry(SignalDir.LONG.value, 2480.0, 2510.0, tag="ENTRY")
+    await engine._close_leg("SL", btc_exit_price=2480.0)
+    pnl = _exit_calls(engine.notifier)[-1].kwargs["pnl"]
+    assert pnl == pytest.approx(14.0)

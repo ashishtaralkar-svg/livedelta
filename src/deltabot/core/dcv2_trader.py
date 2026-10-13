@@ -47,7 +47,7 @@ from ..models import Candle
 from ..strategy.dcv2 import DCv2Strategy
 from . import position_state
 from .candle_aggregator import CandleAggregator
-from .options_executor import OptionsExecutor, OptionsMarginError, PaperExecutor
+from .options_executor import _LOT_DEFAULT, _LOT_SIZE, OptionsExecutor, OptionsMarginError, PaperExecutor
 
 _IST = ZoneInfo("Asia/Kolkata")
 _BAR_SECONDS = 300  # 5 minutes — DCv2's validated timeframe
@@ -96,6 +96,9 @@ class DCv2Engine:
         self._tp_price: float | None = None
         self._current_dir: int | None = None
         self._tp_mult = 1.0 - settings.take_profit_pct / 100.0   # 70% -> 0.30
+        # Underlying per option lot for P&L messages (BTC 0.001, ETH 0.01).
+        _asset = settings.symbol.replace("USDT", "").replace("USD", "")
+        self._lot = _LOT_SIZE.get(_asset, _LOT_DEFAULT)
         # Guards so poll / forming / closed-candle paths can't double open/close.
         self._entry_in_progress = False
         self._closing = False
@@ -470,7 +473,7 @@ class DCv2Engine:
                 position_state.clear(self.settings.state_file)
             exit_prem = fill if fill is not None else mark
             entry_prem = self._entry_premium
-            gross = (entry_prem - exit_prem) * lots * 0.001 if entry_prem is not None else 0.0
+            gross = (entry_prem - exit_prem) * lots * self._lot if entry_prem is not None else 0.0
             self.strategy.force_flat()
             self._entry_premium = self._tp_price = self._current_dir = None
             log.info("DCv2 TP hit", extra={"extra": {"contract": contract, "exit_prem": exit_prem}})
@@ -515,7 +518,7 @@ class DCv2Engine:
             if self.settings.state_file:
                 position_state.clear(self.settings.state_file)
             entry_prem = self._entry_premium
-            gross = ((entry_prem - fill) * lots * 0.001
+            gross = ((entry_prem - fill) * lots * self._lot
                      if (entry_prem is not None and fill is not None) else 0.0)
             self._entry_premium = self._tp_price = self._current_dir = None
             log.info("DCv2 exit", extra={"extra": {
@@ -801,7 +804,7 @@ class DCv2Engine:
                 if self.settings.state_file:
                     position_state.clear(self.settings.state_file)
                 entry_prem = self._entry_premium
-                gross = ((entry_prem - fill) * lots * 0.001
+                gross = ((entry_prem - fill) * lots * self._lot
                          if (entry_prem is not None and fill is not None) else 0.0)
                 self._entry_premium = self._tp_price = self._current_dir = None
                 await self.notifier.notify(

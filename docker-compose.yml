@@ -78,6 +78,26 @@ services:
         max-file: "5"
     stop_grace_period: 30s
 
+  # DCv2 on ETH -- same engine as dcv2bot, ETH options (~40 premium), on its OWN
+  # Delta SUB-ACCOUNT (DELTA_STATE_FILE=state/dcv2eth_pos.json). Fill .env.dcv2eth
+  # first (cp .env.dcv2eth.example .env.dcv2eth). Bring it up ALONE:
+  #   docker compose up -d --build dcv2ethbot
+  dcv2ethbot:
+    build: .
+    image: deltabot:latest
+    container_name: dcv2ethbot
+    restart: always
+    env_file:
+      - .env.dcv2eth
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s
+
   # DCv3 bot -- DCv2's signal logic but BUYS options instead of selling
   # (the mirror of dcv2bot), on its OWN Delta SUB-ACCOUNT, in parallel with
   # dcv2bot/the other bots which it NEVER touches (separate capital,
