@@ -361,3 +361,29 @@ async def test_has_open_strangle_true_if_either_leg_open() -> None:
     assert not engine.has_open_strangle
     engine.executor_ce.has_open_position = True
     assert engine.has_open_strangle
+
+
+def _fake_now(monkeypatch, dt):
+    import datetime as _dtmod
+
+    import deltabot.core.daily_strangle_9pm_trader as mod
+
+    class _FakeDatetime(_dtmod.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return dt
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)
+
+
+async def test_no_entry_on_skip_weekdays(monkeypatch) -> None:
+    """DELTA_SKIP_WEEKDAYS=Sat,Sun: no strangle on Saturday/Sunday nights (backtest parity)."""
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo("Asia/Kolkata")
+    import datetime as _dtmod
+    engine = _make_engine(skip_weekdays="Sat,Sun")
+    _fake_now(monkeypatch, _dtmod.datetime(2026, 10, 24, 21, 0, tzinfo=ist))   # Saturday
+    await engine._maybe_enter()
+    assert engine.executor_ce.open_calls == [] and engine.executor_pe.open_calls == []
+    _fake_now(monkeypatch, _dtmod.datetime(2026, 10, 23, 21, 0, tzinfo=ist))   # Friday
+    await engine._maybe_enter()
+    assert len(engine.executor_ce.open_calls) == 1 and len(engine.executor_pe.open_calls) == 1

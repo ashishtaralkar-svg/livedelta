@@ -205,6 +205,12 @@ class DailyStrangle9pmEngine:
         if self.entry_in_progress or self.has_open_strangle:
             log.info("Strangle9pm: entry window fired but already positioned/in-progress — skipping")
             return
+        # DELTA_SKIP_WEEKDAYS (e.g. Sat,Sun): no new strangle on those IST days -- matches
+        # the backtest's weekday-only default (weekend nights lost money in backtest).
+        today = datetime.now(_IST).weekday()
+        if today in self.settings.skip_weekday_ints:
+            log.info("Strangle9pm: skip day — no entry today", extra={"extra": {"weekday": today}})
+            return
         self.entry_in_progress = True
         try:
             spot = await self._get_spot_price()
