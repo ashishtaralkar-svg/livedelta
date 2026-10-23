@@ -598,3 +598,15 @@ def test_pending_cleared_on_trend_flip_only_when_enabled() -> None:
             t += 300
         assert s._hunt_bear
         assert s.has_pending is expect_pending
+
+
+def test_friday_evening_entries_blocked_only_when_enabled(monkeypatch) -> None:
+    _fake_now(monkeypatch, datetime(2026, 10, 23, 19, 0, tzinfo=_ist))   # Friday 19:00
+    off = _make_engine(skip_weekdays="Sat,Sun")
+    on = _make_engine(skip_weekdays="Sat,Sun", dcv2_no_entry_friday_evening=True)
+    assert not off._entries_blocked()
+    assert on._entries_blocked()
+    _fake_now(monkeypatch, datetime(2026, 10, 23, 12, 0, tzinfo=_ist))   # Friday noon
+    assert not on._entries_blocked()
+    _fake_now(monkeypatch, datetime(2026, 10, 22, 19, 0, tzinfo=_ist))   # Thursday evening
+    assert not on._entries_blocked()

@@ -213,6 +213,9 @@ class Settings(BaseSettings):
     # Drop an armed setup when EMA(trend) crosses EMA(long), so it can't fire against
     # the new trend. Off by default (backtest-verify before enabling).
     dcv2_clear_pending_on_trend_flip: bool = False
+    # No new entries on the evening before a skip day (Friday after the 17:25 weekend
+    # flat) -> nothing is opened into the weekend. Off by default.
+    dcv2_no_entry_friday_evening: bool = False
     # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
     # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
     # missed/unexpected signal be reconstructed minute-by-minute from the live

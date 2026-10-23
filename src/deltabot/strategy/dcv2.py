@@ -186,6 +186,7 @@ class DCv2Strategy:
         entry_end_hour: int = 24,
         require_ema_direction_at_trigger: bool = False,
         clear_pending_on_trend_flip: bool = False,
+        no_entry_eve_before_skip: bool = False,
     ) -> None:
         self.dc_period = dc_period
         self.ema_trend_length = ema_trend_length
@@ -298,6 +299,9 @@ class DCv2Strategy:
         # A pending setup armed under the old EMA state is dropped when EMA(trend)
         # crosses EMA(long) (otherwise it can fire AGAINST the new trend).
         self.clear_pending_on_trend_flip = clear_pending_on_trend_flip
+        # Also block entries on the evening before a skip day, from the square-off
+        # time on (Friday after the 17:25 weekend flat): nothing is opened into the weekend.
+        self.no_entry_eve_before_skip = no_entry_eve_before_skip
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -635,6 +639,9 @@ class DCv2Strategy:
         if self.no_settlement_gap:
             square_off = in_gap = False
         day_blocked = local.weekday() in self.skip_weekdays
+        if (self.no_entry_eve_before_skip and now_mins >= self._sq_mins
+                and (local.weekday() + 1) % 7 in self.skip_weekdays):
+            day_blocked = True
         hour_blocked = not (self.entry_start_hour <= local.hour < self.entry_end_hour)
         # session_line mode: (re)draw the session line at 17:30 each day.
         session_start = (self._prev_now_mins is not None

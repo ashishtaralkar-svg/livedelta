@@ -78,6 +78,7 @@ class DCv2Engine:
             no_settlement_gap=settings.dcv2_continuous_roll,
             require_ema_direction_at_trigger=settings.dcv2_require_ema_direction_at_trigger,
             clear_pending_on_trend_flip=settings.dcv2_clear_pending_on_trend_flip,
+            no_entry_eve_before_skip=settings.dcv2_no_entry_friday_evening,
         )
         self.executor = (PaperExecutor(rest, settings) if settings.paper_mode
                          else OptionsExecutor(rest, settings))
@@ -753,6 +754,11 @@ class DCv2Engine:
         now = datetime.now(_IST)
         if now.weekday() in self.settings.skip_weekday_ints:
             return True
+        if (self.settings.dcv2_no_entry_friday_evening
+                and (now.weekday() + 1) % 7 in self.settings.skip_weekday_ints
+                and (now.hour, now.minute) >= (self.settings.square_off_hour,
+                                               self.settings.square_off_minute)):
+            return True   # evening before a skip day: nothing opened into the weekend
         if self.settings.dcv2_continuous_roll:
             return False   # no same-day settlement gap -- _square_off() rolls immediately
         if self._sq_off_date != now.date():
