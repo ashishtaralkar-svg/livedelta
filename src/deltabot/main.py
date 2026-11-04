@@ -11,6 +11,7 @@ from .core.daily_strangle_9pm_trader import DailyStrangle9pmEngine
 from .core.dchannel_trader import DchannelEngine
 from .core.dcv2_trader import DCv2Engine
 from .core.dcv3_trader import DCv3Engine
+from .core.ema_side_9pm_trader import EmaSide9pmEngine
 from .core.ema21_trader import Ema21BreakdownEngine
 from .core.heikin_ashi_trader import HeikinAshiEngine
 from .core.range_engulfing_fade_sell_trader import RangeEngulfingFadeSellEngine
@@ -62,6 +63,8 @@ async def run(settings: Settings) -> None:
         engine = DailyStrangle9pmEngine(settings, rest, notifier)
     elif settings.strategy == "strangle9pmladder":
         engine = DailyStrangle9pmLadderedEngine(settings, rest, notifier)
+    elif settings.strategy == "emaside9pm":
+        engine = EmaSide9pmEngine(settings, rest, notifier)
     elif settings.strategy == "weeklyhedge":
         engine = WeeklyStrangleHedgeEngine(settings, rest, notifier)
     else:

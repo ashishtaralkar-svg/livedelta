@@ -17,6 +17,7 @@
 .env.strangle9pmladder
 .env.strangle9pmladder2
 .env.weeklyhedge
+.env.emaside9pm
 state/
 
 # Python

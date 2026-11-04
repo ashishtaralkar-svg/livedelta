@@ -425,3 +425,23 @@ services:
         max-size: "20m"
         max-file: "5"
     stop_grace_period: 30s
+
+  # 9PM EMA50/EMA200 one-side option sell -- own Delta SUB-ACCOUNT
+  # (DELTA_STATE_FILE=state/emaside9pm_pos.json). cp .env.emaside9pm.example .env.emaside9pm,
+  # add the sub-account keys, then bring it up ALONE:
+  #   docker compose up -d --build emaside9pmbot
+  emaside9pmbot:
+    build: .
+    image: deltabot:latest
+    container_name: emaside9pmbot
+    restart: always
+    env_file:
+      - .env.emaside9pm
+    volumes:
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

@@ -600,6 +600,23 @@ class Settings(BaseSettings):
     # ladder itself is new config surface).
     strangle9pm_laddered_otm_pcts: str = "1,1.5,2"
 
+    # --- 9PM EMA50/EMA200 one-side option sell (emaside9pm) ---
+    # scripts/backtest_9pm_ema_side_sell.py --stacked --sl-pct 100: from the 21:00 IST
+    # session start, the first closed 5m BTC candle with close > EMA50 > EMA200 sells a
+    # PUT, close < EMA50 < EMA200 sells a CALL (strike otm_pct%% from that close, 0 =
+    # ATM, next-day expiry). One trade per session; premium TARGET (decay %%) / SL
+    # (rise %%); otherwise bought back at exit_hour:minute the next day.
+    emaside_entry_hour: int = 21
+    emaside_entry_minute: int = 0
+    emaside_exit_hour: int = 17
+    emaside_exit_minute: int = 0
+    emaside_otm_pct: float = 0.0
+    emaside_target_pct: float = 70.0
+    emaside_sl_pct: float = 100.0
+    emaside_fast: int = 50
+    emaside_slow: int = 200
+    emaside_resolution: str = "5m"
+
     # --- Weekly short strangle + breakeven hedge (weeklyhedge) ---
     # scripts/backtest_weekly_strangle_breakeven_hedge.py --hedge-offset 2000:
     # every entry weekday (Fri) sell CE+PE ~otm_pct%% away on NEXT Friday's
