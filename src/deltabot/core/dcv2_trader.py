@@ -139,6 +139,7 @@ class DCv2Engine:
             side="buy")
         self._atm_entry: float | None = None
         self._atm_close_pending: str | None = None   # failed ATM close -> retried every tick
+        self._atm_close_alerted = False
         self._atm_busy = False                       # ATM order in flight
         self._atm_state_file = _atm_state_path(settings.state_file)
         self._last_px: float | None = None           # latest BTC tick (forming/closed candle)
@@ -627,6 +628,7 @@ class DCv2Engine:
     async def _close_atm(self, reason: str) -> None:
         if not self.atm_executor.has_open_position:
             self._atm_close_pending = None
+            self._atm_close_alerted = False
             return
         if self._atm_busy:
             self._atm_close_pending = reason   # ATM order in flight -> close right after it
@@ -640,12 +642,14 @@ class DCv2Engine:
             except Exception as exc:  # noqa: BLE001
                 log.error("DCv2: ATM close failed — will retry every tick",
                           extra={"extra": {"error": str(exc), "reason": reason}})
-                if self._atm_close_pending is None:
+                if not self._atm_close_alerted:   # alert once per stuck close, not every retry
+                    self._atm_close_alerted = True
                     await self.notifier.notify(NotifyEvent.API_ERROR,
                                                detail=f"DCv2: ATM {reason} close: {exc} (retrying)")
                 self._atm_close_pending = reason
                 return
             self._atm_close_pending = None
+            self._atm_close_alerted = False
             if self._atm_state_file:
                 position_state.clear(self._atm_state_file)
             entry = self._atm_entry

@@ -746,6 +746,26 @@ async def test_atm_close_failure_is_retried() -> None:
     assert not engine.atm_executor.has_open_position and engine._atm_close_pending is None
 
 
+async def test_atm_deferred_close_that_fails_is_alerted_once() -> None:
+    engine = _atm_engine()
+    real_open = engine.atm_executor.open_option_by_otm_pct
+
+    async def open_then_sold_leg_closes(*a):
+        res = await real_open(*a)
+        await engine._close_atm("SL")        # deferred: ATM buy in flight
+        engine.atm_executor.close_exc = RuntimeError("502")
+        return res
+    engine.atm_executor.open_option_by_otm_pct = open_then_sold_leg_closes
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    for _ in range(3):
+        await engine._retry_atm_close()
+    details = [c.kwargs.get("detail", "") for c in engine.notifier.notify.await_args_list]
+    assert sum("ATM SL close" in d for d in details) == 1
+    engine.atm_executor.close_exc = None
+    await engine._retry_atm_close()
+    assert not engine.atm_executor.has_open_position and engine._atm_close_alerted is False
+
+
 async def test_atm_close_requested_mid_buy_closes_right_after() -> None:
     engine = _atm_engine()
     real_open = engine.atm_executor.open_option_by_otm_pct
