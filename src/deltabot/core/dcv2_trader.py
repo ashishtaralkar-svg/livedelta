@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..config import Settings
@@ -53,6 +54,15 @@ _IST = ZoneInfo("Asia/Kolkata")
 _BAR_SECONDS = 300  # 5 minutes — DCv2's validated timeframe
 
 log = get_logger(__name__)
+
+
+def _atm_state_path(state_file: str) -> str:
+    """state/dcv2_pos.json -> state/dcv2_pos_atm.json (own file, so clearing the sold
+    leg's state can never wipe the record of a still-open ATM leg)."""
+    if not state_file:
+        return ""
+    p = Path(state_file)
+    return str(p.with_name(f"{p.stem}_atm{p.suffix or '.json'}"))
 
 
 class DCv2Engine:
@@ -120,6 +130,18 @@ class DCv2Engine:
         self._last_foreign_check = 0.0
         self._foreign_candidate: list[str] | None = None   # seen once; flagged on 2nd sighting
         self._state_write_alerted = False
+        # ATM BUY leg, opened/closed in sync with the sold leg (dcv2_atm_buy_lots > 0).
+        # The executor always exists so a leftover ATM long from an earlier run is still
+        # recognised as ours (never "untracked") and closed, even with the feature off.
+        self._atm_enabled = settings.dcv2_atm_buy_lots > 0 and not settings.paper_mode
+        self.atm_executor = OptionsExecutor(
+            rest, settings.model_copy(update={"option_contracts": max(settings.dcv2_atm_buy_lots, 1)}),
+            side="buy")
+        self._atm_entry: float | None = None
+        self._atm_close_pending: str | None = None   # failed ATM close -> retried every tick
+        self._atm_busy = False                       # ATM order in flight
+        self._atm_state_file = _atm_state_path(settings.state_file)
+        self._last_px: float | None = None           # latest BTC tick (forming/closed candle)
 
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
@@ -172,6 +194,8 @@ class DCv2Engine:
                 log.info("DCv2: closed option on shutdown")
             except Exception as exc:  # noqa: BLE001
                 log.error("DCv2: failed to close on shutdown", extra={"extra": {"error": str(exc)}})
+        if self.settings.close_on_shutdown and self.atm_executor.has_open_position:
+            await self._close_atm("shutdown")
 
     async def daily_summary(self) -> None:
         pass
@@ -285,6 +309,8 @@ class DCv2Engine:
         task.add_done_callback(self._tasks.discard)
 
     async def _handle_forming_candle(self, candle: Candle) -> None:
+        self._last_px = candle.close
+        await self._retry_atm_close()
         if await self._retry_pending_exit(candle.close):
             return
         if not self.strategy.ready:
@@ -334,7 +360,9 @@ class DCv2Engine:
                     return
         self._last_closed_start = candle.start_time
         self._last_btc_close = candle.close
+        self._last_px = candle.close
 
+        await self._retry_atm_close()
         await self._retry_pending_exit(candle.close)   # never skip the strategy update
 
         # Strategy update -> closed-bar exits (SL / EMA_CROSS / TRAIL) + entries.
@@ -399,6 +427,7 @@ class DCv2Engine:
                 await self._refresh_foreign()
             except Exception as exc:  # noqa: BLE001
                 log.warning("DCv2: foreign refresh error", extra={"extra": {"error": str(exc)}})
+            await self._retry_atm_close()
             if await self._retry_pending_exit(self._last_btc_close or 0.0):
                 continue
             if self._closing or self._tp_price is None or not self.executor.has_open_position:
@@ -457,6 +486,7 @@ class DCv2Engine:
             NotifyEvent.EXIT, reason="closed outside the bot (self-healed)",
             contract=contract or "?", size=self.settings.option_contracts,
         )
+        await self._close_atm("SYNC")   # the ATM leg never outlives the sold leg
 
     # ------------------------------------------------------------------ #
     async def _close_tp(self, mark: float) -> None:
@@ -487,6 +517,7 @@ class DCv2Engine:
                 entry_premium=entry_prem, exit_premium=exit_prem,
                 pnl=round(gross, 2), size=lots,
             )
+            await self._close_atm("TP")
         finally:
             self._closing = False
 
@@ -533,8 +564,106 @@ class DCv2Engine:
                 entry_premium=entry_prem, exit_premium=fill,
                 pnl=round(gross, 2), size=lots,
             )
+            await self._close_atm(reason)
         finally:
             self._closing = False
+
+    # ------------------------------------------------------------------ #
+    # ATM BUY leg (dcv2_atm_buy_lots > 0): bought right after every sell fill,
+    # closed on every exit of the sold leg. A failed ATM order never touches
+    # the sold leg; a failed ATM close is retried every tick.
+    # ------------------------------------------------------------------ #
+    async def _open_atm(self, signal_dir: int, btc_price: float, tag: str) -> None:
+        if not self._atm_enabled or not self.executor.has_open_position:
+            return
+        if self.atm_executor.has_open_position:
+            log.warning("DCv2: previous ATM leg still open (close pending) — not buying another",
+                        extra={"extra": {"contract": self.atm_executor.tracked_symbol}})
+            return
+        px = self._last_px or btc_price
+        if not px or px <= 0:
+            log.warning("DCv2: no BTC price for the ATM strike — ATM buy skipped")
+            return
+        self._atm_busy = True
+        try:
+            try:
+                fill, symbol = await self.atm_executor.open_option_by_otm_pct(signal_dir, px, 0.0)
+            except Exception as exc:  # noqa: BLE001
+                log.error("DCv2: ATM buy failed", extra={"extra": {"error": str(exc)}})
+                await self.notifier.notify(
+                    NotifyEvent.API_ERROR,
+                    detail=f"DCv2: ATM buy failed ({exc}) -- the sold leg is open WITHOUT its ATM "
+                           "buy. If an ATM position did open, the bot will flag it as untracked.")
+                return
+            if not self.atm_executor.has_open_position:
+                log.warning("DCv2: ATM buy — no contract selected (empty chain)")
+                await self.notifier.notify(NotifyEvent.API_ERROR,
+                                           detail="DCv2: ATM buy skipped -- option chain empty")
+                return
+            if fill is None and symbol:
+                try:
+                    fill = await asyncio.to_thread(self.rest.get_mark_price, symbol)
+                except Exception:  # noqa: BLE001 -- P&L display only
+                    fill = None
+            self._atm_entry = fill
+            if self._atm_state_file:
+                position_state.save(
+                    self._atm_state_file, symbol=symbol or "",
+                    product_id=self.atm_executor.tracked_product_id,
+                    size=self.atm_executor.tracked_size, entry_premium=fill, direction=signal_dir)
+            is_buy = signal_dir == SignalDir.LONG.value
+            log.info("DCv2 ATM buy", extra={"extra": {"tag": tag, "symbol": symbol, "fill": fill,
+                                                       "btc": px}})
+            await self.notifier.notify(
+                NotifyEvent.ENTRY_LONG if is_buy else NotifyEvent.ENTRY_SHORT,
+                direction="CALL" if is_buy else "PUT", contract=symbol or "?", premium=fill,
+                btc_price=px, tag=tag, side="buy",
+            )
+        finally:
+            self._atm_busy = False
+        if self._atm_close_pending is not None:   # sold leg closed while we were buying
+            await self._close_atm(self._atm_close_pending)
+
+    async def _close_atm(self, reason: str) -> None:
+        if not self.atm_executor.has_open_position:
+            self._atm_close_pending = None
+            return
+        if self._atm_busy:
+            self._atm_close_pending = reason   # ATM order in flight -> close right after it
+            return
+        self._atm_busy = True
+        try:
+            contract = self.atm_executor.tracked_symbol
+            lots = self.atm_executor.tracked_size
+            try:
+                fill = await self.atm_executor.close_option()
+            except Exception as exc:  # noqa: BLE001
+                log.error("DCv2: ATM close failed — will retry every tick",
+                          extra={"extra": {"error": str(exc), "reason": reason}})
+                if self._atm_close_pending is None:
+                    await self.notifier.notify(NotifyEvent.API_ERROR,
+                                               detail=f"DCv2: ATM {reason} close: {exc} (retrying)")
+                self._atm_close_pending = reason
+                return
+            self._atm_close_pending = None
+            if self._atm_state_file:
+                position_state.clear(self._atm_state_file)
+            entry = self._atm_entry
+            self._atm_entry = None
+            gross = ((fill - entry) * lots * self._lot
+                     if (entry is not None and fill is not None) else 0.0)
+            log.info("DCv2 ATM exit", extra={"extra": {"reason": reason, "contract": contract,
+                                                        "fill": fill}})
+            await self.notifier.notify(
+                NotifyEvent.EXIT, reason=f"ATM {reason}", contract=contract or "?",
+                entry_premium=entry, exit_premium=fill, pnl=round(gross, 2), size=lots, side="buy",
+            )
+        finally:
+            self._atm_busy = False
+
+    async def _retry_atm_close(self) -> None:
+        if self._atm_close_pending is not None and not self._atm_busy:
+            await self._close_atm(self._atm_close_pending)
 
     async def _open_entry(self, signal_dir: int, sl_level: float | None,
                           btc_price: float, tag: str) -> None:
@@ -591,6 +720,7 @@ class DCv2Engine:
                 premium=fill, btc_price=btc_price, sl_level=sl_level,
                 tp_price=round(self._tp_price, 1), tag=tag,
             )
+            await self._open_atm(signal_dir, btc_price, tag)
         finally:
             self._entry_in_progress = False
 
@@ -610,9 +740,13 @@ class DCv2Engine:
         # An order in flight (entry fill / buy-back) would show up on the exchange
         # before the executor tracks it -> it must not be mistaken for a foreign position.
         for _ in range(60):
-            if not (self._entry_in_progress or self._closing):
+            if not (self._entry_in_progress or self._closing or self._atm_busy):
                 break
             await asyncio.sleep(0.5)
+        atm_saved = position_state.load(self._atm_state_file) if self._atm_state_file else None
+        atm_owned = atm_saved.get("symbol") if atm_saved else None
+        atm_pid = (self.atm_executor.tracked_product_id
+                   if self.atm_executor.has_open_position else None)
         state_file = self.settings.state_file
         saved = position_state.load(state_file) if state_file else None
         owned_symbol = saved.get("symbol") if saved else None
@@ -646,10 +780,16 @@ class DCv2Engine:
         mine = next((p for p in shorts
                      if (owned_symbol and p.get("symbol") == owned_symbol)
                      or (tracked_pid is not None and p.get("product_id") == tracked_pid)), None)
-        foreign = sorted(p.get("symbol", "?") for p in positions if p is not mine)
+        # The ATM BUY leg is a LONG: ours = the state-file symbol or the in-memory one.
+        atm_mine = next((p for p in positions if p["size"] > 0 and p is not mine
+                         and ((atm_owned and p.get("symbol") == atm_owned)
+                              or (atm_pid is not None and p.get("product_id") == atm_pid))), None)
+        foreign = sorted(p.get("symbol", "?") for p in positions
+                         if p is not mine and p is not atm_mine)
         await self._set_foreign(foreign)
         self._foreign_candidate = None
         self._last_foreign_check = time.time()
+        self._reconcile_atm(atm_mine, atm_saved)
 
         if mine is not None:
             if saved and saved.get("symbol") == mine.get("symbol"):
@@ -687,6 +827,34 @@ class DCv2Engine:
             self.strategy.force_flat()
         self._closing = False
         log.info("DCv2 reconcile: no owned position — state FLAT")
+        if self.atm_executor.has_open_position:
+            # Sold leg is gone but its ATM leg is still open -> close it (never orphaned).
+            log.warning("DCv2 reconcile: ATM leg open without its sold leg — closing it",
+                        extra={"extra": {"contract": self.atm_executor.tracked_symbol}})
+            await self._close_atm("SYNC")
+
+    def _reconcile_atm(self, atm_mine: dict | None, atm_saved: dict | None) -> None:
+        """Adopt our ATM long after a restart. If the exchange does not show it, keep
+        tracking it (a transiently empty fetch must not turn it into an 'untracked'
+        position); the next close clears it via reduce-only if it is really gone."""
+        if atm_mine is not None:
+            if self.atm_executor.tracked_product_id != atm_mine.get("product_id"):
+                opt_type = OptionType.CALL if atm_mine["symbol"].startswith("C-") else OptionType.PUT
+                self.atm_executor.adopt(atm_mine["product_id"], atm_mine["size"], opt_type,
+                                        atm_mine.get("symbol"))
+                if atm_saved and atm_saved.get("symbol") == atm_mine.get("symbol"):
+                    self._atm_entry = atm_saved.get("entry_premium")
+                log.info("DCv2 reconcile: adopted ATM long", extra={"extra": {"symbol": atm_mine["symbol"]}})
+            return
+        if (not self.atm_executor.has_open_position and atm_saved
+                and atm_saved.get("product_id") and atm_saved.get("symbol")):
+            sym = str(atm_saved["symbol"])
+            opt_type = OptionType.CALL if sym.startswith("C-") else OptionType.PUT
+            self.atm_executor.adopt(int(atm_saved["product_id"]), int(atm_saved.get("size") or 0),
+                                    opt_type, sym)
+            self._atm_entry = atm_saved.get("entry_premium")
+            log.warning("DCv2 reconcile: ATM leg in state file not returned by exchange — "
+                        "tracking it until the next close", extra={"extra": {"symbol": sym}})
 
     async def _set_foreign(self, foreign: list[str]) -> None:
         """Update the untracked-position block; alert when it turns on AND when it lifts."""
@@ -717,7 +885,7 @@ class DCv2Engine:
         if self.settings.paper_mode:
             return
         iv = self.settings.position_verify_seconds
-        if iv <= 0 or self._closing or self._entry_in_progress:
+        if iv <= 0 or self._closing or self._entry_in_progress or self._atm_busy:
             return
         now = time.time()
         if now - self._last_foreign_check < iv:
@@ -730,11 +898,13 @@ class DCv2Engine:
         except Exception as exc:  # noqa: BLE001
             log.warning("DCv2: foreign-position check failed", extra={"extra": {"error": str(exc)}})
             return
-        if self._closing or self._entry_in_progress:
+        if self._closing or self._entry_in_progress or self._atm_busy:
             return   # an order landed while we were fetching; judge on the next pass
-        tracked = self.executor.tracked_product_id if self.executor.has_open_position else None
-        foreign = sorted(p.get("symbol", "?") for p in positions
-                         if tracked is None or p.get("product_id") != tracked)
+        own = {pid for pid in (
+            self.executor.tracked_product_id if self.executor.has_open_position else None,
+            self.atm_executor.tracked_product_id if self.atm_executor.has_open_position else None,
+        ) if pid is not None}
+        foreign = sorted(p.get("symbol", "?") for p in positions if p.get("product_id") not in own)
         if not foreign or set(foreign) <= set(self._foreign_symbols):
             self._foreign_candidate = None
             await self._set_foreign(foreign)        # lifting / shrinking applies at once
@@ -829,6 +999,8 @@ class DCv2Engine:
                 if weekend_flat:
                     self.strategy.force_flat()
                 return
+        # The ATM leg closes with the sold leg (also a stray one when the sold leg is flat).
+        await self._close_atm(reason)
         # Friday: end the directional trade entirely (no weekend rollover).
         if weekend_flat:
             self.strategy.force_flat()

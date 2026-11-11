@@ -610,3 +610,203 @@ def test_friday_evening_entries_blocked_only_when_enabled(monkeypatch) -> None:
     assert not on._entries_blocked()
     _fake_now(monkeypatch, datetime(2026, 10, 22, 19, 0, tzinfo=_ist))   # Thursday evening
     assert not on._entries_blocked()
+
+
+# ---------------------------------------------------------------------- #
+# ATM BUY leg (dcv2_atm_buy_lots): bought after every sell fill, closed on
+# every exit of the sold leg, never treated as an untracked position.
+# ---------------------------------------------------------------------- #
+class FakeAtmExecutor:
+    def __init__(self, lots: int = 10) -> None:
+        self.has_open_position = False
+        self.tracked_symbol: str | None = None
+        self.tracked_product_id: int | None = None
+        self.tracked_size = 0
+        self.lots = lots
+        self.open_calls: list[tuple[int, float, float]] = []
+        self.close_calls = 0
+        self.open_exc: Exception | None = None
+        self.close_exc: Exception | None = None
+        self.open_result: tuple[float | None, str | None] = (600.0, "C-BTC-60000-070726")
+        self.close_result: float | None = 900.0
+
+    async def open_option_by_otm_pct(self, signal_dir, btc_price, otm_pct):
+        self.open_calls.append((signal_dir, btc_price, otm_pct))
+        if self.open_exc:
+            raise self.open_exc
+        fill, sym = self.open_result
+        self.has_open_position = True
+        self.tracked_symbol, self.tracked_product_id, self.tracked_size = sym, 555, self.lots
+        return fill, sym
+
+    async def close_option(self):
+        self.close_calls += 1
+        if self.close_exc:
+            raise self.close_exc
+        self.has_open_position = False
+        self.tracked_symbol = self.tracked_product_id = None
+        return self.close_result
+
+    def adopt(self, product_id, size, option_type, symbol=None) -> None:
+        self.has_open_position = True
+        self.tracked_product_id, self.tracked_size, self.tracked_symbol = product_id, abs(size), symbol
+
+    def clear(self) -> None:
+        self.has_open_position = False
+        self.tracked_symbol = self.tracked_product_id = None
+
+
+def _atm_engine(**kw) -> DCv2Engine:
+    kw.setdefault("dcv2_atm_buy_lots", 10)
+    engine = _make_engine(**kw)
+    engine.atm_executor = FakeAtmExecutor(kw["dcv2_atm_buy_lots"])
+    return engine
+
+
+def _atm_exits(notifier):
+    return [c for c in _exit_calls(notifier) if str(c.kwargs.get("reason", "")).startswith("ATM")]
+
+
+async def test_atm_bought_after_sell_and_closed_on_sl() -> None:
+    engine = _atm_engine()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    assert engine.atm_executor.open_calls == [(SignalDir.LONG.value, 60000.0, 0.0)]   # ATM, same dir
+    entries = [c for c in engine.notifier.notify.await_args_list if c.kwargs.get("side") == "buy"]
+    assert entries and entries[-1].kwargs["direction"] == "CALL"
+    await engine._close_leg("SL", btc_exit_price=59000.0)
+    assert engine.atm_executor.close_calls == 1 and not engine.atm_executor.has_open_position
+    ex = _atm_exits(engine.notifier)[-1].kwargs
+    assert ex["reason"] == "ATM SL" and ex["pnl"] == pytest.approx((900 - 600) * 10 * 0.001)
+
+
+async def test_atm_uses_latest_tick_for_strike() -> None:
+    engine = _atm_engine()
+    engine._last_px = 60123.0
+    await engine._open_entry(SignalDir.SHORT.value, 61000.0, 60000.0, tag="ENTRY")
+    assert engine.atm_executor.open_calls == [(SignalDir.SHORT.value, 60123.0, 0.0)]
+
+
+async def test_atm_closed_on_tp_and_square_off(monkeypatch) -> None:
+    engine = _atm_engine()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    await engine._close_tp(270.0)
+    assert engine.atm_executor.close_calls == 1
+    assert _atm_exits(engine.notifier)[-1].kwargs["reason"] == "ATM TP"
+
+    engine = _atm_engine(skip_weekdays="Sat,Sun")
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.strategy._in_long = True
+    _fake_now(monkeypatch, datetime(2026, 7, 10, 17, 25, tzinfo=_ist))  # Fri -> WEEKEND
+    await engine._square_off()
+    assert engine.atm_executor.close_calls == 1
+    assert _atm_exits(engine.notifier)[-1].kwargs["reason"] == "ATM WEEKEND"
+
+
+async def test_atm_rebought_on_rollover() -> None:
+    engine = _atm_engine(skip_weekdays="")
+    engine._sq_off_date = None
+    strat = MagicMock()
+    strat.update.return_value = None
+    strat.position_state = PositionState.LONG
+    strat.sl_level = 59000.0
+    engine.strategy = strat
+    await engine._handle_closed_candle(_c(300, cl=60500.0))
+    assert engine.atm_executor.open_calls == [(SignalDir.LONG.value, 60500.0, 0.0)]
+
+
+async def test_atm_disabled_by_default_and_in_paper_mode() -> None:
+    engine = _make_engine()
+    engine.atm_executor = FakeAtmExecutor()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    assert engine.atm_executor.open_calls == []
+    paper = _atm_engine(paper_mode=True)
+    assert paper._atm_enabled is False
+
+
+async def test_atm_buy_failure_keeps_sold_leg_and_alerts() -> None:
+    engine = _atm_engine()
+    engine.atm_executor.open_exc = RuntimeError("timeout")
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    assert engine.executor.has_open_position and engine._entry_premium == 900.0
+    assert not engine.atm_executor.has_open_position
+    details = [c.kwargs.get("detail", "") for c in engine.notifier.notify.await_args_list]
+    assert any("ATM buy failed" in d for d in details)
+    await engine._close_leg("SL", 59000.0)            # sold leg still closes normally
+    assert engine.executor.close_calls == 1
+
+
+async def test_atm_close_failure_is_retried() -> None:
+    engine = _atm_engine()
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    engine.atm_executor.close_exc = RuntimeError("502")
+    await engine._close_leg("SL", 59000.0)
+    assert engine.atm_executor.has_open_position and engine._atm_close_pending == "SL"
+    engine.atm_executor.close_exc = None
+    await engine._retry_atm_close()
+    assert not engine.atm_executor.has_open_position and engine._atm_close_pending is None
+
+
+async def test_atm_close_requested_mid_buy_closes_right_after() -> None:
+    engine = _atm_engine()
+    real_open = engine.atm_executor.open_option_by_otm_pct
+
+    async def open_then_sold_leg_closes(*a):
+        res = await real_open(*a)
+        await engine._close_atm("SL")        # sold leg's SL fires while the ATM buy is in flight
+        return res
+    engine.atm_executor.open_option_by_otm_pct = open_then_sold_leg_closes
+    await engine._open_entry(SignalDir.LONG.value, 59000.0, 60000.0, tag="ENTRY")
+    assert engine.atm_executor.close_calls == 1 and not engine.atm_executor.has_open_position
+
+
+async def test_restart_adopts_atm_long_and_does_not_block(tmp_path, monkeypatch) -> None:
+    from deltabot.core import position_state
+    _fake_now(monkeypatch, datetime(2026, 10, 12, 10, 0, tzinfo=_ist))
+    sf = str(tmp_path / "dcv2.json")
+    engine = _atm_engine(state_file=sf)
+    assert engine._atm_state_file == str(tmp_path / "dcv2_atm.json")
+    position_state.save(sf, symbol="P-BTC-60000-070726", product_id=123, size=25,
+                        entry_premium=900.0, tp_price=270.0, direction=SignalDir.LONG.value)
+    position_state.save(engine._atm_state_file, symbol="C-BTC-60000-070726", product_id=555,
+                        size=10, entry_premium=600.0, direction=SignalDir.LONG.value)
+    engine.rest = FakeRest(positions=[
+        {"symbol": "P-BTC-60000-070726", "size": -25, "product_id": 123},
+        {"symbol": "C-BTC-60000-070726", "size": 10, "product_id": 555}])
+    await engine._sync_options_to_exchange()
+    assert engine.executor.has_open_position and engine.atm_executor.has_open_position
+    assert engine._atm_entry == 600.0
+    assert engine._foreign_symbols == [] and not engine._entries_blocked()
+    for _ in range(2):
+        engine._last_foreign_check = 0.0
+        await engine._refresh_foreign()
+    assert not engine._entries_blocked()
+
+
+async def test_restart_closes_atm_left_without_sold_leg(tmp_path) -> None:
+    from deltabot.core import position_state
+    engine = _atm_engine(state_file=str(tmp_path / "dcv2.json"))
+    position_state.save(engine._atm_state_file, symbol="C-BTC-60000-070726", product_id=555,
+                        size=10, entry_premium=600.0, direction=SignalDir.LONG.value)
+    engine.rest = FakeRest(positions=[{"symbol": "C-BTC-60000-070726", "size": 10, "product_id": 555}])
+    await engine._sync_options_to_exchange()
+    assert engine.atm_executor.close_calls == 1 and not engine.atm_executor.has_open_position
+    assert engine._foreign_symbols == []
+    assert position_state.load(engine._atm_state_file) is None
+
+
+async def test_unknown_long_is_still_foreign(tmp_path) -> None:
+    engine = _atm_engine(state_file=str(tmp_path / "dcv2.json"))
+    engine.rest = FakeRest(positions=[{"symbol": "C-BTC-70000-070726", "size": 3, "product_id": 9}])
+    await engine._sync_options_to_exchange()
+    assert engine._foreign_symbols == ["C-BTC-70000-070726"]
+    assert engine.atm_executor.close_calls == 0       # never closes a position it does not own
+
+
+def test_real_atm_executor_is_buy_side_with_own_lots() -> None:
+    from deltabot.enums import OptionType
+    engine = _make_engine(dcv2_atm_buy_lots=7)
+    ex = engine.atm_executor
+    assert ex.is_buy_side and ex._settings.option_contracts == 7
+    assert engine.settings.option_contracts == 25                  # sold leg untouched
+    assert ex._option_type_for(SignalDir.LONG.value) == OptionType.CALL
+    assert ex._option_type_for(SignalDir.SHORT.value) == OptionType.PUT

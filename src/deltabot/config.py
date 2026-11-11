@@ -216,6 +216,12 @@ class Settings(BaseSettings):
     # No new entries on the evening before a skip day (Friday after the 17:25 weekend
     # flat) -> nothing is opened into the weekend. Off by default.
     dcv2_no_entry_friday_evening: bool = False
+    # ATM BUY leg in sync with the sold leg (backtest --combo-buy --combo-buy-atm):
+    # BUY signal -> also BUY the ATM CALL, SELL signal -> BUY the ATM PUT, same expiry.
+    # Opened right after every sell fill (entry + rollover) and closed on EVERY exit
+    # of the sold leg (TP / SL / TRAIL / EMA_CROSS / EOD / WEEKEND). Lot count of the
+    # ATM leg; 0 (default) = off. Never used in paper mode.
+    dcv2_atm_buy_lots: int = 0
     # Log a full strategy-state snapshot (HA/EMA/Donchian/touched/pending/pos)
     # on EVERY closed 5m candle -- diagnostic only, ~288 lines/day. Lets a
     # missed/unexpected signal be reconstructed minute-by-minute from the live
